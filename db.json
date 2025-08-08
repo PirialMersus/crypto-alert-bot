@@ -1,0 +1,10 @@
+{
+  "alerts": [
+    {
+      "userId": 791785172,
+      "symbol": "ETH",
+      "targetPrice": 3800,
+      "direction": "above"
+    }
+  ]
+}
