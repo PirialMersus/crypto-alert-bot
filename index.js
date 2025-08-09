@@ -33,8 +33,7 @@ await connectToMongo();
 
 // ------------------ HTTP сервер ------------------
 const app = express();
-app.get('/', (req, res) => res.send('Бот работает с монгошкой! 🚀'));
-
+app.get('/', (req, res) => res.send('Бот работает с монгошкой! 🚀🚀'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🌐 HTTP сервер запущен на порту ${PORT}`));
 
@@ -51,6 +50,27 @@ const mainMenu = {
   }
 };
 
+// ------------------ Кэш цен ------------------
+const pricesCache = new Map(); // symbol -> { price, time }
+const CACHE_TTL = 15000; // 15 секунд
+
+async function getPrice(symbol) {
+  const now = Date.now();
+  const cached = pricesCache.get(symbol);
+  if (cached && (now - cached.time) < CACHE_TTL) {
+    return cached.price;
+  }
+  try {
+    const res = await axios.get(`https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=${symbol}`);
+    const price = parseFloat(res.data.data?.price);
+    pricesCache.set(symbol, { price, time: now });
+    return price;
+  } catch {
+    return null;
+  }
+}
+
+// ------------------ Telegram ------------------
 bot.start((ctx) => {
   ctx.session = {};
   ctx.reply('Привет! 🚀 Я бот для уведомлений о цене крипты (KuCoin API).', mainMenu);
@@ -68,16 +88,18 @@ bot.hears('📋 Мои алерты', async (ctx) => {
   if (userAlerts.length === 0) {
     return ctx.reply('У тебя нет активных алертов.', mainMenu);
   }
-  let msg = '📋 Твои алерты:\n\n';
-  for (let i = 0; i < userAlerts.length; i++) {
-    const a = userAlerts[i];
-    let currentPrice = 'нет данных';
-    try {
-      const res = await axios.get(`https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=${a.symbol}`);
-      currentPrice = res.data.data?.price || 'нет данных';
-    } catch {}
-    msg += `${i + 1}. ${a.symbol} ${a.condition} ${a.price} (текущая: ${currentPrice})\n`;
+
+  // Загружаем цены только для уникальных символов
+  const uniqueSymbols = [...new Set(userAlerts.map(a => a.symbol))];
+  const priceMap = {};
+  for (const sym of uniqueSymbols) {
+    priceMap[sym] = await getPrice(sym) ?? 'нет данных';
   }
+
+  let msg = '📋 Твои алерты:\n\n';
+  userAlerts.forEach((a, i) => {
+    msg += `${i + 1}. ${a.symbol} ${a.condition} ${a.price} (текущая: ${priceMap[a.symbol]})\n`;
+  });
 
   ctx.reply(msg, {
     reply_markup: {
@@ -102,15 +124,12 @@ bot.on('text', async (ctx) => {
   if (step === 'symbol') {
     const symbol = text.toUpperCase();
     const fullSymbol = `${symbol}-USDT`;
+    const price = await getPrice(fullSymbol);
 
-    try {
-      const res = await axios.get(`https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=${fullSymbol}`);
-      if (!res.data.data) throw new Error();
-
+    if (price) {
       ctx.session.symbol = fullSymbol;
       ctx.session.step = 'condition';
-
-      ctx.reply(`✅ Монета найдена: ${fullSymbol}\nТекущая цена: ${res.data.data.price}\nВыбери условие:`, {
+      ctx.reply(`✅ Монета найдена: ${fullSymbol}\nТекущая цена: ${price}\nВыбери условие:`, {
         reply_markup: {
           keyboard: [
             [{ text: '⬆️ Когда выше' }, { text: '⬇️ Когда ниже' }],
@@ -119,7 +138,7 @@ bot.on('text', async (ctx) => {
           resize_keyboard: true
         }
       });
-    } catch {
+    } else {
       ctx.reply('❌ Такой пары нет на KuCoin. Попробуй другую монету.');
     }
 
@@ -134,28 +153,24 @@ bot.on('text', async (ctx) => {
     });
 
   } else if (step === 'price') {
-    const price = parseFloat(text);
-    if (isNaN(price)) return ctx.reply('Введите корректное число цены');
+    const priceValue = parseFloat(text);
+    if (isNaN(priceValue)) return ctx.reply('Введите корректное число цены');
 
-    ctx.session.price = price;
+    ctx.session.price = priceValue;
+    const currentPrice = await getPrice(ctx.session.symbol);
 
-    try {
-      const res = await axios.get(`https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=${ctx.session.symbol}`);
-      const currentPrice = parseFloat(res.data.data.price);
-
+    if (currentPrice) {
       await alertsCollection.insertOne({
         userId: ctx.from.id,
         symbol: ctx.session.symbol,
         condition: ctx.session.condition,
         price: ctx.session.price
       });
-
       ctx.reply(`✅ Алерт создан: ${ctx.session.symbol} ${ctx.session.condition} ${ctx.session.price}\nТекущая цена: ${currentPrice}`, mainMenu);
-      ctx.session = {};
-    } catch {
+    } else {
       ctx.reply('❌ Ошибка при получении цены. Попробуй позже.', mainMenu);
-      ctx.session = {};
     }
+    ctx.session = {};
   }
 });
 
@@ -176,16 +191,17 @@ bot.on('callback_query', async (ctx) => {
     return;
   }
 
-  let msg = '📋 Твои алерты:\n\n';
-  for (let i = 0; i < updatedAlerts.length; i++) {
-    const a = updatedAlerts[i];
-    let currentPrice = 'нет данных';
-    try {
-      const res = await axios.get(`https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=${a.symbol}`);
-      currentPrice = res.data.data?.price || 'нет данных';
-    } catch {}
-    msg += `${i + 1}. ${a.symbol} ${a.condition} ${a.price} (текущая: ${currentPrice})\n`;
+  // Загружаем цены только для уникальных символов
+  const uniqueSymbols = [...new Set(updatedAlerts.map(a => a.symbol))];
+  const priceMap = {};
+  for (const sym of uniqueSymbols) {
+    priceMap[sym] = await getPrice(sym) ?? 'нет данных';
   }
+
+  let msg = '📋 Твои алерты:\n\n';
+  updatedAlerts.forEach((a, i) => {
+    msg += `${i + 1}. ${a.symbol} ${a.condition} ${a.price} (текущая: ${priceMap[a.symbol]})\n`;
+  });
 
   await ctx.editMessageText(msg, {
     reply_markup: {
@@ -201,27 +217,25 @@ bot.on('callback_query', async (ctx) => {
 // 🔁 Проверка алертов каждую минуту
 setInterval(async () => {
   const allAlerts = await alertsCollection.find({}).toArray();
-  const pricesCache = new Map();
+  const uniqueSymbols = [...new Set(allAlerts.map(a => a.symbol))];
+
+  // Обновляем цены для всех уникальных символов
+  for (const sym of uniqueSymbols) {
+    await getPrice(sym);
+  }
 
   for (const alert of allAlerts) {
-    try {
-      if (!pricesCache.has(alert.symbol)) {
-        const res = await axios.get(`https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=${alert.symbol}`);
-        pricesCache.set(alert.symbol, parseFloat(res.data.data.price));
-      }
-      const currentPrice = pricesCache.get(alert.symbol);
+    const currentPrice = pricesCache.get(alert.symbol)?.price;
+    if (!currentPrice) continue;
 
-      if (
-        (alert.condition === '>' && currentPrice > alert.price) ||
-        (alert.condition === '<' && currentPrice < alert.price)
-      ) {
-        bot.telegram.sendMessage(alert.userId, `🔔 ${alert.symbol} сейчас ${currentPrice}`);
-        await alertsCollection.deleteOne({ _id: alert._id });
-      }
-    } catch (err) {
-      console.error(`Ошибка получения цены ${alert.symbol}`, err.message);
+    if (
+      (alert.condition === '>' && currentPrice > alert.price) ||
+      (alert.condition === '<' && currentPrice < alert.price)
+    ) {
+      bot.telegram.sendMessage(alert.userId, `🔔 ${alert.symbol} сейчас ${currentPrice}`);
+      await alertsCollection.deleteOne({ _id: alert._id });
     }
   }
 }, 60000);
 
-bot.launch().then(() => console.log('🚀 Бот запущен с MongoDB'));
+bot.launch().then(() => console.log('🚀 Бот запущен с MongoDB и оптимизированным кэшем'));
