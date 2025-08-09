@@ -33,7 +33,7 @@ await connectToMongo();
 
 // ------------------ HTTP сервер ------------------
 const app = express();
-app.get('/', (req, res) => res.send('Бот работает! 🚀'));
+app.get('/', (req, res) => res.send('Бот работает с монгошкой! 🚀'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🌐 HTTP сервер запущен на порту ${PORT}`));
