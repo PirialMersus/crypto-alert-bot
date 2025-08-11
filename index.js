@@ -7,8 +7,18 @@ import { MongoClient, ObjectId } from 'mongodb';
 
 dotenv.config();
 
-const bot = new Telegraf(process.env.BOT_TOKEN);
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const MONGO_URI = process.env.MONGO_URI;
+const CREATOR_ID = process.env.CREATOR_ID ? parseInt(process.env.CREATOR_ID, 10) : null;
+const INACTIVE_DAYS = 30; // считать неактивным >30 дней
+const CACHE_TTL = 70000; // 70 секунд
 
+if (!BOT_TOKEN) throw new Error('BOT_TOKEN не задан в окружении');
+if (!MONGO_URI) throw new Error('MONGO_URI не задан в окружении');
+
+const bot = new Telegraf(BOT_TOKEN);
+
+// ------------------ Сессии ------------------
 bot.use(session());
 bot.use((ctx, next) => {
   if (!ctx.session) ctx.session = {};
@@ -16,9 +26,10 @@ bot.use((ctx, next) => {
 });
 
 // ------------------ Подключение к MongoDB ------------------
-const client = new MongoClient(process.env.MONGO_URI);
+const client = new MongoClient(MONGO_URI);
 let alertsCollection;
 let lastViewsCollection;
+let usersCollection;
 
 async function connectToMongo() {
   try {
@@ -26,16 +37,18 @@ async function connectToMongo() {
     const db = client.db();
     alertsCollection = db.collection('alerts');
     lastViewsCollection = db.collection('last_alerts_view');
+    usersCollection = db.collection('users');
     console.log('✅ Подключено к MongoDB');
   } catch (err) {
     console.error('❌ Ошибка подключения к MongoDB:', err);
+    throw err;
   }
 }
 await connectToMongo();
 
 // ------------------ HTTP сервер ------------------
 const app = express();
-app.get('/', (req, res) => res.send('Бот работает с монгошкой! 🚀🚀🚀'));
+app.get('/', (req, res) => res.send('Бот работает с монгошкой! 🚀'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🌐 HTTP сервер запущен на порту ${PORT}`));
 
@@ -43,25 +56,31 @@ app.listen(PORT, () => console.log(`🌐 HTTP сервер запущен на �
 process.on('uncaughtException', err => console.error('Необработанная ошибка:', err));
 process.on('unhandledRejection', reason => console.error('Необработанное обещание:', reason));
 
-const mainMenu = {
-  reply_markup: {
-    keyboard: [
-      [{ text: '➕ Создать алерт' }, { text: '📋 Мои алерты' }]
-    ],
-    resize_keyboard: true
+// ------------------ Главное меню (добавляем кнопку только для создателя) ------------------
+function getMainMenu(userId) {
+  const keyboard = [
+    [{ text: '➕ Создать алерт' }, { text: '📋 Мои алерты' }]
+  ];
+  // сравнение по строкам, чтобы избежать проблем с типами
+  if (CREATOR_ID && String(userId) === String(CREATOR_ID)) {
+    keyboard.push([{ text: '👥 Количество активных пользователей' }]);
   }
-};
+  return { reply_markup: { keyboard, resize_keyboard: true } };
+}
 
-// ------------------ Кэш цен ------------------
-const pricesCache = new Map(); // symbol -> { price, time }
-const CACHE_TTL = 15000; // 15 секунд
+// ------------------ КЭШИ ------------------
+const pricesCache = new Map();        // symbol -> { price, time }
+const alertsCache = new Map();        // userId -> { alerts, time }
+const lastViewsCache = new Map();     // userId -> { map: {symbol:lastPrice}, time }
+const usersActivityCache = new Map(); // userId -> lastWriteTs (ms)
+let statsCache = { count: null, time: 0 }; // кеш для количества активных пользователей
 
+// ------------------ Получение цены (KuCoin) с кешем ------------------
 async function getPrice(symbol) {
   const now = Date.now();
   const cached = pricesCache.get(symbol);
-  if (cached && (now - cached.time) < CACHE_TTL) {
-    return cached.price;
-  }
+  if (cached && (now - cached.time) < CACHE_TTL) return cached.price;
+
   try {
     const res = await axios.get(`https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=${symbol}`);
     const price = parseFloat(res.data.data?.price);
@@ -73,38 +92,167 @@ async function getPrice(symbol) {
   }
 }
 
-// ------------------ Helpers ------------------
+// ------------------ Кеширование списка алертов (по пользователю) ------------------
+async function getUserAlertsCached(userId) {
+  const now = Date.now();
+  const cached = alertsCache.get(userId);
+  if (cached && (now - cached.time) < CACHE_TTL) return cached.alerts;
+
+  const alerts = await alertsCollection.find({ userId }).toArray();
+  alertsCache.set(userId, { alerts, time: now });
+  return alerts;
+}
+function invalidateUserAlertsCache(userId) {
+  try {
+    alertsCache.delete(userId);
+  } catch (e) {
+    console.error('Ошибка инвалидации кеша алертов для', userId, e);
+  }
+}
+
+// ------------------ lastViews: чтение с кешем + буферизованная запись ------------------
+async function getUserLastViewsCached(userId) {
+  const now = Date.now();
+  const cached = lastViewsCache.get(userId);
+  if (cached && (now - cached.time) < CACHE_TTL) return cached.map;
+
+  const rows = await lastViewsCollection.find({ userId }).toArray();
+  const map = Object.fromEntries(rows.map(r => [r.symbol, r.lastPrice]));
+  lastViewsCache.set(userId, { map, time: now });
+  return map;
+}
+
+// updates: { SYMBOL: price, ... }
+// Записываем в БД не чаще, чем раз в CACHE_TTL, иначе обновляем только память
+async function updateUserLastViews(userId, updates) {
+  if (!userId) return;
+  const now = Date.now();
+  const cached = lastViewsCache.get(userId);
+
+  if (cached && (now - cached.time) < CACHE_TTL) {
+    // обновляем только в памяти
+    Object.assign(cached.map, updates);
+    return;
+  }
+
+  // иначе — пишем в БД одним bulkWrite и обновляем кеш
+  const combined = { ...(cached ? cached.map : {}), ...updates };
+  const ops = Object.entries(combined).map(([symbol, lastPrice]) => ({
+    updateOne: {
+      filter: { userId, symbol },
+      update: { $set: { lastPrice } },
+      upsert: true
+    }
+  }));
+
+  if (ops.length) {
+    try {
+      await lastViewsCollection.bulkWrite(ops);
+    } catch (e) {
+      console.error('Ошибка bulkWrite lastViews:', e);
+    }
+  }
+  lastViewsCache.set(userId, { map: combined, time: now });
+}
+
+// ------------------ Middleware: обновление lastActive (rate-limited, не чаще чем CACHE_TTL) ------------------
+bot.use(async (ctx, next) => {
+  try {
+    if (ctx.from && ctx.from.id) {
+      const uid = ctx.from.id;
+      const now = Date.now();
+      const lastWrite = usersActivityCache.get(uid) || 0;
+      if ((now - lastWrite) >= CACHE_TTL) {
+        try {
+          await usersCollection.updateOne(
+            { userId: uid },
+            { $set: { userId: uid, username: ctx.from.username || null, lastActive: new Date() } },
+            { upsert: true }
+          );
+        } catch (e) {
+          console.error('Ошибка записи lastActive:', e);
+        }
+        usersActivityCache.set(uid, now);
+        // инвалидируем статистику, чтобы владелец видел свежие данные максимум через TTL
+        statsCache.time = 0;
+      }
+    }
+  } catch (e) {
+    console.error('Ошибка в middleware активности:', e);
+  }
+  return next();
+});
+
+// ------------------ Хелперы форматирования ------------------
 function formatPercentRemaining(condition, targetPrice, currentPrice) {
   if (typeof currentPrice !== 'number' || typeof targetPrice !== 'number') return '';
-  if (condition === '>' && currentPrice < targetPrice) {
-    const pct = ((targetPrice - currentPrice) / targetPrice) * 100;
-    return `(осталось ${pct.toFixed(2)}% до срабатывания)`;
-  }
-  if (condition === '<' && currentPrice > targetPrice) {
-    const pct = ((currentPrice - targetPrice) / targetPrice) * 100;
-    return `(осталось ${pct.toFixed(2)}% до срабатывания)`;
+  const diff = condition === '>' ? targetPrice - currentPrice : currentPrice - targetPrice;
+  if ((condition === '>' && currentPrice < targetPrice) || (condition === '<' && currentPrice > targetPrice)) {
+    return `(осталось ${(diff / targetPrice * 100).toFixed(2)}% до срабатывания)`;
   }
   return '';
 }
-
 function formatChangeWithIcons(change) {
-  // change — число в процентах
   const sign = change >= 0 ? '+' : '';
   const value = `${sign}${change.toFixed(2)}%`;
   if (change > 0) return `${value} 🟢⬆️`;
   if (change < 0) return `${value} 🔴⬇️`;
   return `${value}`;
 }
+const safeBold = text => `*${text}*`;
 
-function safeBold(text) {
-  // Простая обёртка для жирного в Markdown (мы предполагаем что символы тикера безопасны)
-  return `*${text}*`;
+// ------------------ Отрисовка списка алертов ------------------
+async function renderAlertsList(userId) {
+  const alerts = await getUserAlertsCached(userId);
+  if (!alerts.length) return { text: 'У тебя нет активных алертов.', buttons: [] };
+
+  const uniqueSymbols = [...new Set(alerts.map(a => a.symbol))];
+  const pricesArr = await Promise.all(uniqueSymbols.map(sym => getPrice(sym)));
+  const priceMap = Object.fromEntries(uniqueSymbols.map((sym, i) => [sym, typeof pricesArr[i] === 'number' ? pricesArr[i] : null]));
+
+  const lastViewMap = await getUserLastViewsCached(userId);
+
+  let msg = '📋 *Твои алерты:*\n\n';
+  const buttons = [];
+  const updates = {};
+
+  alerts.forEach((a, i) => {
+    const currentPrice = priceMap[a.symbol];
+    const titleLine = safeBold(`${i + 1}. ${a.symbol}`);
+
+    if (currentPrice == null) {
+      msg += `${titleLine}\n— нет данных о цене\n\n`;
+    } else {
+      const percentText = formatPercentRemaining(a.condition, a.price, currentPrice);
+      let changeSinceLast = '';
+      if (typeof lastViewMap[a.symbol] === 'number') {
+        const change = ((currentPrice - lastViewMap[a.symbol]) / lastViewMap[a.symbol]) * 100;
+        changeSinceLast = `\n📊 С последнего просмотра: ${formatChangeWithIcons(change)}`;
+      }
+
+      msg += `${titleLine}\n` +
+        `Условие: ${a.condition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${a.price}*\n` +
+        `Текущая: *${currentPrice}* ${percentText}${changeSinceLast}\n\n`;
+
+      updates[a.symbol] = currentPrice;
+    }
+
+    buttons.push([{ text: `❌ Удалить ${i + 1} пару`, callback_data: `del_${a._id.toString()}` }]);
+  });
+
+  try {
+    await updateUserLastViews(userId, updates);
+  } catch (e) {
+    console.error('Ошибка при updateUserLastViews:', e);
+  }
+
+  return { text: msg, buttons };
 }
 
-// ------------------ Telegram ------------------
+// ------------------ Telegram handlers ------------------
 bot.start((ctx) => {
   ctx.session = {};
-  ctx.reply('Привет! 🚀 Я бот для уведомлений о цене крипты (KuCoin API).', mainMenu);
+  ctx.reply('Привет! 🚀 Я бот для уведомлений о цене крипты (KuCoin API).', getMainMenu(ctx.from?.id));
 });
 
 bot.hears('➕ Создать алерт', (ctx) => {
@@ -114,93 +262,41 @@ bot.hears('➕ Создать алерт', (ctx) => {
   });
 });
 
-// --- Главное: Мои алерты ---
 bot.hears('📋 Мои алерты', async (ctx) => {
   try {
-    const userId = ctx.from.id;
-    const userAlerts = await alertsCollection.find({ userId }).toArray();
-
-    if (!userAlerts.length) {
-      return ctx.reply('У тебя нет активных алертов.', mainMenu);
-    }
-
-    // Уникальные символы (чтобы не дергать API лишний раз)
-    const uniqueSymbols = [...new Set(userAlerts.map(a => a.symbol))];
-
-    // Получаем цены параллельно
-    const pricePromises = uniqueSymbols.map(sym => getPrice(sym));
-    const priceResults = await Promise.all(pricePromises);
-    const priceMap = {};
-    uniqueSymbols.forEach((sym, i) => {
-      priceMap[sym] = (typeof priceResults[i] === 'number') ? priceResults[i] : 'нет данных';
-    });
-
-    // Загружаем все lastViews одним запросом (для данного пользователя)
-    const lastViews = await lastViewsCollection.find({ userId }).toArray();
-    const hasPrevView = lastViews.length > 0;
-    const lastViewMap = Object.fromEntries(lastViews.map(v => [v.symbol, v.lastPrice]));
-
-    // Формируем сообщение: каждая запись — номер + пара жирным, затем условие/цена/проценты
-    let msg = '📋 *Твои алерты:*\n\n';
-    const buttons = []; // inline-кнопки: каждая кнопка соответствует одному алерту (текст: ❌ Удалить N пару)
-    const updatePromises = [];
-
-    for (let i = 0; i < userAlerts.length; i++) {
-      const a = userAlerts[i];
-      const currentPrice = priceMap[a.symbol];
-
-      // Номер и пара (жирная строка)
-      const titleLine = safeBold(`${i + 1} ${a.symbol}`);
-
-      if (currentPrice === 'нет данных' || currentPrice === null) {
-        msg += `${titleLine}\n— нет данных о цене\n\n`;
-        buttons.push([{ text: `❌ Удалить ${i + 1} пару`, callback_data: `del_${a._id.toString()}` }]);
-        continue;
-      }
-
-      const percentText = formatPercentRemaining(a.condition, a.price, currentPrice);
-
-      // Показываем изменение с последнего просмотра только если ранее был просмотр
-      let changeSinceLast = '';
-      if (hasPrevView && lastViewMap[a.symbol] !== undefined && typeof lastViewMap[a.symbol] === 'number') {
-        const change = ((currentPrice - lastViewMap[a.symbol]) / lastViewMap[a.symbol]) * 100;
-        changeSinceLast = `\n📊 С последнего просмотра: ${formatChangeWithIcons(change)}`;
-      }
-
-      msg += `${titleLine}\n` +
-        `Условие: ${a.condition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${a.price}*\n` +
-        `Текущая: *${currentPrice}* ${percentText}${changeSinceLast}\n\n`;
-
-      // кнопка удаления: ❌ Удалить N пару
-      buttons.push([{ text: `❌ Удалить ${i + 1} пару`, callback_data: `del_${a._id.toString()}` }]);
-
-      // Подготовим upsert lastPrice (собираем промисы)
-      updatePromises.push(
-        lastViewsCollection.updateOne(
-          { userId, symbol: a.symbol },
-          { $set: { lastPrice: currentPrice } },
-          { upsert: true }
-        ).catch(e => console.error('Ошибка сохранения lastPrice', e))
-      );
-    }
-
-    // Выполняем все upsert параллельно
-    await Promise.all(updatePromises);
-
-    // Отправляем сообщение с inline-кнопками. Каждой строке соответствует своя кнопка.
-    await ctx.replyWithMarkdown(msg, {
-      reply_markup: { inline_keyboard: buttons }
-    });
+    const { text, buttons } = await renderAlertsList(ctx.from.id);
+    await ctx.replyWithMarkdown(text, { reply_markup: { inline_keyboard: buttons } });
   } catch (err) {
-    console.error('Ошибка в обработчике "Мои алерты":', err);
+    console.error('Ошибка в "Мои алерты":', err);
     ctx.reply('Произошла ошибка при получении алертов. Попробуй позже.');
   }
 });
 
-// --- Создание алерта ---
+// --------- Кнопка статистики (только для создателя) ----------
+bot.hears('👥 Количество активных пользователей', async (ctx) => {
+  try {
+    if (!CREATOR_ID || String(ctx.from.id) !== String(CREATOR_ID)) {
+      return ctx.reply('У вас нет доступа к этой команде.');
+    }
+
+    const now = Date.now();
+    if (statsCache.count !== null && (now - statsCache.time) < CACHE_TTL) {
+      return ctx.reply(`👥 Активных пользователей за последние ${INACTIVE_DAYS} дней: ${statsCache.count}`);
+    }
+
+    const cutoff = new Date(Date.now() - INACTIVE_DAYS * 24 * 60 * 60 * 1000);
+    const activeCount = await usersCollection.countDocuments({ lastActive: { $gte: cutoff } });
+    statsCache = { count: activeCount, time: now };
+    await ctx.reply(`👥 Активных пользователей за последние ${INACTIVE_DAYS} дней: ${activeCount}`);
+  } catch (e) {
+    console.error('Ошибка получения количества активных пользователей:', e);
+    ctx.reply('Ошибка получения статистики.');
+  }
+});
+
 bot.hears('↩️ Отмена', (ctx) => {
   ctx.session = {};
-  ctx.reply('Действие отменено ✅', mainMenu);
+  ctx.reply('Действие отменено ✅', getMainMenu(ctx.from.id));
 });
 
 bot.on('text', async (ctx) => {
@@ -256,9 +352,13 @@ bot.on('text', async (ctx) => {
           condition: ctx.session.condition,
           price: ctx.session.price
         });
-        ctx.reply(`✅ Алерт создан: **${ctx.session.symbol}** ${ctx.session.condition} *${ctx.session.price}*\nТекущая цена: *${currentPrice}*`, { parse_mode: 'Markdown', ...mainMenu });
+
+        // инвалидация кеша алертов для юзера (чтобы при следующем просмотре показать свежие данные)
+        invalidateUserAlertsCache(ctx.from.id);
+
+        ctx.reply(`✅ Алерт создан: **${ctx.session.symbol}** ${ctx.session.condition} *${ctx.session.price}*\nТекущая цена: *${currentPrice}*`, { parse_mode: 'Markdown', ...getMainMenu(ctx.from.id) });
       } else {
-        ctx.reply('❌ Ошибка при получении цены. Попробуй позже.', mainMenu);
+        ctx.reply('❌ Ошибка при получении цены. Попробуй позже.', getMainMenu(ctx.from.id));
       }
       ctx.session = {};
     }
@@ -268,118 +368,48 @@ bot.on('text', async (ctx) => {
   }
 });
 
-// --- Удаление алерта через inline-кнопку и мгновенная перерисовка ---
+// ------------------ Удаление алерта (callback) ------------------
 bot.on('callback_query', async (ctx) => {
   try {
     const data = ctx.callbackQuery.data;
-    if (!data || !data.startsWith('del_')) {
-      return ctx.answerCbQuery();
-    }
+    if (!data?.startsWith('del_')) return ctx.answerCbQuery();
 
-    const id = data.replace('del_', '');
-    // Удаляем алерт
-    await alertsCollection.deleteOne({ _id: new ObjectId(id) });
+    const idStr = data.replace('del_', '');
+    await alertsCollection.deleteOne({ _id: new ObjectId(idStr) });
 
-    // Получаем userId и сообщение, чтобы перерисовать
-    const userId = ctx.from.id;
+    // инвалидация кеша алертов для юзера
+    invalidateUserAlertsCache(ctx.from.id);
 
-    // Перезагружаем обновлённый список алертов
-    const updatedAlerts = await alertsCollection.find({ userId }).toArray();
+    const { text, buttons } = await renderAlertsList(ctx.from.id);
 
-    if (!updatedAlerts.length) {
-      // если пусто — редактируем сообщение и отправляем в меню
+    if (buttons.length) {
+      try {
+        await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
+      } catch {
+        await ctx.replyWithMarkdown(text, { reply_markup: { inline_keyboard: buttons } });
+      }
+    } else {
       try {
         await ctx.editMessageText('У тебя больше нет активных алертов.', { reply_markup: { inline_keyboard: [] } });
-      } catch (e) {
-        // иногда редактировать нельзя (старое сообщение) — просто игнорируем
-      }
-      await ctx.reply('Вы в главном меню', mainMenu);
-      await ctx.answerCbQuery('Алерт удалён');
-      return;
-    }
-
-    // Получаем цены для уникальных символов параллельно
-    const uniqueSymbols = [...new Set(updatedAlerts.map(a => a.symbol))];
-    const pricePromises = uniqueSymbols.map(sym => getPrice(sym));
-    const priceResults = await Promise.all(pricePromises);
-    const priceMap = {};
-    uniqueSymbols.forEach((sym, i) => {
-      priceMap[sym] = typeof priceResults[i] === 'number' ? priceResults[i] : 'нет данных';
-    });
-
-    // Получаем lastViews одной операцией
-    const lastViews = await lastViewsCollection.find({ userId }).toArray();
-    const hasPrevView = lastViews.length > 0;
-    const lastViewMap = Object.fromEntries(lastViews.map(v => [v.symbol, v.lastPrice]));
-
-    // Собираем текст
-    let msg = '📋 *Твои алерты:*\n\n';
-    const buttons = [];
-    const updatePromises = [];
-
-    for (let i = 0; i < updatedAlerts.length; i++) {
-      const a = updatedAlerts[i];
-      const currentPrice = priceMap[a.symbol];
-
-      const titleLine = safeBold(`${i + 1} ${a.symbol}`);
-
-      if (currentPrice === 'нет данных') {
-        msg += `${titleLine}\n— нет данных о цене\n\n`;
-        buttons.push([{ text: `❌ Удалить ${i + 1} пару`, callback_data: `del_${a._id.toString()}` }]);
-        continue;
-      }
-
-      const percentText = formatPercentRemaining(a.condition, a.price, currentPrice);
-
-      let changeSinceLast = '';
-      if (hasPrevView && lastViewMap[a.symbol] !== undefined && typeof lastViewMap[a.symbol] === 'number') {
-        const change = ((currentPrice - lastViewMap[a.symbol]) / lastViewMap[a.symbol]) * 100;
-        changeSinceLast = `\n📊 С последнего просмотра: ${formatChangeWithIcons(change)}`;
-      }
-
-      msg += `${titleLine}\n` +
-        `Условие: ${a.condition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${a.price}*\n` +
-        `Текущая: *${currentPrice}* ${percentText}${changeSinceLast}\n\n`;
-
-      buttons.push([{ text: `❌ Удалить ${i + 1} пару`, callback_data: `del_${a._id.toString()}` }]);
-
-      // Обновляем last price для этой пары (собираем промисы)
-      updatePromises.push(
-        lastViewsCollection.updateOne(
-          { userId, symbol: a.symbol },
-          { $set: { lastPrice: currentPrice } },
-          { upsert: true }
-        ).catch(e => console.error('Ошибка сохранения lastPrice после удаления', e))
-      );
-    }
-
-    await Promise.all(updatePromises);
-
-    // Пытаемся отредактировать исходное сообщение (будет работать в большинстве случаев)
-    try {
-      await ctx.editMessageText(msg, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
-    } catch (e) {
-      // если редактировать нельзя (сообщение старое), отправляем новое
-      await ctx.replyWithMarkdown(msg, { reply_markup: { inline_keyboard: buttons } });
+      } catch {}
+      await ctx.reply('Вы в главном меню', getMainMenu(ctx.from.id));
     }
 
     await ctx.answerCbQuery('Алерт удалён');
   } catch (err) {
     console.error('Ошибка в callback_query:', err);
-    try { await ctx.answerCbQuery('Ошибка'); } catch (e) {}
+    try { await ctx.answerCbQuery('Ошибка'); } catch {}
   }
 });
 
-// 🔁 Проверка алертов каждые 60 секунд
+// ------------------ Фоновая проверка алертов (каждые 120 секунд) ------------------
 setInterval(async () => {
   try {
     const allAlerts = await alertsCollection.find({}).toArray();
     if (!allAlerts.length) return;
 
     const uniqueSymbols = [...new Set(allAlerts.map(a => a.symbol))];
-
-    // Обновляем цены параллельно
-    await Promise.all(uniqueSymbols.map(sym => getPrice(sym)));
+    await Promise.all(uniqueSymbols.map(sym => getPrice(sym))); // getPrice сам кеширует
 
     for (const alert of allAlerts) {
       const currentPrice = pricesCache.get(alert.symbol)?.price;
@@ -393,12 +423,50 @@ setInterval(async () => {
           `🔔 *Сработал алерт!*\nМонета: **${alert.symbol}**\nЦена сейчас: *${currentPrice}*\nТвоё условие: ${alert.condition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${alert.price}*`,
           { parse_mode: 'Markdown' }
         );
+
         await alertsCollection.deleteOne({ _id: alert._id });
+
+        // инвалидация кеша алертов для пользователя, у которого сработал алерт
+        invalidateUserAlertsCache(alert.userId);
       }
     }
   } catch (err) {
     console.error('Ошибка в проверке алертов:', err);
   }
-}, 60000);
+}, 120000);
 
-bot.launch().then(() => console.log('🚀 Бот запущен с MongoDB и оптимизированным кэшем'));
+// ------------------ Удаление неактивных пользователей ------------------
+async function removeInactiveUsers() {
+  try {
+    const cutoff = new Date(Date.now() - INACTIVE_DAYS * 24 * 60 * 60 * 1000);
+    const inactiveUsers = await usersCollection.find({ lastActive: { $lt: cutoff } }).toArray();
+
+    if (!inactiveUsers.length) return;
+
+    const ids = inactiveUsers.map(u => u.userId);
+    await alertsCollection.deleteMany({ userId: { $in: ids } });
+    await lastViewsCollection.deleteMany({ userId: { $in: ids } });
+    await usersCollection.deleteMany({ userId: { $in: ids } });
+
+    // очистка кэшей для удалённых пользователей
+    ids.forEach(id => {
+      invalidateUserAlertsCache(id);
+      usersActivityCache.delete(id);
+      lastViewsCache.delete(id);
+    });
+
+    // инвалидация статистики
+    statsCache.time = 0;
+
+    console.log(`Удалено ${ids.length} неактивных пользователей (>${INACTIVE_DAYS} дней) и их данные.`);
+  } catch (e) {
+    console.error('Ошибка при удалении неактивных пользователей:', e);
+  }
+}
+
+// Запуск при старте и затем раз в сутки
+await removeInactiveUsers();
+setInterval(removeInactiveUsers, 24 * 60 * 60 * 1000);
+
+// ------------------ Запуск бота ------------------
+bot.launch().then(() => console.log('🚀 Бот запущен с кэшем и оптимизациями'));
