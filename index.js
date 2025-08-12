@@ -50,7 +50,7 @@ await connectToMongo();
 
 // ------------------ HTTP сервер ------------------
 const app = express();
-app.get('/', (req, res) => res.send('Бот работает с монгошкой! 🚀🚀🚀'));
+app.get('/', (req, res) => res.send('Бот работает с монгошкой! 🚀🚀🚀🚀'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🌐 HTTP сервер запущен на порту ${PORT}`));
 
@@ -79,39 +79,6 @@ let statsCache = { count: null, time: 0 }; // кеш для количества
 // Доп. кэши и дедупликация запросов
 let allAlertsCache = { alerts: null, time: 0 }; // global alerts cache for background check
 const requestCache = new Map(); // key -> { time, value, promise }
-
-// ------------------ Request cache + helpers ------------------
-async function getCachedResponse(key, fetcher) {
-  const now = Date.now();
-  const cached = requestCache.get(key);
-
-  // 1) свежий value — возвращаем мгновенно
-  if (cached && cached.value && (now - cached.time) < CACHE_TTL) {
-    return cached.value;
-  }
-
-  // 2) если есть in-flight promise — ждём его (не запускаем новый fetch)
-  if (cached && cached.promise) {
-    return await cached.promise;
-  }
-
-  // 3) запускаем fetch и сохраняем promise
-  const p = (async () => {
-    try {
-      const val = await fetcher();
-      requestCache.set(key, { time: Date.now(), value: val }); // сохраняем результат
-      return val;
-    } catch (err) {
-      // при ошибке чистим кеш чтобы следующий вызов мог повторить попытку
-      requestCache.delete(key);
-      throw err;
-    }
-  })();
-
-  // сохраняем промис (чтобы другие запросы дождались)
-  requestCache.set(key, { promise: p });
-  return await p;
-}
 
 function invalidateRequestCachePrefix(prefix) {
   for (const k of requestCache.keys()) {
