@@ -13,7 +13,7 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const MONGO_URI = process.env.MONGO_URI;
 const CREATOR_ID = process.env.CREATOR_ID ? parseInt(process.env.CREATOR_ID, 10) : null;
 const INACTIVE_DAYS = 30; // считать неактивным >30 дней
-const CACHE_TTL = 70000; // 70 секунд (ms)
+const CACHE_TTL = 10000; // 70 секунд (ms)
 
 if (!BOT_TOKEN) throw new Error('BOT_TOKEN не задан в окружении');
 if (!MONGO_URI) throw new Error('MONGO_URI не задан в окружении');
