@@ -407,7 +407,7 @@ async function renderAlertsList(userId, options = { includeDeleteButtons: false 
 // ------------------ Telegram handlers ------------------
 bot.start((ctx) => {
   ctx.session = {};
-  ctx.reply('Привет! 🚀 Я бот для уведомлений о цене крипты (KuCoin API).', getMainMenu(ctx.from?.id));
+  ctx.reply('Привет! 🚀 Я бот для уведомлений о цене крипты.', getMainMenu(ctx.from?.id));
 });
 
 bot.hears('➕ Создать алерт', (ctx) => {
