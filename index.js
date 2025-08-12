@@ -13,7 +13,7 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const MONGO_URI = process.env.MONGO_URI;
 const CREATOR_ID = process.env.CREATOR_ID ? parseInt(process.env.CREATOR_ID, 10) : null;
 const INACTIVE_DAYS = 30; // считать неактивным >30 дней
-const CACHE_TTL = 10000; // 70 секунд (ms)
+const CACHE_TTL = 10000; // 10 секунд (ms) — кеш цены и некоторых других краткоживущих кешей
 
 if (!BOT_TOKEN) throw new Error('BOT_TOKEN не задан в окружении');
 if (!MONGO_URI) throw new Error('MONGO_URI не задан в окружении');
@@ -139,7 +139,7 @@ async function getPrice(symbol) {
     .catch(err => {
       pricePromises.delete(symbol);
       console.error('getPrice error for', symbol, err?.message || err);
-      throw err;
+      return null;
     });
 
   pricePromises.set(symbol, p);
@@ -177,77 +177,107 @@ async function getAllAlertsCached() {
   return allAlerts;
 }
 
-// ------------------ lastViews: чтение с кешем + буферизованная запись ------------------
-async function getUserLastViewsCached(userId) {
+// ------------------ lastViews: buffered read/write ------------------
+// Структуры для планировщика/буфера
+const lastViewsWriteTimers = new Map();   // userId -> timeoutId
+const lastViewsLastWriteTs = new Map();   // userId -> timestamp ms
+
+// Чтение: сначала из in-memory кеша, иначе из БД и заполняем кэш
+async function getUserLastViewsCachedOrDb(userId) {
+  if (!userId) return {};
   const now = Date.now();
   const cached = lastViewsCache.get(userId);
-  if (cached && (now - cached.time) < CACHE_TTL) return cached.map;
+  if (cached && (now - cached.time) < CACHE_TTL) {
+    return cached.map;
+  }
 
   try {
     const rows = await lastViewsCollection.find({ userId }).toArray();
-    // приводим lastPrice к number, если возможно
-    const mapEntries = rows.map(r => {
+    const map = Object.fromEntries(rows.map(r => {
       const raw = r?.lastPrice;
       const num = (typeof raw === 'number') ? raw : (raw == null ? null : Number(raw));
       return [r.symbol, Number.isFinite(num) ? num : null];
-    });
-    const map = Object.fromEntries(mapEntries);
+    }));
     lastViewsCache.set(userId, { map, time: now });
     return map;
   } catch (e) {
-    console.error('getUserLastViewsCached error:', e);
+    console.error('getUserLastViewsCachedOrDb error:', e);
     lastViewsCache.set(userId, { map: {}, time: now });
     return {};
   }
 }
 
-// updates: { SYMBOL: price, ... }
-// Записываем в БД не чаще, чем раз в CACHE_TTL, иначе обновляем только память
-async function updateUserLastViews(userId, updates) {
+// Прямая запись в БД (bulkWrite)
+async function writeUserLastViewsToDb(userId, updates) {
   if (!userId || !updates || Object.keys(updates).length === 0) return;
-  const now = Date.now();
-  const cached = lastViewsCache.get(userId);
-
-  // нормализуем вход — все значения в Number (или пропускаем, если невалид)
-  const normalized = {};
-  for (const [sym, v] of Object.entries(updates)) {
-    const num = typeof v === 'number' ? v : (v == null ? NaN : Number(v));
-    if (Number.isFinite(num)) normalized[sym] = num;
-  }
-  if (!Object.keys(normalized).length) return;
-
-  if (cached && (now - cached.time) < CACHE_TTL) {
-    // обновляем только в памяти и обновляем таймстамп (чтобы новая память считалась свежей)
-    Object.assign(cached.map, normalized);
-    cached.time = now;
-    lastViewsCache.set(userId, cached);
-    // также инвалидируем рендер-кеш (на случай, если где-то закешировали рендер)
-    invalidateRequestCachePrefix(`renderAlerts:${userId}:`);
-    return;
-  }
-
-  // иначе — пишем в БД (bulkWrite) только нормализованные записи
-  const ops = Object.entries(normalized).map(([symbol, lastPrice]) => ({
+  const ops = Object.entries(updates).map(([symbol, lastPrice]) => ({
     updateOne: {
       filter: { userId, symbol },
       update: { $set: { lastPrice } },
       upsert: true
     }
   }));
-
-  if (ops.length) {
-    try {
-      await lastViewsCollection.bulkWrite(ops);
-    } catch (e) {
-      console.error('Ошибка bulkWrite lastViews:', e);
-      // не падаем — всё равно обновим кеш ниже
-    }
+  try {
+    await lastViewsCollection.bulkWrite(ops);
+    lastViewsLastWriteTs.set(userId, Date.now());
+  } catch (e) {
+    console.error('writeUserLastViewsToDb bulkWrite error:', e);
   }
+}
 
-  const combined = { ...(cached ? cached.map : {}), ...normalized };
-  lastViewsCache.set(userId, { map: combined, time: now });
-  // инвалидируем рендер-кеш (если где-то был)
-  invalidateRequestCachePrefix(`renderAlerts:${userId}:`);
+// Планировщик: отложенная запись (если много быстрых кликов)
+function scheduleWriteLastViews(userId) {
+  if (lastViewsWriteTimers.has(userId)) return;
+
+  const timer = setTimeout(async () => {
+    lastViewsWriteTimers.delete(userId);
+    const cached = lastViewsCache.get(userId);
+    if (!cached || !cached.map) return;
+    await writeUserLastViewsToDb(userId, cached.map);
+    cached.time = Date.now();
+    lastViewsCache.set(userId, cached);
+  }, CACHE_TTL);
+
+  lastViewsWriteTimers.set(userId, timer);
+}
+
+// Buffered update: обновляем только кэш и решаем — писать сейчас или отложить
+async function updateUserLastViewsBuffered(userId, updates) {
+  if (!userId || !updates || Object.keys(updates).length === 0) return;
+  const now = Date.now();
+
+  // нормализуем числа
+  const normalized = {};
+  for (const [sym, v] of Object.entries(updates)) {
+    const num = (typeof v === 'number') ? v : (v == null ? NaN : Number(v));
+    if (Number.isFinite(num)) normalized[sym] = num;
+  }
+  if (!Object.keys(normalized).length) return;
+
+  const cached = lastViewsCache.get(userId) || { map: {}, time: 0 };
+  Object.assign(cached.map, normalized);
+  cached.time = now;
+  lastViewsCache.set(userId, cached);
+
+  const lastWrite = lastViewsLastWriteTs.get(userId) || 0;
+  if ((now - lastWrite) >= CACHE_TTL) {
+    // если с последней записи прошло >= TTL — пишем немедленно
+    await writeUserLastViewsToDb(userId, cached.map);
+  } else {
+    // иначе планируем отложенную запись (если ещё не запланирована)
+    scheduleWriteLastViews(userId);
+  }
+}
+
+// При удалении пользователя очищаем таймеры
+function clearLastViewsUser(userId) {
+  const t = lastViewsWriteTimers.get(userId);
+  if (t) {
+    clearTimeout(t);
+    lastViewsWriteTimers.delete(userId);
+  }
+  lastViewsLastWriteTs.delete(userId);
+  lastViewsCache.delete(userId);
 }
 
 // ------------------ Middleware: обновление lastActive (rate-limited) ------------------
@@ -288,7 +318,6 @@ function formatPercentRemaining(condition, targetPrice, currentPrice) {
   return '';
 }
 function formatChangeWithIcons(change) {
-  // зеленая стрелочка вверх и красная стрелочка вниз
   const sign = change >= 0 ? '+' : '';
   const value = `${sign}${change.toFixed(2)}%`;
   if (change > 0) return `${value} 📈`;
@@ -311,11 +340,12 @@ async function renderAlertsList(userId, options = { includeDeleteButtons: false 
   const pricesArr = await Promise.all(uniqueSymbols.map(sym => getPrice(sym)));
   const priceMap = Object.fromEntries(uniqueSymbols.map((sym, i) => [sym, typeof pricesArr[i] === 'number' ? pricesArr[i] : null]));
 
-  const lastViewMap = await getUserLastViewsCached(userId);
+  // Читаем реальные lastViews из БД/кэша перед вычислением — это ключ к корректной разнице
+  const lastViewMap = await getUserLastViewsCachedOrDb(userId);
 
   let msg = '📋 *Твои алерты:*\n\n';
   const buttons = [];
-  const updates = {};
+  const updates = {}; // обновления lastPrice которые нужно записать после формирования сообщения
 
   alerts.forEach((a, i) => {
     const currentPrice = priceMap[a.symbol];
@@ -333,42 +363,41 @@ async function renderAlertsList(userId, options = { includeDeleteButtons: false 
 
       if (Number.isFinite(last) && last > 0) {
         const change = ((currentPrice - last) / last) * 100;
-        changeSinceLast = `\n📊 С последнего просмотра: ${formatChangeWithIcons(change)}`;
+        changeSinceLast = `\nС последнего просмотра: ${formatChangeWithIcons(change)}`;
       } else if (Number.isFinite(last) && last === 0) {
         // защита от деления на ноль — покажем абсолютную разницу
         const diff = currentPrice - last;
-        changeSinceLast = `\n📊 С последнего просмотра: ${diff.toFixed(8)} (абс.)`;
+        changeSinceLast = `\nС последнего просмотра: ${diff.toFixed(8)} (абс.)`;
       } // иначе — нет данных о последнем просмотре
 
       msg += `${titleLine}\n` +
         `Условие: ${a.condition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${a.price}*\n` +
         `Текущая: *${currentPrice}* ${percentText}${changeSinceLast}\n\n`;
 
+      // помечаем обновление lastPrice — всегда записываем текущее значение в кэш/буфер,
+      // чтобы при следующем клике сравнение было относительно текущего клика.
       updates[a.symbol] = currentPrice;
     }
   });
 
-  // сохраняем последние цены (буферизация внутри функции — безопасно)
+  // записываем новые lastPrice буферизованно (в кэш и по правилам write-buffer)
   try {
-    await updateUserLastViews(userId, updates);
+    await updateUserLastViewsBuffered(userId, updates);
   } catch (e) {
-    console.error('Ошибка при updateUserLastViews:', e);
+    console.error('Ошибка при updateUserLastViewsBuffered:', e);
   }
 
   // формируем inline-кнопки исходя из опции
   if (options.includeDeleteButtons) {
-    // кнопки удаления по одной на алерт + внизу кнопка "Назад"
     alerts.forEach((a, i) => {
-      // Теперь в тексте кнопки показываем: номер, пара и условие
       const conditionText = a.condition === '>' ? '⬆️ выше' : '⬇️ ниже';
       buttons.push([{
         text: `❌ Удалить ${i + 1}: ${a.symbol} (${conditionText} ${a.price})`,
         callback_data: `del_${a._id.toString()}`
       }]);
     });
-    buttons.push([{ text: '⬆️ свернуть', callback_data: 'back_to_alerts' }]);
+    buttons.push([{ text: '⬆️ Свернуть', callback_data: 'back_to_alerts' }]);
   } else {
-    // компактная версия: единственная кнопка "Удалить..."
     buttons.push([{ text: '❌ Удалить пару № ...', callback_data: 'show_delete_menu' }]);
   }
 
@@ -388,7 +417,7 @@ bot.hears('➕ Создать алерт', (ctx) => {
   });
 });
 
-// === ВАЖНО: вызываем renderAlertsList напрямую (без кеша рендера) ===
+// вызываем renderAlertsList напрямую, чтобы lastViews были всегда актуальны
 bot.hears('📋 Мои алерты', async (ctx) => {
   try {
     const { text, buttons } = await renderAlertsList(ctx.from.id, { includeDeleteButtons: false });
@@ -404,7 +433,6 @@ bot.action('show_delete_menu', async (ctx) => {
   try {
     await ctx.answerCbQuery();
     const userId = ctx.from.id;
-    // также напрямую — чтобы "последний просмотр" был актуален
     const { text, buttons } = await renderAlertsList(userId, { includeDeleteButtons: true });
     try {
       await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
@@ -531,7 +559,6 @@ bot.on('text', async (ctx) => {
       const currentPrice = await getPrice(ctx.session.symbol);
 
       if (currentPrice) {
-        // вставка алерта
         await alertsCollection.insertOne({
           userId: ctx.from.id,
           symbol: ctx.session.symbol,
@@ -539,9 +566,8 @@ bot.on('text', async (ctx) => {
           price: ctx.session.price
         });
 
-        // инвалидация кеша алертов для юзера (чтобы при следующем просмотре показать свежие данные)
+        // инвалидация кеша алертов и глобального списка
         invalidateUserAlertsCache(ctx.from.id);
-        // инвалидация глобального списка алертов (фоновые проверки)
         allAlertsCache.time = 0;
 
         ctx.reply(`✅ Алерт создан: **${ctx.session.symbol}** ${ctx.session.condition} *${ctx.session.price}*\nТекущая цена: *${currentPrice}*`, { parse_mode: 'Markdown', ...getMainMenu(ctx.from.id) });
@@ -564,7 +590,6 @@ bot.on('callback_query', async (ctx) => {
 
     if (data.startsWith('del_')) {
       const idStr = data.replace('del_', '');
-      // достаём алерт чтобы знать userId (может быть удалён другим способом)
       const alertToDelete = await alertsCollection.findOne({ _id: new ObjectId(idStr) });
       if (!alertToDelete) {
         await ctx.answerCbQuery('Алерт не найден');
@@ -586,7 +611,6 @@ bot.on('callback_query', async (ctx) => {
           await ctx.replyWithMarkdown(text, { reply_markup: { inline_keyboard: buttons } });
         }
       } else {
-        // нет алертов — сообщаем и отправляем главное меню
         try {
           await ctx.editMessageText('У тебя больше нет активных алертов.', { reply_markup: { inline_keyboard: [] } });
         } catch {}
@@ -597,7 +621,6 @@ bot.on('callback_query', async (ctx) => {
       return;
     }
 
-    // другие callback'и (show_delete_menu/back_to_alerts) обрабатываются через bot.action выше
     await ctx.answerCbQuery();
   } catch (err) {
     console.error('Ошибка в callback_query:', err);
@@ -653,11 +676,11 @@ async function removeInactiveUsers() {
     await lastViewsCollection.deleteMany({ userId: { $in: ids } });
     await usersCollection.deleteMany({ userId: { $in: ids } });
 
-    // очистка кэшей для удалённых пользователей
+    // очистка кэшей и таймеров для удалённых пользователей
     ids.forEach(id => {
       invalidateUserAlertsCache(id);
       usersActivityCache.delete(id);
-      lastViewsCache.delete(id);
+      clearLastViewsUser(id);
     });
 
     // инвалидация статистики
