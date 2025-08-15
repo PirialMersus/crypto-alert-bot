@@ -81,6 +81,9 @@ const alertsCache = new Map();                    // userId -> { alerts, time }
 const lastViewsCache = new Map();                 // userId -> { symbol: lastPrice }
 let allAlertsCache = { alerts: null, time: 0 };
 
+// simple stats cache
+let statsCache = { count: null, time: 0 };
+
 // ---------- HTTP client with retries ----------
 const httpClient = axios.create({ timeout: AXIOS_TIMEOUT, headers: { 'User-Agent': 'crypto-alert-bot/1.0' } });
 
@@ -259,10 +262,6 @@ async function pushUserRecentSymbol(userId, base) {
 }
 
 // ---------- Рендер списка алертов (fast режим для delete/back) ----------
-/**
- * options.fast: если true — быстрый рендер: использует кешы, не ждёт refreshAllTickers
- * options.includeDeleteButtons: показывает кнопки удаления
- */
 async function renderAlertsList(userId, options = { fast: false, includeDeleteButtons: false }) {
   const alerts = await getUserAlertsCached(userId);
   if (!alerts.length) return { text: 'У тебя нет активных алертов.', buttons: [] };
@@ -276,7 +275,6 @@ async function renderAlertsList(userId, options = { fast: false, includeDeleteBu
       priceMap.set(s, await getPrice(s));
     }
   } else {
-    // быстрый: берём из текущего tickersCache или pricesCache (если там есть)
     for (const s of unique) {
       const p = tickersCache.map.get(s);
       if (Number.isFinite(p)) priceMap.set(s, p);
@@ -323,7 +321,6 @@ async function renderAlertsList(userId, options = { fast: false, includeDeleteBu
     buttons.push([{ text: '⬆️ Свернуть', callback_data: 'back_to_alerts' }]);
   }
 
-  // записываем новые lastViews (упрощённо — сразу)
   const valid = {};
   for (const [k, v] of Object.entries(upd)) if (Number.isFinite(v)) valid[k] = v;
   if (Object.keys(valid).length) {
@@ -340,8 +337,16 @@ function getMainMenu(userId) {
   return { reply_markup: { keyboard, resize_keyboard: true } };
 }
 
-// ---------- Handlers ----------
+// ---------- Helpers for stats ----------
+async function countDocumentsWithTimeout(filter, ms = 7000) {
+  if (!usersCollection) throw new Error('usersCollection не инициализирована');
+  return await Promise.race([
+    usersCollection.countDocuments(filter),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('mongo_timeout')), ms))
+  ]);
+}
 
+// ---------- Handlers ----------
 bot.start(ctx => {
   ctx.session = {};
   ctx.reply('Привет! Я бот-алерт для крипты.', getMainMenu(ctx.from?.id));
@@ -361,13 +366,41 @@ bot.hears('↩️ Отмена', ctx => { ctx.session = {}; ctx.reply('Отме�
 // --- Мои алерты: показываем typing (только для этой команды) ---
 bot.hears('📋 Мои алерты', async (ctx) => {
   try {
-    // показать typing
     try { await bot.telegram.sendChatAction(ctx.chat.id, 'typing'); } catch (_) {}
     const { text, buttons } = await renderAlertsList(ctx.from.id, { includeDeleteButtons: false, fast: false });
     await ctx.replyWithMarkdown(text, { reply_markup: { inline_keyboard: buttons } });
   } catch (e) {
     console.error('Мои алерты error', e);
     ctx.reply('Ошибка при получении алертов.');
+  }
+});
+
+// --- Количество активных пользователей (только создателю) ---
+bot.hears('👥 Количество активных пользователей', async (ctx) => {
+  try {
+    if (!CREATOR_ID || String(ctx.from.id) !== String(CREATOR_ID)) {
+      return ctx.reply('У вас нет доступа к этой команде.');
+    }
+
+    const now = Date.now();
+    if (statsCache.count !== null && (now - statsCache.time) < CACHE_TTL) {
+      return ctx.reply(`👥 Активных пользователей за последние ${INACTIVE_DAYS} дней: ${statsCache.count}`);
+    }
+
+    const cutoff = new Date(Date.now() - INACTIVE_DAYS * DAY_MS);
+    let activeCount;
+    try {
+      activeCount = await countDocumentsWithTimeout({ lastActive: { $gte: cutoff } }, 7000);
+    } catch (err) {
+      console.error('Ошибка/таймаут при подсчёте активных пользователей:', err);
+      return ctx.reply('Ошибка получения статистики (таймаут или проблема с БД). Попробуйте позже.');
+    }
+
+    statsCache = { count: activeCount, time: now };
+    await ctx.reply(`👥 Активных пользователей за последние ${INACTIVE_DAYS} дней: ${activeCount}`);
+  } catch (e) {
+    console.error('stats handler error', e);
+    try { await ctx.reply('Ошибка получения статистики.'); } catch {}
   }
 });
 
@@ -381,7 +414,6 @@ bot.action('show_delete_menu', async (ctx) => {
     } catch {
       await ctx.replyWithMarkdown(text, { reply_markup: { inline_keyboard: buttons } });
     }
-    // обновим в фоне, если нужно (не ждём)
     (async () => {
       try {
         const fresh = await renderAlertsList(ctx.from.id, { includeDeleteButtons: true, fast: false });
@@ -430,7 +462,6 @@ bot.on('callback_query', async (ctx) => {
       await alertsCollection.deleteOne({ _id: new ObjectId(id) });
       invalidateUserAlertsCache(ctx.from.id);
 
-      // быстрый рендер результата
       const { text, buttons } = await renderAlertsList(ctx.from.id, { includeDeleteButtons: true, fast: true });
       if (buttons.length) {
         try { await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } }); } catch { await ctx.replyWithMarkdown(text, { reply_markup: { inline_keyboard: buttons } }); }
@@ -555,7 +586,6 @@ setInterval(async () => {
       else missing.push(s);
     }
 
-    // level1 для отсутствующих
     for (let i = 0; i < missing.length; i += 8) {
       const chunk = missing.slice(i, i+8);
       await Promise.all(chunk.map(async sym => {
