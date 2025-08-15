@@ -1,5 +1,7 @@
 // crypto-bot/index.js
-// Главный файл бота с логикой алертов и CRUD в MongoDB
+// Упрощённая версия: телеграм-бот с алертами и опциональным стоп-лоссом.
+// Поддержка массовых котировок (allTickers) + level1 fallback.
+// Показ typing только для "📋 Мои алерты".
 
 import { Telegraf, session } from 'telegraf';
 import axios from 'axios';
@@ -12,270 +14,221 @@ dotenv.config();
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const MONGO_URI = process.env.MONGO_URI;
 const CREATOR_ID = process.env.CREATOR_ID ? parseInt(process.env.CREATOR_ID, 10) : null;
-const INACTIVE_DAYS = 30; // считать неактивным >30 дней
-const CACHE_TTL = 10000; // 10 секунд (ms) — кеш цены и некоторых других краткоживущих кешей
 
 if (!BOT_TOKEN) throw new Error('BOT_TOKEN не задан в окружении');
 if (!MONGO_URI) throw new Error('MONGO_URI не задан в окружении');
 
+// ---------- Константы ----------
+const INACTIVE_DAYS = 30;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+// По твоей просьбе: короткие TTL чтобы данные были более свежими
+const TICKERS_TTL = 10_000;   // ms — allTickers TTL
+const CACHE_TTL = 20_000;    // ms — общий короткий кеш для быстрых данных
+const BG_CHECK_INTERVAL = 60_000; // ms — фоновая проверка алертов
+
+const AXIOS_TIMEOUT = 7_000;
+const AXIOS_RETRIES = 2;
+
+const POPULAR_COINS = ['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE'];
+
+// ---------- Инициализация ----------
 const bot = new Telegraf(BOT_TOKEN);
 
-// ------------------ Сессии ------------------
 bot.use(session());
 bot.use((ctx, next) => {
   if (!ctx.session) ctx.session = {};
   return next();
 });
 
-// ------------------ Подключение к MongoDB ------------------
+const app = express();
+app.get('/', (_req, res) => res.send('Бот работает!'));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`HTTP server on ${PORT}`));
+
+// ---------- MongoDB ----------
 const client = new MongoClient(MONGO_URI);
-let alertsCollection;
-let lastViewsCollection;
-let usersCollection;
+let alertsCollection, usersCollection, lastViewsCollection;
+
+async function ensureIndexes(db) {
+  try {
+    await db.collection('alerts').createIndex({ userId: 1 });
+    await db.collection('alerts').createIndex({ symbol: 1 });
+    await db.collection('alerts').createIndex({ userId: 1, symbol: 1 });
+    await db.collection('users').createIndex({ userId: 1 }, { unique: true });
+    await db.collection('users').createIndex({ lastActive: 1 });
+    await db.collection('last_alerts_view').createIndex({ userId: 1, symbol: 1 }, { unique: true });
+  } catch (e) {
+    console.error('ensureIndexes error', e);
+  }
+}
 
 async function connectToMongo() {
-  try {
-    await client.connect();
-    const db = client.db();
-    alertsCollection = db.collection('alerts');
-    lastViewsCollection = db.collection('last_alerts_view');
-    usersCollection = db.collection('users');
-    console.log('✅ Подключено к MongoDB');
-  } catch (err) {
-    console.error('❌ Ошибка подключения к MongoDB:', err);
-    throw err;
-  }
+  await client.connect();
+  const db = client.db();
+  alertsCollection = db.collection('alerts');
+  usersCollection = db.collection('users');
+  lastViewsCollection = db.collection('last_alerts_view');
+  await ensureIndexes(db);
+  console.log('Connected to MongoDB and indexes are ready');
 }
 await connectToMongo();
 
-// ------------------ HTTP сервер ------------------
-const app = express();
-app.get('/', (req, res) => res.send('Бот работает с монгошкой! 🚀🚀🚀🚀'));
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🌐 HTTP сервер запущен на порту ${PORT}`));
+// ---------- Кэши ----------
+const tickersCache = { time: 0, map: new Map() }; // allTickers cache
+const pricesCache = new Map();                    // symbol -> { price, time }
+const alertsCache = new Map();                    // userId -> { alerts, time }
+const lastViewsCache = new Map();                 // userId -> { symbol: lastPrice }
+let allAlertsCache = { alerts: null, time: 0 };
 
-// ------------------ Обработчики ошибок ------------------
-process.on('uncaughtException', err => console.error('Необработанная ошибка:', err));
-process.on('unhandledRejection', reason => console.error('Необработанное обещание:', reason));
+// ---------- HTTP client with retries ----------
+const httpClient = axios.create({ timeout: AXIOS_TIMEOUT, headers: { 'User-Agent': 'crypto-alert-bot/1.0' } });
 
-// ------------------ Главное меню (добавляем кнопку только для создателя) ------------------
-function getMainMenu(userId) {
-  const keyboard = [
-    [{ text: '➕ Создать алерт' }, { text: '📋 Мои алерты' }]
-  ];
-  if (CREATOR_ID && String(userId) === String(CREATOR_ID)) {
-    keyboard.push([{ text: '👥 Количество активных пользователей' }]);
+async function httpGetWithRetry(url, retries = AXIOS_RETRIES) {
+  let attempt = 0;
+  let lastErr = null;
+  while (attempt <= retries) {
+    try {
+      return await httpClient.get(url);
+    } catch (e) {
+      lastErr = e;
+      const delay = Math.min(500 * Math.pow(2, attempt), 2000);
+      await new Promise(r => setTimeout(r, delay));
+      attempt++;
+    }
   }
-  return { reply_markup: { keyboard, resize_keyboard: true } };
+  throw lastErr;
 }
 
-// ------------------ КЭШИ ------------------
-const pricesCache = new Map();        // symbol -> { price, time }
-const alertsCache = new Map();        // userId -> { alerts, time }
-const lastViewsCache = new Map();     // userId -> { map: {symbol:lastPrice}, time }
-const usersActivityCache = new Map(); // userId -> lastWriteTs (ms)
-let statsCache = { count: null, time: 0 }; // кеш для количества активных пользователей
-
-// Доп. кэши и дедупликация запросов
-let allAlertsCache = { alerts: null, time: 0 }; // global alerts cache for background check
-const requestCache = new Map(); // key -> { time, value, promise }
-
-function invalidateRequestCachePrefix(prefix) {
-  for (const k of requestCache.keys()) {
-    if (k.startsWith(prefix)) requestCache.delete(k);
-  }
-}
-
-// ------------------ Получение цены (KuCoin) с кешем + dedupe ------------------
-const pricePromises = new Map();
-
-async function getPrice(symbol) {
+// ---------- KuCoin: allTickers + level1 ----------
+async function refreshAllTickers() {
   const now = Date.now();
+  if (now - tickersCache.time < TICKERS_TTL && tickersCache.map.size) return tickersCache.map;
+
+  try {
+    const res = await httpGetWithRetry('https://api.kucoin.com/api/v1/market/allTickers');
+    const list = res?.data?.data?.ticker || [];
+    const map = new Map();
+    for (const t of list) {
+      const p = t?.last ? Number(t.last) : NaN;
+      if (t?.symbol && Number.isFinite(p)) map.set(t.symbol, p);
+    }
+    tickersCache.time = Date.now();
+    tickersCache.map = map;
+    return map;
+  } catch (e) {
+    console.error('refreshAllTickers error:', e?.message || e);
+    return tickersCache.map;
+  }
+}
+
+const pricePromises = new Map();
+async function getPriceLevel1(symbol) {
   const cached = pricesCache.get(symbol);
-  if (cached && (now - cached.time) < CACHE_TTL) return cached.price;
+  if (cached && (Date.now() - cached.time) < CACHE_TTL) return cached.price;
+  if (pricePromises.has(symbol)) return await pricePromises.get(symbol);
 
-  if (pricePromises.has(symbol)) return pricePromises.get(symbol);
-
-  const p = axios.get(`https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=${symbol}`)
+  const p = httpGetWithRetry(`https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=${symbol}`)
     .then(res => {
-      const price = parseFloat(res.data.data?.price);
-      pricesCache.set(symbol, { price, time: Date.now() });
-      pricePromises.delete(symbol);
-      return price;
+      const price = Number(res?.data?.data?.price);
+      if (Number.isFinite(price)) {
+        pricesCache.set(symbol, { price, time: Date.now() });
+        return price;
+      }
+      return null;
     })
     .catch(err => {
-      pricePromises.delete(symbol);
-      console.error('getPrice error for', symbol, err?.message || err);
+      console.error('getPriceLevel1 error for', symbol, err?.message || err);
       return null;
-    });
+    })
+    .finally(() => pricePromises.delete(symbol));
 
   pricePromises.set(symbol, p);
   return await p;
 }
 
-// ------------------ Кеширование списка алертов (по пользователю) ------------------
+async function getPrice(symbol) {
+  const map = await refreshAllTickers();
+  if (map.has(symbol)) return map.get(symbol);
+  return await getPriceLevel1(symbol);
+}
+
+// Быстрый — использует текущие кэши и не ждёт долго
+async function getPriceFast(symbol) {
+  if (tickersCache.map.has(symbol) && (Date.now() - tickersCache.time) < TICKERS_TTL * 2) {
+    if (Date.now() - tickersCache.time >= TICKERS_TTL) refreshAllTickers().catch(()=>{});
+    return tickersCache.map.get(symbol);
+  }
+  const lvl1 = await getPriceLevel1(symbol);
+  refreshAllTickers().catch(()=>{});
+  return lvl1;
+}
+
+// ---------- Простейшие CRUD-кеш вспомогательные ----------
 async function getUserAlertsCached(userId) {
   const now = Date.now();
-  const cached = alertsCache.get(userId);
-  if (cached && (now - cached.time) < CACHE_TTL) return cached.alerts;
-
+  const c = alertsCache.get(userId);
+  if (c && (now - c.time) < CACHE_TTL) return c.alerts;
   const alerts = await alertsCollection.find({ userId }).toArray();
   alertsCache.set(userId, { alerts, time: now });
   return alerts;
 }
 function invalidateUserAlertsCache(userId) {
-  try {
-    alertsCache.delete(userId);
-    // инвалидируем рендер-кеш по префиксу (на случай, если где-то ещё использовали)
-    try { invalidateRequestCachePrefix(`renderAlerts:${userId}:`); } catch {}
-  } catch (e) {
-    console.error('Ошибка инвалидации кеша алертов для', userId, e);
-  }
+  alertsCache.delete(userId);
+  allAlertsCache.time = 0;
 }
-
-// ------------------ allAlerts cached (для фоновой проверки) ------------------
 async function getAllAlertsCached() {
   const now = Date.now();
-  if (allAlertsCache.alerts && (now - allAlertsCache.time) < CACHE_TTL) {
-    return allAlertsCache.alerts;
-  }
-  const allAlerts = await alertsCollection.find({}).toArray();
-  allAlertsCache = { alerts: allAlerts, time: now };
-  return allAlerts;
+  if (allAlertsCache.alerts && (now - allAlertsCache.time) < CACHE_TTL) return allAlertsCache.alerts;
+  const all = await alertsCollection.find({}).toArray();
+  allAlertsCache = { alerts: all, time: Date.now() };
+  return all;
 }
 
-// ------------------ lastViews: buffered read/write ------------------
-// Структуры для планировщика/буфера
-const lastViewsWriteTimers = new Map();   // userId -> timeoutId
-const lastViewsLastWriteTs = new Map();   // userId -> timestamp ms
-
-// Чтение: сначала из in-memory кеша, иначе из БД и заполняем кэш
-async function getUserLastViewsCachedOrDb(userId) {
-  if (!userId) return {};
+// last views (упрощённо — читаем/пишем прямо)
+async function getUserLastViews(userId) {
   const now = Date.now();
   const cached = lastViewsCache.get(userId);
-  if (cached && (now - cached.time) < CACHE_TTL) {
-    return cached.map;
-  }
-
-  try {
-    const rows = await lastViewsCollection.find({ userId }).toArray();
-    const map = Object.fromEntries(rows.map(r => {
-      const raw = r?.lastPrice;
-      const num = (typeof raw === 'number') ? raw : (raw == null ? null : Number(raw));
-      return [r.symbol, Number.isFinite(num) ? num : null];
-    }));
-    lastViewsCache.set(userId, { map, time: now });
-    return map;
-  } catch (e) {
-    console.error('getUserLastViewsCachedOrDb error:', e);
-    lastViewsCache.set(userId, { map: {}, time: now });
-    return {};
-  }
+  if (cached && (now - cached.time) < CACHE_TTL) return cached.map;
+  const rows = await lastViewsCollection.find({ userId }).toArray();
+  const map = Object.fromEntries(rows.map(r => [r.symbol, (typeof r.lastPrice === 'number') ? r.lastPrice : null]));
+  lastViewsCache.set(userId, { map, time: now });
+  return map;
 }
-
-// Прямая запись в БД (bulkWrite)
-async function writeUserLastViewsToDb(userId, updates) {
-  if (!userId || !updates || Object.keys(updates).length === 0) return;
+async function setUserLastViews(userId, updates) {
+  if (!updates || !Object.keys(updates).length) return;
   const ops = Object.entries(updates).map(([symbol, lastPrice]) => ({
-    updateOne: {
-      filter: { userId, symbol },
-      update: { $set: { lastPrice } },
-      upsert: true
-    }
+    updateOne: { filter: { userId, symbol }, update: { $set: { lastPrice } }, upsert: true }
   }));
-  try {
-    await lastViewsCollection.bulkWrite(ops);
-    lastViewsLastWriteTs.set(userId, Date.now());
-  } catch (e) {
-    console.error('writeUserLastViewsToDb bulkWrite error:', e);
-  }
-}
-
-// Планировщик: отложенная запись (если много быстрых кликов)
-function scheduleWriteLastViews(userId) {
-  if (lastViewsWriteTimers.has(userId)) return;
-
-  const timer = setTimeout(async () => {
-    lastViewsWriteTimers.delete(userId);
-    const cached = lastViewsCache.get(userId);
-    if (!cached || !cached.map) return;
-    await writeUserLastViewsToDb(userId, cached.map);
-    cached.time = Date.now();
-    lastViewsCache.set(userId, cached);
-  }, CACHE_TTL);
-
-  lastViewsWriteTimers.set(userId, timer);
-}
-
-// Buffered update: обновляем только кэш и решаем — писать сейчас или отложить
-async function updateUserLastViewsBuffered(userId, updates) {
-  if (!userId || !updates || Object.keys(updates).length === 0) return;
-  const now = Date.now();
-
-  // нормализуем числа
-  const normalized = {};
-  for (const [sym, v] of Object.entries(updates)) {
-    const num = (typeof v === 'number') ? v : (v == null ? NaN : Number(v));
-    if (Number.isFinite(num)) normalized[sym] = num;
-  }
-  if (!Object.keys(normalized).length) return;
-
-  const cached = lastViewsCache.get(userId) || { map: {}, time: 0 };
-  Object.assign(cached.map, normalized);
-  cached.time = now;
-  lastViewsCache.set(userId, cached);
-
-  const lastWrite = lastViewsLastWriteTs.get(userId) || 0;
-  if ((now - lastWrite) >= CACHE_TTL) {
-    // если с последней записи прошло >= TTL — пишем немедленно
-    await writeUserLastViewsToDb(userId, cached.map);
-  } else {
-    // иначе планируем отложенную запись (если ещё не запланирована)
-    scheduleWriteLastViews(userId);
-  }
-}
-
-// При удалении пользователя очищаем таймеры
-function clearLastViewsUser(userId) {
-  const t = lastViewsWriteTimers.get(userId);
-  if (t) {
-    clearTimeout(t);
-    lastViewsWriteTimers.delete(userId);
-  }
-  lastViewsLastWriteTs.delete(userId);
+  await lastViewsCollection.bulkWrite(ops);
   lastViewsCache.delete(userId);
 }
 
-// ------------------ Middleware: обновление lastActive (rate-limited) ------------------
+// ---------- Middleware активности ----------
+const usersActivityCache = new Map();
 bot.use(async (ctx, next) => {
   try {
-    if (ctx.from && ctx.from.id) {
-      const uid = ctx.from.id;
+    const uid = ctx.from?.id;
+    if (uid) {
       const now = Date.now();
-      const lastWrite = usersActivityCache.get(uid) || 0;
-      if ((now - lastWrite) >= CACHE_TTL) {
-        try {
-          await usersCollection.updateOne(
-            { userId: uid },
-            { $set: { userId: uid, username: ctx.from.username || null, lastActive: new Date() } },
-            { upsert: true }
-          );
-          usersActivityCache.set(uid, now); // ставим только после успешной записи
-        } catch (e) {
-          console.error('Ошибка записи lastActive:', e);
-        }
-        // инвалидируем статистику
-        statsCache.time = 0;
+      const last = usersActivityCache.get(uid) || 0;
+      if ((now - last) >= CACHE_TTL) {
+        await usersCollection.updateOne(
+          { userId: uid },
+          { $set: { userId: uid, username: ctx.from.username || null, lastActive: new Date() }, $setOnInsert: { createdAt: new Date(), recentSymbols: [] } },
+          { upsert: true }
+        );
+        usersActivityCache.set(uid, now);
       }
     }
   } catch (e) {
-    console.error('Ошибка в middleware активности:', e);
+    console.error('activity middleware error', e);
   }
   return next();
 });
 
-// ------------------ Хелперы форматирования ------------------
+// ---------- Форматирование ----------
+const safeBold = t => `*${t}*`;
 function formatPercentRemaining(condition, targetPrice, currentPrice) {
   if (typeof currentPrice !== 'number' || typeof targetPrice !== 'number') return '';
   const diff = condition === '>' ? targetPrice - currentPrice : currentPrice - targetPrice;
@@ -291,380 +244,364 @@ function formatChangeWithIcons(change) {
   if (change < 0) return `${value} 📉`;
   return `${value}`;
 }
-const safeBold = text => `*${text}*`;
 
-// ------------------ Отрисовка списка алертов ------------------
+// ---------- Полезные функции для предложений ----------
+async function getUserRecentSymbols(userId) {
+  try {
+    const u = await usersCollection.findOne({ userId }, { projection: { recentSymbols: 1 } });
+    return Array.isArray(u?.recentSymbols) ? u.recentSymbols.slice(-6).reverse() : [];
+  } catch {
+    return [];
+  }
+}
+async function pushUserRecentSymbol(userId, base) {
+  try { await usersCollection.updateOne({ userId }, { $addToSet: { recentSymbols: base } }); } catch (e) { /* ignore */ }
+}
+
+// ---------- Рендер списка алертов (fast режим для delete/back) ----------
 /**
- renderAlertsList(userId, options)
- options.includeDeleteButtons: boolean
- Возвращает { text, buttons } где buttons — inline_keyboard (массив рядов).
+ * options.fast: если true — быстрый рендер: использует кешы, не ждёт refreshAllTickers
+ * options.includeDeleteButtons: показывает кнопки удаления
  */
-async function renderAlertsList(userId, options = { includeDeleteButtons: false }) {
+async function renderAlertsList(userId, options = { fast: false, includeDeleteButtons: false }) {
   const alerts = await getUserAlertsCached(userId);
   if (!alerts.length) return { text: 'У тебя нет активных алертов.', buttons: [] };
 
-  const uniqueSymbols = [...new Set(alerts.map(a => a.symbol))];
-  const pricesArr = await Promise.all(uniqueSymbols.map(sym => getPrice(sym)));
-  const priceMap = Object.fromEntries(uniqueSymbols.map((sym, i) => [sym, typeof pricesArr[i] === 'number' ? pricesArr[i] : null]));
+  const unique = [...new Set(alerts.map(a => a.symbol))];
+  const priceMap = new Map();
 
-  // Читаем реальные lastViews из БД/кэша перед вычислением — это ключ к корректной разнице
-  const lastViewMap = await getUserLastViewsCachedOrDb(userId);
+  if (!options.fast) {
+    await refreshAllTickers();
+    for (const s of unique) {
+      priceMap.set(s, await getPrice(s));
+    }
+  } else {
+    // быстрый: берём из текущего tickersCache или pricesCache (если там есть)
+    for (const s of unique) {
+      const p = tickersCache.map.get(s);
+      if (Number.isFinite(p)) priceMap.set(s, p);
+      else {
+        const c = pricesCache.get(s);
+        priceMap.set(s, c ? c.price : null);
+      }
+    }
+    if (Date.now() - tickersCache.time >= TICKERS_TTL) refreshAllTickers().catch(()=>{});
+  }
 
-  let msg = '📋 *Твои алерты:*\n\n';
+  const lastViews = await getUserLastViews(userId);
+  let text = '📋 *Твои алерты:*\n\n';
   const buttons = [];
-  const updates = {}; // обновления lastPrice которые нужно записать после формирования сообщения
+  const upd = {};
 
-  alerts.forEach((a, i) => {
-    const currentPrice = priceMap[a.symbol];
-    const titleLine = safeBold(`${i + 1}. ${a.symbol}`);
-
-    if (currentPrice == null || !Number.isFinite(currentPrice)) {
-      msg += `${titleLine}\n— нет данных о цене\n\n`;
+  alerts.forEach((a, idx) => {
+    const cur = priceMap.get(a.symbol);
+    const isSL = a.type === 'sl';
+    const title = isSL ? safeBold(`${idx+1}. ${a.symbol} — 🛑 SL`) : safeBold(`${idx+1}. ${a.symbol}`);
+    if (!Number.isFinite(cur)) {
+      text += `${title}\n— нет данных о цене\n\n`;
     } else {
-      const percentText = formatPercentRemaining(a.condition, a.price, currentPrice);
-
-      // корректный расчёт изменения с последнего просмотра
-      let changeSinceLast = '';
-      const lastRaw = lastViewMap[a.symbol];
-      const last = (typeof lastRaw === 'number') ? lastRaw : (lastRaw == null ? null : Number(lastRaw));
-
+      const percent = formatPercentRemaining(a.condition, a.price, cur);
+      let changeText = '';
+      const last = (typeof lastViews[a.symbol] === 'number') ? lastViews[a.symbol] : null;
       if (Number.isFinite(last) && last > 0) {
-        const change = ((currentPrice - last) / last) * 100;
-        changeSinceLast = `\nС последнего просмотра: ${formatChangeWithIcons(change)}`;
-      } else if (Number.isFinite(last) && last === 0) {
-        // защита от деления на ноль — покажем абсолютную разницу
-        const diff = currentPrice - last;
-        changeSinceLast = `\nС последнего просмотра: ${diff.toFixed(8)} (абс.)`;
-      } // иначе — нет данных о последнем просмотре
-
-      msg += `${titleLine}\n` +
-        `Условие: ${a.condition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${a.price}*\n` +
-        `Текущая: *${currentPrice}* ${percentText}${changeSinceLast}\n\n`;
-
-      // помечаем обновление lastPrice — всегда записываем текущее значение в кэш/буфер,
-      // чтобы при следующем клике сравнение было относительно текущего клика.
-      updates[a.symbol] = currentPrice;
+        changeText = `\nС последнего просмотра: ${formatChangeWithIcons(((cur - last)/last)*100)}`;
+      }
+      text += `${title}\nТип: ${isSL ? '🛑 Стоп-лосс' : '🔔 Уведомление'}\nУсловие: ${a.condition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${a.price}*\nТекущая: *${cur}* ${percent}${changeText}\n\n`;
+      upd[a.symbol] = cur;
+    }
+    if (options.includeDeleteButtons) {
+      buttons.push([{
+        text: `❌ Удалить ${idx+1}: ${a.symbol} (${a.condition} ${a.price})`,
+        callback_data: `del_${a._id.toString()}`
+      }]);
     }
   });
 
-  // записываем новые lastPrice буферизованно (в кэш и по правилам write-buffer)
-  try {
-    await updateUserLastViewsBuffered(userId, updates);
-  } catch (e) {
-    console.error('Ошибка при updateUserLastViewsBuffered:', e);
-  }
-
-  // формируем inline-кнопки исходя из опции
-  if (options.includeDeleteButtons) {
-    alerts.forEach((a, i) => {
-      const conditionText = a.condition === '>' ? '⬆️ выше' : '⬇️ ниже';
-      buttons.push([{
-        text: `❌ Удалить ${i + 1}: ${a.symbol} (${conditionText} ${a.price})`,
-        callback_data: `del_${a._id.toString()}`
-      }]);
-    });
-    buttons.push([{ text: '⬆️ Свернуть', callback_data: 'back_to_alerts' }]);
-  } else {
+  if (!options.includeDeleteButtons) {
     buttons.push([{ text: '❌ Удалить пару № ...', callback_data: 'show_delete_menu' }]);
+  } else {
+    buttons.push([{ text: '⬆️ Свернуть', callback_data: 'back_to_alerts' }]);
   }
 
-  return { text: msg, buttons };
+  // записываем новые lastViews (упрощённо — сразу)
+  const valid = {};
+  for (const [k, v] of Object.entries(upd)) if (Number.isFinite(v)) valid[k] = v;
+  if (Object.keys(valid).length) {
+    try { await setUserLastViews(userId, valid); } catch (e) { /* ignore */ }
+  }
+
+  return { text, buttons };
 }
 
-// ------------------ Telegram handlers ------------------
-bot.start((ctx) => {
+// ---------- Main menu ----------
+function getMainMenu(userId) {
+  const keyboard = [[{ text: '➕ Создать алерт' }, { text: '📋 Мои алерты' }]];
+  if (CREATOR_ID && String(userId) === String(CREATOR_ID)) keyboard.push([{ text: '👥 Количество активных пользователей' }]);
+  return { reply_markup: { keyboard, resize_keyboard: true } };
+}
+
+// ---------- Handlers ----------
+
+bot.start(ctx => {
   ctx.session = {};
-  ctx.reply('Привет! 🚀 Я бот для уведомлений о цене крипты.', getMainMenu(ctx.from?.id));
+  ctx.reply('Привет! Я бот-алерт для крипты.', getMainMenu(ctx.from?.id));
 });
 
-bot.hears('➕ Создать алерт', (ctx) => {
+bot.hears('➕ Создать алерт', async (ctx) => {
   ctx.session = { step: 'symbol' };
-  ctx.reply('Введи символ криптовалюты (например: BTC):', {
-    reply_markup: { keyboard: [[{ text: '↩️ Отмена' }]], resize_keyboard: true }
-  });
+  refreshAllTickers().catch(()=>{});
+  const recent = await getUserRecentSymbols(ctx.from.id);
+  const suggest = [...new Set([...recent, ...POPULAR_COINS])].slice(0,6).map(s=>({ text: s }));
+  const kb = suggest.length ? [suggest, [{ text: '↩️ Отмена' }]] : [[{ text: '↩️ Отмена' }]];
+  ctx.reply('Введи символ (например BTC) или нажми кнопку:', { reply_markup: { keyboard: kb, resize_keyboard: true } });
 });
 
-// вызываем renderAlertsList напрямую, чтобы lastViews были всегда актуальны
+bot.hears('↩️ Отмена', ctx => { ctx.session = {}; ctx.reply('Отмена ✅', getMainMenu(ctx.from.id)); });
+
+// --- Мои алерты: показываем typing (только для этой команды) ---
 bot.hears('📋 Мои алерты', async (ctx) => {
   try {
-    const { text, buttons } = await renderAlertsList(ctx.from.id, { includeDeleteButtons: false });
+    // показать typing
+    try { await bot.telegram.sendChatAction(ctx.chat.id, 'typing'); } catch (_) {}
+    const { text, buttons } = await renderAlertsList(ctx.from.id, { includeDeleteButtons: false, fast: false });
     await ctx.replyWithMarkdown(text, { reply_markup: { inline_keyboard: buttons } });
-  } catch (err) {
-    console.error('Ошибка в "Мои алерты":', err);
-    ctx.reply('Произошла ошибка при получении алертов. Попробуй позже.');
+  } catch (e) {
+    console.error('Мои алерты error', e);
+    ctx.reply('Ошибка при получении алертов.');
   }
 });
 
-// --------- Показать меню удаления (нажатие "Удалить...") ----------
+// Показать меню удаления (быстро, без typing)
 bot.action('show_delete_menu', async (ctx) => {
   try {
     await ctx.answerCbQuery();
-    const userId = ctx.from.id;
-    const { text, buttons } = await renderAlertsList(userId, { includeDeleteButtons: true });
+    const { text, buttons } = await renderAlertsList(ctx.from.id, { includeDeleteButtons: true, fast: true });
     try {
       await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
     } catch {
       await ctx.replyWithMarkdown(text, { reply_markup: { inline_keyboard: buttons } });
     }
+    // обновим в фоне, если нужно (не ждём)
+    (async () => {
+      try {
+        const fresh = await renderAlertsList(ctx.from.id, { includeDeleteButtons: true, fast: false });
+        try { await ctx.editMessageText(fresh.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: fresh.buttons } }); } catch {}
+      } catch {}
+    })();
   } catch (e) {
-    console.error('Ошибка show_delete_menu:', e);
+    console.error('show_delete_menu error', e);
     try { await ctx.answerCbQuery('Ошибка'); } catch {}
   }
 });
 
-// --------- Вернуться назад из меню удаления ----------
 bot.action('back_to_alerts', async (ctx) => {
   try {
     await ctx.answerCbQuery();
-    const userId = ctx.from.id;
-    const { text, buttons } = await renderAlertsList(userId, { includeDeleteButtons: false });
+    const { text, buttons } = await renderAlertsList(ctx.from.id, { includeDeleteButtons: false, fast: true });
     try {
       await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
     } catch {
       await ctx.replyWithMarkdown(text, { reply_markup: { inline_keyboard: buttons } });
     }
+    (async () => {
+      try {
+        const fresh = await renderAlertsList(ctx.from.id, { includeDeleteButtons: false, fast: false });
+        try { await ctx.editMessageText(fresh.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: fresh.buttons } }); } catch {}
+      } catch {}
+    })();
   } catch (e) {
-    console.error('Ошибка back_to_alerts:', e);
+    console.error('back_to_alerts error', e);
     try { await ctx.answerCbQuery('Ошибка'); } catch {}
   }
 });
 
-// ------------------ Статистика — надежный хэндлер (для создателя) ------------------
-// helper: countDocuments с таймаутом
-async function countDocumentsWithTimeout(filter, ms = 7000) {
-  if (!usersCollection) throw new Error('usersCollection не инициализирована');
-  return await Promise.race([
-    usersCollection.countDocuments(filter),
-    new Promise((_, reject) => setTimeout(() => reject(new Error('mongo_timeout')), ms))
-  ]);
-}
-
-bot.hears('👥 Количество активных пользователей', async (ctx) => {
-  try {
-    if (!CREATOR_ID || String(ctx.from.id) !== String(CREATOR_ID)) {
-      return ctx.reply('У вас нет доступа к этой команде.');
-    }
-
-    const now = Date.now();
-    if (statsCache.count !== null && (now - statsCache.time) < CACHE_TTL) {
-      return ctx.reply(`👥 Активных пользователей за последние ${INACTIVE_DAYS} дней: ${statsCache.count}`);
-    }
-
-    if (!usersCollection) {
-      console.error('Запрос статистики — usersCollection ещё не готова');
-      return ctx.reply('База данных пока не готова. Попробуйте через пару секунд.');
-    }
-
-    const cutoff = new Date(Date.now() - INACTIVE_DAYS * 24 * 60 * 60 * 1000);
-
-    let activeCount;
-    try {
-      activeCount = await countDocumentsWithTimeout({ lastActive: { $gte: cutoff } }, 7000);
-    } catch (err) {
-      console.error('Ошибка/таймаут при подсчёте активных пользователей:', err);
-      return ctx.reply('Ошибка получения статистики (таймаут или проблема с БД). Попробуйте позже.');
-    }
-
-    statsCache = { count: activeCount, time: now };
-    await ctx.reply(`👥 Активных пользователей за последние ${INACTIVE_DAYS} дней: ${activeCount}`);
-  } catch (e) {
-    console.error('Не удалось получить количество активных пользователей:', e);
-    try { await ctx.reply('Ошибка получения статистики.'); } catch {}
-  }
-});
-
-// --------- Обработчик текста (создание алертов) ----------
-bot.hears('↩️ Отмена', (ctx) => {
-  ctx.session = {};
-  ctx.reply('Действие отменено ✅', getMainMenu(ctx.from.id));
-});
-
-bot.on('text', async (ctx) => {
-  try {
-    const step = ctx.session.step;
-    const text = ctx.message.text.trim();
-
-    if (!step) return;
-
-    if (step === 'symbol') {
-      const symbol = text.toUpperCase();
-      const fullSymbol = `${symbol}-USDT`;
-      const price = await getPrice(fullSymbol);
-
-      if (price) {
-        ctx.session.symbol = fullSymbol;
-        ctx.session.step = 'condition';
-        ctx.reply(`✅ Монета найдена: **${fullSymbol}**\nТекущая цена: *${price}*\nВыбери условие:`, {
-          parse_mode: 'Markdown',
-          reply_markup: {
-            keyboard: [
-              [{ text: '⬆️ Когда выше' }, { text: '⬇️ Когда ниже' }],
-              [{ text: '↩️ Отмена' }]
-            ],
-            resize_keyboard: true
-          }
-        });
-      } else {
-        ctx.reply('❌ Такой пары нет на KuCoin. Попробуй другую монету.');
-      }
-
-    } else if (step === 'condition') {
-      if (text === '⬆️ Когда выше') ctx.session.condition = '>';
-      else if (text === '⬇️ Когда ниже') ctx.session.condition = '<';
-      else return ctx.reply('Выбери из кнопок ⬆️ или ⬇️');
-
-      ctx.session.step = 'price';
-      ctx.reply('Введи цену:', {
-        reply_markup: { keyboard: [[{ text: '↩️ Отмена' }]], resize_keyboard: true }
-      });
-
-    } else if (step === 'price') {
-      const priceValue = parseFloat(text);
-      if (isNaN(priceValue)) return ctx.reply('Введите корректное число цены');
-
-      ctx.session.price = priceValue;
-      const currentPrice = await getPrice(ctx.session.symbol);
-
-      if (currentPrice) {
-        await alertsCollection.insertOne({
-          userId: ctx.from.id,
-          symbol: ctx.session.symbol,
-          condition: ctx.session.condition,
-          price: ctx.session.price
-        });
-
-        // инвалидация кеша алертов и глобального списка
-        invalidateUserAlertsCache(ctx.from.id);
-        allAlertsCache.time = 0;
-
-        ctx.reply(`✅ Алерт создан: **${ctx.session.symbol}** ${ctx.session.condition} *${ctx.session.price}*\nТекущая цена: *${currentPrice}*`, { parse_mode: 'Markdown', ...getMainMenu(ctx.from.id) });
-      } else {
-        ctx.reply('❌ Ошибка при получении цены. Попробуй позже.', getMainMenu(ctx.from.id));
-      }
-      ctx.session = {};
-    }
-  } catch (err) {
-    console.error('Ошибка в on text:', err);
-    ctx.reply('Произошла ошибка, повтори, пожалуйста.');
-  }
-});
-
-// --------- Обработчик callback_query (включая del_) ----------
+// callback delete
 bot.on('callback_query', async (ctx) => {
   try {
-    const data = ctx.callbackQuery.data;
+    const data = ctx.callbackQuery?.data;
     if (!data) return ctx.answerCbQuery();
-
     if (data.startsWith('del_')) {
-      const idStr = data.replace('del_', '');
-      const alertToDelete = await alertsCollection.findOne({ _id: new ObjectId(idStr) });
-      if (!alertToDelete) {
+      const id = data.replace('del_', '');
+      const doc = await alertsCollection.findOne({ _id: new ObjectId(id) });
+      if (!doc) {
         await ctx.answerCbQuery('Алерт не найден');
         return;
       }
-      await alertsCollection.deleteOne({ _id: new ObjectId(idStr) });
-
-      // инвалидация кеша алертов для юзера
+      await alertsCollection.deleteOne({ _id: new ObjectId(id) });
       invalidateUserAlertsCache(ctx.from.id);
-      allAlertsCache.time = 0;
 
-      // после удаления показываем меню удаления заново (чтобы пользователь мог удалить ещё)
-      const { text, buttons } = await renderAlertsList(ctx.from.id, { includeDeleteButtons: true });
-
+      // быстрый рендер результата
+      const { text, buttons } = await renderAlertsList(ctx.from.id, { includeDeleteButtons: true, fast: true });
       if (buttons.length) {
-        try {
-          await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
-        } catch {
-          await ctx.replyWithMarkdown(text, { reply_markup: { inline_keyboard: buttons } });
-        }
+        try { await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } }); } catch { await ctx.replyWithMarkdown(text, { reply_markup: { inline_keyboard: buttons } }); }
       } else {
-        try {
-          await ctx.editMessageText('У тебя больше нет активных алертов.', { reply_markup: { inline_keyboard: [] } });
-        } catch {}
+        try { await ctx.editMessageText('У тебя больше нет активных алертов.', { reply_markup: { inline_keyboard: [] } }); } catch {}
         await ctx.reply('Вы в главном меню', getMainMenu(ctx.from.id));
       }
 
       await ctx.answerCbQuery('Алерт удалён');
       return;
     }
-
     await ctx.answerCbQuery();
-  } catch (err) {
-    console.error('Ошибка в callback_query:', err);
+  } catch (e) {
+    console.error('callback_query error', e);
     try { await ctx.answerCbQuery('Ошибка'); } catch {}
   }
 });
 
-// ------------------ Фоновая проверка алертов (каждые 120 секунд) ------------------
+// ---------- Создание алертов (текстовый поток) ----------
+bot.on('text', async (ctx) => {
+  try {
+    const step = ctx.session.step;
+    const text = (ctx.message.text || '').trim();
+
+    // если без шага и юзер прислал короткий тикер — начинает процесс
+    if (!step && /^[A-Z0-9]{2,10}$/i.test(text)) {
+      ctx.session = { step: 'symbol' };
+    }
+    if (!ctx.session.step) return;
+
+    if (ctx.session.step === 'symbol') {
+      const base = text.toUpperCase();
+      const symbol = `${base}-USDT`;
+      const price = await getPriceFast(symbol);
+      if (Number.isFinite(price)) {
+        await pushUserRecentSymbol(ctx.from.id, base);
+        ctx.session.symbol = symbol;
+        ctx.session.step = 'alert_condition';
+        await ctx.replyWithMarkdown(`✅ Монета: *${symbol}*\nТекущая цена: *${price}*\nВыбери направление:`, {
+          reply_markup: { keyboard: [[{ text: '⬆️ Когда выше' }, { text: '⬇️ Когда ниже' }], [{ text: '↩️ Отмена' }]], resize_keyboard:true }
+        });
+      } else {
+        await ctx.reply('Пара не найдена на KuCoin. Попробуй другой символ.');
+        ctx.session = {};
+      }
+      return;
+    }
+
+    if (ctx.session.step === 'alert_condition') {
+      if (text === '⬆️ Когда выше') ctx.session.alertCondition = '>';
+      else if (text === '⬇️ Когда ниже') ctx.session.alertCondition = '<';
+      else { await ctx.reply('Выбери ⬆️ или ⬇️'); return; }
+      ctx.session.step = 'alert_price';
+      await ctx.reply('Введи цену уведомления:', { reply_markup: { keyboard: [[{ text: '↩️ Отмена' }]], resize_keyboard:true } });
+      return;
+    }
+
+    if (ctx.session.step === 'alert_price') {
+      const v = parseFloat(text);
+      if (!Number.isFinite(v)) { await ctx.reply('Введите корректное число'); return; }
+      ctx.session.alertPrice = v;
+      ctx.session.step = 'ask_sl';
+      const hint = ctx.session.alertCondition === '>' ? 'SL будет выше (для шорта — логика обратная)' : 'SL будет ниже';
+      await ctx.reply(`Добавить стоп-лосс? ${hint}`, { reply_markup: { keyboard: [[{ text: '🛑 Добавить SL' }, { text: '⏭️ Без SL' }], [{ text: '↩️ Отмена' }]], resize_keyboard:true } });
+      return;
+    }
+
+    if (ctx.session.step === 'ask_sl') {
+      if (text === '⏭️ Без SL') {
+        await alertsCollection.insertOne({ userId: ctx.from.id, symbol: ctx.session.symbol, condition: ctx.session.alertCondition, price: ctx.session.alertPrice, type: 'alert' });
+        invalidateUserAlertsCache(ctx.from.id);
+        const cp = await getPriceFast(ctx.session.symbol);
+        await ctx.replyWithMarkdown(`✅ Алерт создан: *${ctx.session.symbol}* ${ctx.session.alertCondition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${ctx.session.alertPrice}*\nТекущая цена: *${cp ?? '—'}*`, getMainMenu(ctx.from.id));
+        ctx.session = {};
+        return;
+      }
+      if (text === '🛑 Добавить SL') {
+        ctx.session.step = 'sl_price';
+        await ctx.reply('Введи цену стоп-лосса:', { reply_markup: { keyboard: [[{ text: '↩️ Отмена' }]], resize_keyboard:true } });
+        return;
+      }
+      await ctx.reply('Выбери опцию: 🛑 Добавить SL / ⏭️ Без SL');
+      return;
+    }
+
+    if (ctx.session.step === 'sl_price') {
+      const sl = parseFloat(text);
+      if (!Number.isFinite(sl)) { await ctx.reply('Введите корректное число SL'); return; }
+      const groupId = new ObjectId().toString();
+      const slDir = ctx.session.alertCondition === '<' ? 'ниже' : 'выше';
+      await alertsCollection.insertMany([
+        { userId: ctx.from.id, symbol: ctx.session.symbol, condition: ctx.session.alertCondition, price: ctx.session.alertPrice, type: 'alert', groupId },
+        { userId: ctx.from.id, symbol: ctx.session.symbol, condition: ctx.session.alertCondition, price: sl, type: 'sl', slDir, groupId }
+      ]);
+      invalidateUserAlertsCache(ctx.from.id);
+      const cp = await getPriceFast(ctx.session.symbol);
+      await ctx.replyWithMarkdown(`✅ Создана связка:\n🔔 *${ctx.session.symbol}* ${ctx.session.alertCondition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${ctx.session.alertPrice}*\n🛑 SL (${slDir}) *${sl}*\nТекущая: *${cp ?? '—'}*`, getMainMenu(ctx.from.id));
+      ctx.session = {};
+      return;
+    }
+  } catch (e) {
+    console.error('text handler error', e);
+    try { await ctx.reply('Произошла ошибка, попробуй ещё раз.'); } catch {}
+    ctx.session = {};
+  }
+});
+
+// ---------- Фоновая проверка алертов ----------
 setInterval(async () => {
   try {
-    const allAlerts = await getAllAlertsCached();
-    if (!allAlerts.length) return;
+    const all = await getAllAlertsCached();
+    if (!all.length) return;
 
-    const uniqueSymbols = [...new Set(allAlerts.map(a => a.symbol))];
-    await Promise.all(uniqueSymbols.map(sym => getPrice(sym))); // getPrice сам кеширует и дедуплирует
+    await refreshAllTickers().catch(()=>{});
+    const unique = [...new Set(all.map(a => a.symbol))];
 
-    for (const alert of allAlerts) {
-      const currentPrice = pricesCache.get(alert.symbol)?.price;
-      if (typeof currentPrice !== 'number') continue;
+    const priceMap = new Map();
+    const missing = [];
+    for (const s of unique) {
+      const p = tickersCache.map.get(s);
+      if (Number.isFinite(p)) priceMap.set(s, p);
+      else missing.push(s);
+    }
 
-      if (
-        (alert.condition === '>' && currentPrice > alert.price) ||
-        (alert.condition === '<' && currentPrice < alert.price)
-      ) {
-        await bot.telegram.sendMessage(alert.userId,
-          `🔔 *Сработал алерт!*\nМонета: **${alert.symbol}**\nЦена сейчас: *${currentPrice}*\nТвоё условие: ${alert.condition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${alert.price}*`,
+    // level1 для отсутствующих
+    for (let i = 0; i < missing.length; i += 8) {
+      const chunk = missing.slice(i, i+8);
+      await Promise.all(chunk.map(async sym => {
+        const p = await getPriceLevel1(sym);
+        if (Number.isFinite(p)) priceMap.set(sym, p);
+      }));
+    }
+
+    for (const a of all) {
+      const cur = priceMap.get(a.symbol) ?? (pricesCache.get(a.symbol)?.price);
+      if (!Number.isFinite(cur)) continue;
+      if ((a.condition === '>' && cur > a.price) || (a.condition === '<' && cur < a.price)) {
+        const isSL = a.type === 'sl';
+        await bot.telegram.sendMessage(a.userId,
+          `${isSL ? '🛑 *Сработал стоп-лосс!*' : '🔔 *Сработал алерт!*'}\nМонета: *${a.symbol}*\nЦена сейчас: *${cur}*\nУсловие: ${a.condition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${a.price}*`,
           { parse_mode: 'Markdown' }
         );
-
-        await alertsCollection.deleteOne({ _id: alert._id });
-
-        // инвалидация кеша алертов для пользователя, у которого сработал алерт
-        invalidateUserAlertsCache(alert.userId);
+        await alertsCollection.deleteOne({ _id: a._id });
+        invalidateUserAlertsCache(a.userId);
       }
     }
-    // после обработок — инвалидировать глобальный кеш чтобы при следующем цикле получить обновлённый список
+
     allAlertsCache.time = 0;
-  } catch (err) {
-    console.error('Ошибка в проверке алертов:', err);
+  } catch (e) {
+    console.error('bg check error', e);
   }
-}, 120000);
+}, BG_CHECK_INTERVAL);
 
-// ------------------ Удаление неактивных пользователей ------------------
-async function removeInactiveUsers() {
+// ---------- Удаление неактивных пользователей ----------
+async function removeInactive() {
   try {
-    const cutoff = new Date(Date.now() - INACTIVE_DAYS * 24 * 60 * 60 * 1000);
-    const inactiveUsers = await usersCollection.find({ lastActive: { $lt: cutoff } }).toArray();
-
-    if (!inactiveUsers.length) return;
-
-    const ids = inactiveUsers.map(u => u.userId);
+    const cutoff = new Date(Date.now() - INACTIVE_DAYS * DAY_MS);
+    const inactive = await usersCollection.find({ lastActive: { $lt: cutoff } }).project({ userId:1 }).toArray();
+    if (!inactive.length) return;
+    const ids = inactive.map(u => u.userId);
     await alertsCollection.deleteMany({ userId: { $in: ids } });
     await lastViewsCollection.deleteMany({ userId: { $in: ids } });
     await usersCollection.deleteMany({ userId: { $in: ids } });
-
-    // очистка кэшей и таймеров для удалённых пользователей
-    ids.forEach(id => {
-      invalidateUserAlertsCache(id);
-      usersActivityCache.delete(id);
-      clearLastViewsUser(id);
-    });
-
-    // инвалидация статистики
-    statsCache.time = 0;
-
-    // инвалидация глобального списка алертов
-    allAlertsCache.time = 0;
-
-    console.log(`Удалено ${ids.length} неактивных пользователей (>${INACTIVE_DAYS} дней) и их данные.`);
+    ids.forEach(id => alertsCache.delete(id));
+    console.log(`Removed ${ids.length} inactive users`);
   } catch (e) {
-    console.error('Ошибка при удалении неактивных пользователей:', e);
+    console.error('removeInactive error', e);
   }
 }
+await removeInactive();
+setInterval(removeInactive, DAY_MS);
 
-// Запуск при старте и затем раз в сутки
-await removeInactiveUsers();
-setInterval(removeInactiveUsers, 24 * 60 * 60 * 1000);
-
-// ------------------ Запуск бота ------------------
-bot.launch().then(() => console.log('🚀 Бот запущен с кэшем и оптимизациями'));
+// ---------- Старт ----------
+bot.launch().then(() => console.log('Bot started'));
