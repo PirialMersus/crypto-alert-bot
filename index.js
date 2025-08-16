@@ -32,6 +32,12 @@ const AXIOS_RETRIES = 2;
 
 const POPULAR_COINS = ['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE'];
 
+// Telegram limits & pagination policy
+const TELEGRAM_MAX_MESSAGE = 3800; // safety margin (Telegram ~4096). Use 3800 to be safe.
+const PAGINATE_THRESHOLD = 20;     // включать пагинацию только если алертов больше этой величины
+const ENTRIES_PER_PAGE = 20;       // при пагинации — сколько записей на страницу (можно менять)
+const MAX_ENTRIES_PER_PAGE = 50;   // защитный максимум — чтобы не создавать огромные страницы
+
 // ---------- Инициализация ----------
 const bot = new Telegraf(BOT_TOKEN);
 
@@ -248,6 +254,14 @@ function formatChangeWithIcons(change) {
   return `${value}`;
 }
 
+// компактное форматирование числа (убираем лишние нули)
+function fmtNum(n) {
+  if (!Number.isFinite(n)) return '—';
+  if (n >= 1000 || n === Math.floor(n)) return String(Math.round(n));
+  if (n >= 1) return n.toFixed(4).replace(/\.?0+$/, '');
+  return n.toPrecision(6).replace(/\.?0+$/, '');
+}
+
 // ---------- Полезные функции для предложений ----------
 async function getUserRecentSymbols(userId) {
   try {
@@ -261,19 +275,37 @@ async function pushUserRecentSymbol(userId, base) {
   try { await usersCollection.updateOne({ userId }, { $addToSet: { recentSymbols: base } }); } catch (e) { /* ignore */ }
 }
 
-// ---------- Рендер списка алертов (fast режим для delete/back) ----------
+// ---------- Форматирование одной записи алерта ----------
+function formatAlertEntry(a, idx, cur, last) {
+  const isSL = a.type === 'sl';
+  const title = isSL ? `*${idx+1}. ${a.symbol} — 🛑 SL*` : `*${idx+1}. ${a.symbol}*`;
+  const conditionStr = a.condition === '>' ? '⬆️ выше' : '⬇️ ниже';
+  let percent = '';
+  if (typeof cur === 'number' && typeof a.price === 'number') {
+    const diff = a.condition === '>' ? (a.price - cur) : (cur - a.price);
+    percent = ` (осталось ${(diff / a.price * 100).toFixed(2)}% до срабатывания)`;
+  }
+  let changeText = '';
+  if (typeof last === 'number' && last > 0 && typeof cur === 'number') {
+    changeText = `\nС последнего просмотра: ${formatChangeWithIcons(((cur - last)/last)*100)}`;
+  }
+  const curStr = fmtNum(cur);
+  const priceStr = fmtNum(a.price);
+
+  return `${title}\nТип: ${isSL ? '🛑 Стоп-лосс' : '🔔 Уведомление'}\nУсловие: ${conditionStr} *${priceStr}*\nТекущая: *${curStr}*${percent}${changeText}\n\n`;
+}
+
+// ---------- Рендер списка алертов с условной пагинацией ----------
 async function renderAlertsList(userId, options = { fast: false, includeDeleteButtons: false }) {
   const alerts = await getUserAlertsCached(userId);
-  if (!alerts.length) return { text: 'У тебя нет активных алертов.', buttons: [] };
+  if (!alerts.length) return { pages: [{ text: 'У тебя нет активных алертов.', buttons: [] }], pageCount: 1 };
 
   const unique = [...new Set(alerts.map(a => a.symbol))];
   const priceMap = new Map();
 
   if (!options.fast) {
     await refreshAllTickers();
-    for (const s of unique) {
-      priceMap.set(s, await getPrice(s));
-    }
+    for (const s of unique) priceMap.set(s, await getPrice(s));
   } else {
     for (const s of unique) {
       const p = tickersCache.map.get(s);
@@ -287,47 +319,94 @@ async function renderAlertsList(userId, options = { fast: false, includeDeleteBu
   }
 
   const lastViews = await getUserLastViews(userId);
-  let text = '📋 *Твои алерты:*\n\n';
-  const buttons = [];
-  const upd = {};
 
-  alerts.forEach((a, idx) => {
+  // соберём все текстовые записи и метаданные
+  const entries = alerts.map((a, idx) => {
     const cur = priceMap.get(a.symbol);
-    const isSL = a.type === 'sl';
-    const title = isSL ? safeBold(`${idx+1}. ${a.symbol} — 🛑 SL`) : safeBold(`${idx+1}. ${a.symbol}`);
-    if (!Number.isFinite(cur)) {
-      text += `${title}\n— нет данных о цене\n\n`;
-    } else {
-      const percent = formatPercentRemaining(a.condition, a.price, cur);
-      let changeText = '';
-      const last = (typeof lastViews[a.symbol] === 'number') ? lastViews[a.symbol] : null;
-      if (Number.isFinite(last) && last > 0) {
-        changeText = `\nС последнего просмотра: ${formatChangeWithIcons(((cur - last)/last)*100)}`;
-      }
-      text += `${title}\nТип: ${isSL ? '🛑 Стоп-лосс' : '🔔 Уведомление'}\nУсловие: ${a.condition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${a.price}*\nТекущая: *${cur}* ${percent}${changeText}\n\n`;
-      upd[a.symbol] = cur;
-    }
-    if (options.includeDeleteButtons) {
-      buttons.push([{
-        text: `❌ Удалить ${idx+1}: ${a.symbol} (${a.condition} ${a.price})`,
-        callback_data: `del_${a._id.toString()}`
-      }]);
-    }
+    const last = (typeof lastViews[a.symbol] === 'number') ? lastViews[a.symbol] : null;
+    return { text: formatAlertEntry(a, idx, cur, last), id: a._id.toString(), symbol: a.symbol, index: idx };
   });
 
-  if (!options.includeDeleteButtons) {
-    buttons.push([{ text: '❌ Удалить пару № ...', callback_data: 'show_delete_menu' }]);
+  // Если алертов меньше или равно порога — не делать "страницы" (оставляем одну страницу),
+  // но всё равно следим за лимитом длины (на случай длинных записей) — если длина превышает, уменьшаем точность или отправляем в несколько частей.
+  const pages = [];
+
+  if (alerts.length <= PAGINATE_THRESHOLD) {
+    // собираем одну страницу, но проверяем длину и при необходимости делаем несколько страниц
+    let current = { text: '📋 *Твои алерты:*\n\n', entryIndexes: [], buttons: [] };
+    for (let i = 0; i < entries.length; i++) {
+      const e = entries[i];
+      if ((current.text.length + e.text.length) > TELEGRAM_MAX_MESSAGE) {
+        // если это случилось — завершаем текущую страницу и начинаем новую
+        pages.push(current);
+        current = { text: '📋 *Твои алерты:*\n\n', entryIndexes: [], buttons: [] };
+      }
+      current.text += e.text;
+      current.entryIndexes.push(i);
+    }
+    pages.push(current);
   } else {
-    buttons.push([{ text: '⬆️ Свернуть', callback_data: 'back_to_alerts' }]);
+    // включаем постраничную разбивку по ENTRIES_PER_PAGE (и дополнительно следим за TELEGRAM_MAX_MESSAGE)
+    let i = 0;
+    while (i < entries.length) {
+      let current = { text: '📋 *Твои алерты:*\n\n', entryIndexes: [], buttons: [] };
+      let count = 0;
+      while (i < entries.length && count < ENTRIES_PER_PAGE && (current.text.length + entries[i].text.length) <= TELEGRAM_MAX_MESSAGE) {
+        current.text += entries[i].text;
+        current.entryIndexes.push(i);
+        i++; count++;
+      }
+      // если не добавилось ни одной записи из-за длины строки (очень длинная запись) — добавим хотя бы одну
+      if (current.entryIndexes.length === 0 && i < entries.length) {
+        current.text += entries[i].text;
+        current.entryIndexes.push(i);
+        i++;
+      }
+      pages.push(current);
+    }
   }
 
+  // Формируем кнопки и добавляем индикатор страницы в текст (перед кнопками)
+  for (let p = 0; p < pages.length; p++) {
+    // добавим индикатор "Страница X/Y" перед кнопками
+    const pageNumberText = `Страница ${p+1}/${pages.length}\n\n`;
+    pages[p].text = pages[p].text + pageNumberText;
+
+    const rows = [];
+    if (options.includeDeleteButtons) {
+      // per-entry delete buttons
+      for (const idx of pages[p].entryIndexes) {
+        const e = entries[idx];
+        rows.push([{ text: `❌ ${e.index+1}: ${e.symbol}`, callback_data: `del_${e.id}` }]);
+      }
+      // навигация (делим callback на del/view версии)
+      const nav = [];
+      if (p > 0) nav.push({ text: '◀️ Предыдущая страница', callback_data: `alerts_page_${p-1}_del` });
+      if (p < pages.length - 1) nav.push({ text: 'Следующая страница ▶️', callback_data: `alerts_page_${p+1}_del` });
+      if (nav.length) rows.push(nav);
+      rows.push([{ text: '⬆️ Свернуть', callback_data: 'back_to_alerts' }]);
+    } else {
+      // режим просмотра
+      const nav = [];
+      if (p > 0) nav.push({ text: ' ◀️ Предыдущая страница', callback_data: `alerts_page_${p-1}_view` });
+      if (p < pages.length - 1) nav.push({ text: 'Следующая страница ▶️', callback_data: `alerts_page_${p+1}_view` });
+      if (nav.length) rows.push(nav);
+      rows.push([{ text: '❌ Удалить пару № ...', callback_data: 'show_delete_menu' }]);
+    }
+    pages[p].buttons = rows;
+  }
+
+  // сохраним текущие цены как last views компактно
   const valid = {};
-  for (const [k, v] of Object.entries(upd)) if (Number.isFinite(v)) valid[k] = v;
+  for (const s of unique) {
+    const v = priceMap.get(s);
+    if (Number.isFinite(v)) valid[s] = v;
+  }
   if (Object.keys(valid).length) {
     try { await setUserLastViews(userId, valid); } catch (e) { /* ignore */ }
   }
 
-  return { text, buttons };
+  return { pages, pageCount: pages.length };
 }
 
 // ---------- Main menu ----------
@@ -367,8 +446,9 @@ bot.hears('↩️ Отмена', ctx => { ctx.session = {}; ctx.reply('Отме�
 bot.hears('📋 Мои алерты', async (ctx) => {
   try {
     try { await bot.telegram.sendChatAction(ctx.chat.id, 'typing'); } catch (_) {}
-    const { text, buttons } = await renderAlertsList(ctx.from.id, { includeDeleteButtons: false, fast: false });
-    await ctx.replyWithMarkdown(text, { reply_markup: { inline_keyboard: buttons } });
+    const { pages } = await renderAlertsList(ctx.from.id, { includeDeleteButtons: false, fast: false });
+    const first = pages[0];
+    await ctx.replyWithMarkdown(first.text, { reply_markup: { inline_keyboard: first.buttons } });
   } catch (e) {
     console.error('Мои алерты error', e);
     ctx.reply('Ошибка при получении алертов.');
@@ -408,16 +488,17 @@ bot.hears('👥 Количество активных пользователей
 bot.action('show_delete_menu', async (ctx) => {
   try {
     await ctx.answerCbQuery();
-    const { text, buttons } = await renderAlertsList(ctx.from.id, { includeDeleteButtons: true, fast: true });
+    const { pages } = await renderAlertsList(ctx.from.id, { includeDeleteButtons: true, fast: true });
     try {
-      await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
+      await ctx.editMessageText(pages[0].text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: pages[0].buttons } });
     } catch {
-      await ctx.replyWithMarkdown(text, { reply_markup: { inline_keyboard: buttons } });
+      await ctx.replyWithMarkdown(pages[0].text, { reply_markup: { inline_keyboard: pages[0].buttons } });
     }
+    // обновим через асинхронный запрос более точно
     (async () => {
       try {
         const fresh = await renderAlertsList(ctx.from.id, { includeDeleteButtons: true, fast: false });
-        try { await ctx.editMessageText(fresh.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: fresh.buttons } }); } catch {}
+        try { await ctx.editMessageText(fresh.pages[0].text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: fresh.pages[0].buttons } }); } catch {}
       } catch {}
     })();
   } catch (e) {
@@ -429,16 +510,16 @@ bot.action('show_delete_menu', async (ctx) => {
 bot.action('back_to_alerts', async (ctx) => {
   try {
     await ctx.answerCbQuery();
-    const { text, buttons } = await renderAlertsList(ctx.from.id, { includeDeleteButtons: false, fast: true });
+    const { pages } = await renderAlertsList(ctx.from.id, { includeDeleteButtons: false, fast: true });
     try {
-      await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
+      await ctx.editMessageText(pages[0].text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: pages[0].buttons } });
     } catch {
-      await ctx.replyWithMarkdown(text, { reply_markup: { inline_keyboard: buttons } });
+      await ctx.replyWithMarkdown(pages[0].text, { reply_markup: { inline_keyboard: pages[0].buttons } });
     }
     (async () => {
       try {
         const fresh = await renderAlertsList(ctx.from.id, { includeDeleteButtons: false, fast: false });
-        try { await ctx.editMessageText(fresh.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: fresh.buttons } }); } catch {}
+        try { await ctx.editMessageText(fresh.pages[0].text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: fresh.pages[0].buttons } }); } catch {}
       } catch {}
     })();
   } catch (e) {
@@ -447,7 +528,28 @@ bot.action('back_to_alerts', async (ctx) => {
   }
 });
 
-// callback delete
+// Навигация по страницам (view или del mode)
+bot.action(/alerts_page_(\d+)_(view|del)/, async (ctx) => {
+  try {
+    await ctx.answerCbQuery();
+    const pageIndex = parseInt(ctx.match[1], 10);
+    const mode = ctx.match[2]; // 'view' or 'del'
+    const includeDelete = mode === 'del';
+    const { pages } = await renderAlertsList(ctx.from.id, { includeDeleteButtons: includeDelete, fast: false });
+    const idx = Math.max(0, Math.min(pageIndex, pages.length - 1));
+    const p = pages[idx];
+    try {
+      await ctx.editMessageText(p.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: p.buttons } });
+    } catch (err) {
+      await ctx.replyWithMarkdown(p.text, { reply_markup: { inline_keyboard: p.buttons } });
+    }
+  } catch (e) {
+    console.error('alerts_page action error', e);
+    try { await ctx.answerCbQuery('Ошибка'); } catch {}
+  }
+});
+
+// callback delete (удаление конкретного алерта)
 bot.on('callback_query', async (ctx) => {
   try {
     const data = ctx.callbackQuery?.data;
@@ -462,9 +564,10 @@ bot.on('callback_query', async (ctx) => {
       await alertsCollection.deleteOne({ _id: new ObjectId(id) });
       invalidateUserAlertsCache(ctx.from.id);
 
-      const { text, buttons } = await renderAlertsList(ctx.from.id, { includeDeleteButtons: true, fast: true });
-      if (buttons.length) {
-        try { await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } }); } catch { await ctx.replyWithMarkdown(text, { reply_markup: { inline_keyboard: buttons } }); }
+      // после удаления — покажем первую страницу меню удаления (без гарантии сохранения текущей позиции)
+      const { pages } = await renderAlertsList(ctx.from.id, { includeDeleteButtons: true, fast: true });
+      if (pages.length) {
+        try { await ctx.editMessageText(pages[0].text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: pages[0].buttons } }); } catch { await ctx.replyWithMarkdown(pages[0].text, { reply_markup: { inline_keyboard: pages[0].buttons } }); }
       } else {
         try { await ctx.editMessageText('У тебя больше нет активных алертов.', { reply_markup: { inline_keyboard: [] } }); } catch {}
         await ctx.reply('Вы в главном меню', getMainMenu(ctx.from.id));
@@ -500,7 +603,7 @@ bot.on('text', async (ctx) => {
         await pushUserRecentSymbol(ctx.from.id, base);
         ctx.session.symbol = symbol;
         ctx.session.step = 'alert_condition';
-        await ctx.replyWithMarkdown(`✅ Монета: *${symbol}*\nТекущая цена: *${price}*\nВыбери направление:`, {
+        await ctx.replyWithMarkdown(`✅ Монета: *${symbol}*\nТекущая цена: *${fmtNum(price)}*\nВыбери направление:`, {
           reply_markup: { keyboard: [[{ text: '⬆️ Когда выше' }, { text: '⬇️ Когда ниже' }], [{ text: '↩️ Отмена' }]], resize_keyboard:true }
         });
       } else {
@@ -534,7 +637,7 @@ bot.on('text', async (ctx) => {
         await alertsCollection.insertOne({ userId: ctx.from.id, symbol: ctx.session.symbol, condition: ctx.session.alertCondition, price: ctx.session.alertPrice, type: 'alert' });
         invalidateUserAlertsCache(ctx.from.id);
         const cp = await getPriceFast(ctx.session.symbol);
-        await ctx.replyWithMarkdown(`✅ Алерт создан: *${ctx.session.symbol}* ${ctx.session.alertCondition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${ctx.session.alertPrice}*\nТекущая цена: *${cp ?? '—'}*`, getMainMenu(ctx.from.id));
+        await ctx.replyWithMarkdown(`✅ Алерт создан: *${ctx.session.symbol}* ${ctx.session.alertCondition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${fmtNum(ctx.session.alertPrice)}*\nТекущая цена: *${fmtNum(cp) ?? '—'}*`, getMainMenu(ctx.from.id));
         ctx.session = {};
         return;
       }
@@ -558,7 +661,7 @@ bot.on('text', async (ctx) => {
       ]);
       invalidateUserAlertsCache(ctx.from.id);
       const cp = await getPriceFast(ctx.session.symbol);
-      await ctx.replyWithMarkdown(`✅ Создана связка:\n🔔 *${ctx.session.symbol}* ${ctx.session.alertCondition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${ctx.session.alertPrice}*\n🛑 SL (${slDir}) *${sl}*\nТекущая: *${cp ?? '—'}*`, getMainMenu(ctx.from.id));
+      await ctx.replyWithMarkdown(`✅ Создана связка:\n🔔 *${ctx.session.symbol}* ${ctx.session.alertCondition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${fmtNum(ctx.session.alertPrice)}*\n🛑 SL (${slDir}) *${fmtNum(sl)}*\nТекущая: *${fmtNum(cp) ?? '—'}*`, getMainMenu(ctx.from.id));
       ctx.session = {};
       return;
     }
@@ -600,7 +703,7 @@ setInterval(async () => {
       if ((a.condition === '>' && cur > a.price) || (a.condition === '<' && cur < a.price)) {
         const isSL = a.type === 'sl';
         await bot.telegram.sendMessage(a.userId,
-          `${isSL ? '🛑 *Сработал стоп-лосс!*' : '🔔 *Сработал алерт!*'}\nМонета: *${a.symbol}*\nЦена сейчас: *${cur}*\nУсловие: ${a.condition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${a.price}*`,
+          `${isSL ? '🛑 *Сработал стоп-лосс!*' : '🔔 *Сработал алерт!*'}\nМонета: *${a.symbol}*\nЦена сейчас: *${fmtNum(cur)}*\nУсловие: ${a.condition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${fmtNum(a.price)}*`,
           { parse_mode: 'Markdown' }
         );
         await alertsCollection.deleteOne({ _id: a._id });
