@@ -1,5 +1,7 @@
 // path: crypto-bot/index.js
-// Телеграм-бот-алерт: пагинация по 20, компактный режим удаления (кнопки) — удаление по текущей странице (или все, если выбрано).
+// Телеграм-бот-алерт: пагинация по 20, компактный режим удаления (кнопки).
+// ВАЖНОЕ: исправлен баг — источник страницы теперь надежно кодируется в callback_data:
+// format: del_<id>_p<0|1|...|all>
 
 import { Telegraf, session } from 'telegraf';
 import axios from 'axios';
@@ -36,9 +38,19 @@ const TELEGRAM_MAX_MESSAGE = 3800; // safety margin
 // recentSymbols limits
 const RECENT_SYMBOLS_MAX = 20;
 
-// Button padding target: используем эту метку как эталон ширины
+// Button padding target
 const DELETE_MENU_LABEL = '❌ Удалить пару № ...';
 const DELETE_LABEL_TARGET_LEN = DELETE_MENU_LABEL.length;
+
+// ---------- Motivation settings ----------
+const KYIV_TZ = 'Europe/Kyiv';
+const IMAGE_FETCH_HOUR = 4; // 04:00 Kyiv - fetch and store image+quote
+const PREPARE_SEND_HOUR = 5; // 05:00 Kyiv - prepare sends
+const RETRY_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const MAX_RETRY_ATTEMPTS = 12; // attempts for quote (12*5min = 60min)
+const ONLINE_WINDOW_MS = 10 * 60 * 1000; // 10 minutes considered "recently online"
+const QUOTE_CAPTION_MAX = 1024;
+const MESSAGE_TEXT_MAX = 4000;
 
 // ---------- Инициализация ----------
 const bot = new Telegraf(BOT_TOKEN);
@@ -52,7 +64,7 @@ app.listen(PORT, () => console.log(`HTTP server on ${PORT}`));
 
 // ---------- MongoDB ----------
 const client = new MongoClient(MONGO_URI);
-let alertsCollection, usersCollection, lastViewsCollection;
+let alertsCollection, usersCollection, lastViewsCollection, dailyMotivationCollection, dailyQuoteRetryCollection, pendingDailySendsCollection;
 
 async function ensureIndexes(db) {
   try {
@@ -62,6 +74,11 @@ async function ensureIndexes(db) {
     await db.collection('users').createIndex({ userId: 1 }, { unique: true });
     await db.collection('users').createIndex({ lastActive: 1 });
     await db.collection('last_alerts_view').createIndex({ userId: 1, symbol: 1 }, { unique: true });
+
+    // indexes for motivation
+    await db.collection('daily_motivation').createIndex({ date: 1 }, { unique: true });
+    await db.collection('daily_quote_retry').createIndex({ date: 1 }, { unique: true });
+    await db.collection('pending_daily_sends').createIndex({ userId: 1, date: 1 }, { unique: true });
   } catch (e) { console.error('ensureIndexes error', e); }
 }
 
@@ -71,6 +88,9 @@ async function connectToMongo() {
   alertsCollection = db.collection('alerts');
   usersCollection = db.collection('users');
   lastViewsCollection = db.collection('last_alerts_view');
+  dailyMotivationCollection = db.collection('daily_motivation');
+  dailyQuoteRetryCollection = db.collection('daily_quote_retry');
+  pendingDailySendsCollection = db.collection('pending_daily_sends');
   await ensureIndexes(db);
   console.log('Connected to MongoDB and indexes are ready');
 }
@@ -84,14 +104,17 @@ const lastViewsCache = new Map();
 let allAlertsCache = { alerts: null, time: 0 };
 let statsCache = { count: null, time: 0 };
 
+// daily motivation in-memory cache
+const dailyCache = { date: null, doc: null, imageBuffer: null };
+
 // ---------- HTTP client with retries ----------
 const httpClient = axios.create({ timeout: AXIOS_TIMEOUT, headers: { 'User-Agent': 'crypto-alert-bot/1.0' } });
 
-async function httpGetWithRetry(url, retries = AXIOS_RETRIES) {
+async function httpGetWithRetry(url, retries = AXIOS_RETRIES, opts = {}) {
   let attempt = 0;
   let lastErr = null;
   while (attempt <= retries) {
-    try { return await httpClient.get(url); }
+    try { return await httpClient.get(url, opts); }
     catch (e) { lastErr = e; const delay = Math.min(500 * Math.pow(2, attempt), 2000); await new Promise(r => setTimeout(r, delay)); attempt++; }
   }
   throw lastErr;
@@ -187,7 +210,7 @@ async function setUserLastViews(userId, updates) {
   lastViewsCache.delete(userId);
 }
 
-// activity middleware
+// ---------- Activity middleware ----------
 const usersActivityCache = new Map();
 bot.use(async (ctx, next) => {
   try {
@@ -198,7 +221,7 @@ bot.use(async (ctx, next) => {
       if ((now - last) >= CACHE_TTL) {
         await usersCollection.updateOne(
           { userId: uid },
-          { $set: { userId: uid, username: ctx.from.username || null, lastActive: new Date() }, $setOnInsert: { createdAt: new Date(), recentSymbols: [] } },
+          { $set: { userId: uid, username: ctx.from.username || null, lastActive: new Date(), language_code: ctx.from?.language_code || null }, $setOnInsert: { createdAt: new Date(), recentSymbols: [] } },
           { upsert: true }
         );
         usersActivityCache.set(uid, now);
@@ -245,13 +268,11 @@ function formatConditionShort(a) {
   return `${dir} ${fmtNum(a.price)}`;
 }
 
-// ---------- Utility: pad labels to target length using non-breaking spaces ----------
+// ---------- Utility: pad labels ----------
 function padLabel(text, targetLen = DELETE_LABEL_TARGET_LEN) {
-  // простая оценка длины символов — длина строки
   const cur = String(text);
   if (cur.length >= targetLen) return cur;
   const needed = targetLen - cur.length;
-  // NBSP to visually pad
   return cur + '\u00A0'.repeat(needed);
 }
 
@@ -293,9 +314,7 @@ async function renderAlertsList(userId, options = { fast: false }) {
     let text = '📋 *Твои алерты:*\n\n';
     for (const e of entries) text += e.text;
     const buttons = [];
-    // keep the big button as-is (this is reference label)
     buttons.push([{ text: DELETE_MENU_LABEL, callback_data: `show_delete_menu_0` }]);
-    // save last views
     const valid = {};
     for (const s of uniqueSymbols) { const v = priceMap.get(s); if (Number.isFinite(v)) valid[s] = v; }
     if (Object.keys(valid).length) try { await setUserLastViews(userId, valid); } catch (e) {}
@@ -315,13 +334,12 @@ async function renderAlertsList(userId, options = { fast: false }) {
   }
 
   for (let p = 0; p < pages.length; p++) {
-    pages[p].text = pages[p].text + `Страница *${p+1}*/${pages.length}\n\n`; // bold current number
+    pages[p].text = pages[p].text + `Страница *${p+1}*/${pages.length}\n\n`;
     const rows = [];
     const nav = [];
     if (p > 0) nav.push({ text: '◀️ Предыдущая страница', callback_data: `alerts_page_${p-1}_view` });
     if (p < pages.length - 1) nav.push({ text: 'Следующая страница ▶️', callback_data: `alerts_page_${p+1}_view` });
     if (nav.length) rows.push(nav);
-    // pad the menu-open button to target length (keeps visual width)
     rows.push([{ text: padLabel(DELETE_MENU_LABEL), callback_data: `show_delete_menu_${p}` }]);
     pages[p].buttons = rows;
   }
@@ -334,7 +352,11 @@ async function renderAlertsList(userId, options = { fast: false }) {
   return { pages, pageCount: pages.length };
 }
 
-// ---------- Новый хелпер: строит inline-кнопки удаления для данной страницы, без изменения текста ----------
+// ---------- Новый: buildDeleteInlineForUser (callback_data содержит страницу) ----------
+/**
+ * opts.sourcePage: number|null  (null = all)
+ * we always encode page into callback_data as 'all' or the page number
+ */
 async function buildDeleteInlineForUser(userId, opts = { fast: false, sourcePage: null, totalPages: null }) {
   const alerts = await getUserAlertsCached(userId);
   if (!alerts || !alerts.length) return [];
@@ -367,25 +389,23 @@ async function buildDeleteInlineForUser(userId, opts = { fast: false, sourcePage
 
   // page window
   let pageEntries = entries;
-  let startIdx = 0;
-  let endIdx = entries.length;
   if (typeof opts.sourcePage === 'number' && Number.isFinite(opts.sourcePage)) {
-    startIdx = opts.sourcePage * ENTRIES_PER_PAGE;
-    endIdx = Math.min(startIdx + ENTRIES_PER_PAGE, entries.length);
+    const startIdx = opts.sourcePage * ENTRIES_PER_PAGE;
+    const endIdx = Math.min(startIdx + ENTRIES_PER_PAGE, entries.length);
     pageEntries = entries.slice(startIdx, endIdx);
   }
 
   const inline = [];
 
-  // per-entry short delete buttons (one per row) — keep labels short so clients don't truncate
+  // per-entry short delete buttons — IMPORTANT: callback_data encodes source page (authoritative)
   for (const e of pageEntries) {
     const cond = formatConditionShort(e.alert);
     const raw = `❌ ${e.index+1}: ${e.symbol} — ${cond}`;
-    // use padLabel to try to nudge width, but row is short (one button)
-    inline.push([{ text: padLabel(raw, Math.max(DELETE_LABEL_TARGET_LEN, 28)), callback_data: `del_${e.id}` }]);
+    const pageToken = (opts.sourcePage === null) ? 'all' : String(opts.sourcePage);
+    inline.push([{ text: padLabel(raw, Math.max(DELETE_LABEL_TARGET_LEN, 28)), callback_data: `del_${e.id}_p${pageToken}` }]);
   }
 
-  // nav/top rows similar to original renderDeletePage (preserve behaviour)
+  // nav/top rows
   if (typeof opts.sourcePage === 'number' && typeof opts.totalPages === 'number' && opts.totalPages > 1) {
     const nav = [];
     const sp = opts.sourcePage;
@@ -394,7 +414,7 @@ async function buildDeleteInlineForUser(userId, opts = { fast: false, sourcePage
     if (nav.length) inline.push(nav);
   }
 
-  // bottom controls: collapse / show all (removed "удалить страницу")
+  // bottom controls
   if (typeof opts.sourcePage === 'number' && Number.isFinite(opts.sourcePage)) {
     inline.push([{ text: '⬆️ Свернуть', callback_data: `back_to_alerts_p${opts.sourcePage}` }]);
   } else {
@@ -410,114 +430,13 @@ async function buildDeleteInlineForUser(userId, opts = { fast: false, sourcePage
   return inline;
 }
 
-// ---------- renderDeletePage (compact buttons list) — оставляем для случаев, когда нужен отдельный "полный" view ----------
-async function renderDeletePage(userId, opts = { fast: false, sourcePage: null, totalPages: null }) {
-  const alerts = await getUserAlertsCached(userId);
-  if (!alerts || !alerts.length) return { text: 'У тебя нет активных алертов.', buttons: [] };
-
-  const uniqueSymbols = [...new Set(alerts.map(a => a.symbol))];
-  const priceMap = new Map();
-
-  if (!opts.fast) {
-    await refreshAllTickers();
-    for (const s of uniqueSymbols) priceMap.set(s, await getPrice(s));
-  } else {
-    for (const a of alerts) {
-      const p = tickersCache.map.get(a.symbol);
-      if (Number.isFinite(p)) priceMap.set(a.symbol, p);
-      else {
-        const c = pricesCache.get(a.symbol);
-        if (c) priceMap.set(a.symbol, c.price);
-      }
-    }
-    if (Date.now() - tickersCache.time >= TICKERS_TTL) refreshAllTickers().catch(()=>{});
-  }
-
-  const lastViews = await getUserLastViews(userId);
-
-  const entries = alerts.map((a, idx) => {
-    const cur = priceMap.get(a.symbol);
-    const last = (typeof lastViews[a.symbol] === 'number') ? lastViews[a.symbol] : null;
-    return { id: a._id.toString(), symbol: a.symbol, index: idx, alert: a, cur, last };
-  });
-
-  // Пагинация в меню удаления: если указана страница — берём только её диапазон
-  let pageEntries = entries;
-  let startIdx = 0;
-  let endIdx = entries.length;
-  if (typeof opts.sourcePage === 'number' && Number.isFinite(opts.sourcePage)) {
-    startIdx = opts.sourcePage * ENTRIES_PER_PAGE;
-    endIdx = Math.min(startIdx + ENTRIES_PER_PAGE, entries.length);
-    pageEntries = entries.slice(startIdx, endIdx);
-  }
-
-  // header
-  let header = `📋 *Твои алерты (удаление):* — ${entries.length}\n\n`;
-  if (typeof opts.sourcePage === 'number' && typeof opts.totalPages === 'number' && opts.totalPages > 1) {
-    header += `Страница *${opts.sourcePage+1}*/${opts.totalPages}\n\n`;
-  } else if (typeof opts.sourcePage === 'number') {
-    header += `Показаны алerты ${startIdx+1}–${endIdx}\n\n`;
-  } else {
-    header += `Показаны все алерты\n\n`;
-  }
-
-  // top nav row (immediately under indicator)
-  const inline = [];
-  if (typeof opts.sourcePage === 'number' && typeof opts.totalPages === 'number' && opts.totalPages > 1) {
-    const topNav = [];
-    const sp = opts.sourcePage;
-    if (sp > 0) topNav.push({ text: '◀️ Предыдущая страница', callback_data: `alerts_page_${sp-1}_view` });
-    if (sp < opts.totalPages - 1) topNav.push({ text: 'Следующая страница ▶️', callback_data: `alerts_page_${sp+1}_view` });
-    if (topNav.length) inline.push(topNav);
-  }
-
-  // если на этой странице ничего нет
-  if (!pageEntries.length) {
-    // свернуть возвращает на ту страницу, если она задана
-    if (typeof opts.sourcePage === 'number' && Number.isFinite(opts.sourcePage)) {
-      inline.push([{ text: '⬆️ Свернуть', callback_data: `back_to_alerts_p${opts.sourcePage}` }]);
-    } else {
-      inline.push([{ text: '⬆️ Свернуть', callback_data: 'back_to_alerts' }]);
-    }
-    inline.push([{ text: '📂 Показать все алерты', callback_data: 'show_delete_menu_all' }]);
-    return { text: header + '_На этой странице нет алертов._', buttons: inline };
-  }
-
-  // buttons — по одной кнопке на алерт. label: ❌ {№}: SYMBOL — {условие}
-  for (const e of pageEntries) {
-    const cond = formatConditionShort(e.alert);
-    const raw = `❌ ${e.index+1}: ${e.symbol} — ${cond}`;
-    inline.push([{ text: padLabel(raw), callback_data: `del_${e.id}` }]);
-  }
-
-  // нижний ряд: свернуть / показать все (удаление страницы убрано)
-  if (typeof opts.sourcePage === 'number' && Number.isFinite(opts.sourcePage)) {
-    inline.push([{ text: '⬆️ Свернуть', callback_data: `back_to_alerts_p${opts.sourcePage}` }]);
-  } else {
-    inline.push([{ text: '⬆️ Свернуть', callback_data: 'back_to_alerts' }]);
-  }
-  if (pageEntries.length < entries.length) {
-    inline.push([{ text: '📂 Показать все алерты', callback_data: 'show_delete_menu_all' }]);
-  }
-
-  // save last views compactly
-  const valid = {};
-  for (const s of uniqueSymbols) { const v = priceMap.get(s); if (Number.isFinite(v)) valid[s] = v; }
-  if (Object.keys(valid).length) try { await setUserLastViews(userId, valid); } catch (e) {}
-
-  return { text: header, buttons: inline };
-}
-
 // ---------- Helpers (recentSymbols) ----------
 async function pushRecentSymbol(userId, symbol) {
   try {
-    // удалить существующий элемент (если есть)
     await usersCollection.updateOne(
       { userId },
       { $pull: { recentSymbols: symbol } }
     );
-
-    // затем пушим в конец с ограничением длины (slice: -RECENT_SYMBOLS_MAX)
     await usersCollection.updateOne(
       { userId },
       { $push: { recentSymbols: { $each: [symbol], $slice: -RECENT_SYMBOLS_MAX } } },
@@ -530,7 +449,7 @@ async function pushRecentSymbol(userId, symbol) {
 
 // ---------- Menu/helpers ----------
 function getMainMenu(userId) {
-  const keyboard = [[{ text: '➕ Создать алерт' }, { text: '📋 Мои алерты' }]];
+  const keyboard = [[{ text: '➕ Создать алерт' }, { text: '📋 Мои алерты' }], [{ text: '🌅 Прислать мотивацию' }]];
   if (CREATOR_ID && String(userId) === String(CREATOR_ID)) keyboard.push([{ text: '👥 Количество активных пользователей' }]);
   return { reply_markup: { keyboard, resize_keyboard: true } };
 }
@@ -543,7 +462,453 @@ async function countDocumentsWithTimeout(filter, ms = 7000) {
   ]);
 }
 
-// ---------- Handlers ----------
+// ---------- Motivation providers & helpers ----------
+const QUOTABLE_RANDOM = 'https://api.quotable.io/random';
+const ZEN_QUOTES = 'https://zenquotes.io/api/today';
+const TYPEFIT_ALL = 'https://type.fit/api/quotes';
+const UNSPLASH_RANDOM = 'https://source.unsplash.com/random/1200x800/?nature,landscape,forest,mountains,sea';
+const PICSUM_RANDOM = 'https://picsum.photos/1200/800';
+
+async function fetchQuoteQuotable() {
+  try {
+    const res = await httpGetWithRetry(QUOTABLE_RANDOM, 1);
+    const d = res?.data;
+    if (d?.content) return { text: d.content, author: d.author || '', source: 'quotable' };
+  } catch (e) { console.warn('fetchQuoteQuotable failed', e?.message || e); }
+  return null;
+}
+async function fetchQuoteZen() {
+  try {
+    const res = await httpGetWithRetry(ZEN_QUOTES, 1);
+    const d = res?.data;
+    if (Array.isArray(d) && d[0] && d[0].q) return { text: d[0].q, author: d[0].a || '', source: 'zen' };
+  } catch (e) { console.warn('fetchQuoteZen failed', e?.message || e); }
+  return null;
+}
+async function fetchQuoteTypefit() {
+  try {
+    const res = await httpGetWithRetry(TYPEFIT_ALL, 1);
+    const arr = res?.data;
+    if (Array.isArray(arr) && arr.length) {
+      const cand = arr[Math.floor(Math.random() * arr.length)];
+      if (cand && cand.text) return { text: cand.text, author: cand.author || '', source: 'typefit' };
+    }
+  } catch (e) { console.warn('fetchQuoteTypefit failed', e?.message || e); }
+  return null;
+}
+async function fetchQuoteFromAny() {
+  let q = null;
+  q = await fetchQuoteQuotable().catch(()=>null);
+  if (q) return q;
+  q = await fetchQuoteZen().catch(()=>null);
+  if (q) return q;
+  q = await fetchQuoteTypefit().catch(()=>null);
+  if (q) return q;
+  return null;
+}
+
+async function fetchRandomImage() {
+  const sources = [
+    { name: 'unsplash', url: UNSPLASH_RANDOM },
+    { name: 'picsum', url: PICSUM_RANDOM }
+  ];
+  for (const s of sources) {
+    try {
+      const res = await httpGetWithRetry(s.url, 1, { responseType: 'arraybuffer', maxRedirects: 10 });
+      if (res && res.data) {
+        const buf = Buffer.from(res.data);
+        let finalUrl = null;
+        try { finalUrl = res.request?.res?.responseUrl || null; } catch {}
+        return { buffer: buf, url: finalUrl || s.url, source: s.name };
+      }
+    } catch (e) { console.warn('fetchRandomImage failed', s.name, e?.message || e); }
+  }
+  return null;
+}
+
+// translation helper (try google web then libre)
+const LIBRE_ENDPOINTS = ['https://libretranslate.de/translate', 'https://libretranslate.com/translate'];
+async function translateOrNull(text, targetLang) {
+  if (!text) return null;
+  if (!targetLang) return null;
+  const t = String(targetLang).split('-')[0].toLowerCase();
+  if (!t || t === 'en') return text;
+
+  try {
+    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${encodeURIComponent(t)}&dt=t&q=${encodeURIComponent(text)}`;
+    const res = await httpGetWithRetry(url, 0);
+    const data = res?.data;
+    if (Array.isArray(data) && Array.isArray(data[0])) {
+      const out = data[0].map(seg => (Array.isArray(seg) ? seg[0] : '')).join('');
+      if (out && out.trim()) return out.trim();
+    }
+  } catch (e) { /* continue */ }
+
+  for (const endpoint of LIBRE_ENDPOINTS) {
+    try {
+      const resp = await httpClient.post(endpoint, { q: text, source: 'auto', target: t, format: 'text' }, { headers: { 'Content-Type': 'application/json' }, timeout: 7000 });
+      const d = resp?.data;
+      const cand = d?.translatedText || d?.result || d?.translated_text || (typeof d === 'string' ? d : null);
+      if (cand && String(cand).trim()) return String(cand).trim();
+    } catch (e) { /* continue */ }
+  }
+  return null;
+}
+
+async function resolveUserLang(userId, ctxLang = null, ctxFromLang = null) {
+  try {
+    const u = await usersCollection.findOne({ userId }, { projection: { preferredLang: 1, language_code: 1 } });
+    if (u?.preferredLang) return String(u.preferredLang).split('-')[0];
+    if (ctxLang) return String(ctxLang).split('-')[0];
+    if (ctxFromLang) return String(ctxFromLang).split('-')[0];
+    if (u?.language_code) return String(u.language_code).split('-')[0];
+  } catch (e) {}
+  return 'ru';
+}
+
+// ---------- Daily motivation storage & sending ----------
+async function fetchAndStoreDailyMotivation(dateStr) {
+  try {
+    const quote = await fetchQuoteFromAny().catch(()=>null);
+    const img = await fetchRandomImage().catch(()=>null);
+    const doc = {
+      date: dateStr,
+      quote: quote ? { text: quote.text, author: quote.author || '', source: quote.source || '' } : null,
+      image: img ? { url: img.url, source: img.source } : null,
+      createdAt: new Date()
+    };
+    await dailyMotivationCollection.updateOne({ date: dateStr }, { $setOnInsert: doc }, { upsert: true });
+    const stored = await dailyMotivationCollection.findOne({ date: dateStr });
+    dailyCache.date = dateStr;
+    dailyCache.doc = stored;
+    dailyCache.imageBuffer = null;
+
+    // if no quote -> create retry record
+    if (!stored?.quote) {
+      await dailyQuoteRetryCollection.updateOne({ date: dateStr }, { $set: { date: dateStr, attempts: 0, nextAttemptAt: new Date(Date.now() + RETRY_INTERVAL_MS) } }, { upsert: true });
+    } else {
+      await dailyQuoteRetryCollection.deleteOne({ date: dateStr }).catch(()=>{});
+    }
+
+    console.log('fetchAndStoreDailyMotivation:', dateStr, 'quote:', stored?.quote ? 'yes' : 'no', 'image:', stored?.image ? 'yes':'no');
+    return stored;
+  } catch (e) {
+    console.error('fetchAndStoreDailyMotivation error', e?.message || e);
+    throw e;
+  }
+}
+
+async function ensureDailyImageBuffer(dateStr) {
+  if (dailyCache.date !== dateStr) {
+    const doc = await dailyMotivationCollection.findOne({ date: dateStr }).catch(()=>null);
+    if (!doc) return null;
+    dailyCache.date = dateStr;
+    dailyCache.doc = doc;
+    dailyCache.imageBuffer = null;
+  }
+  if (dailyCache.imageBuffer) return dailyCache.imageBuffer;
+  const doc = dailyCache.doc;
+  if (doc?.image?.url) {
+    try {
+      const r = await httpGetWithRetry(doc.image.url, 1, { responseType: 'arraybuffer', maxRedirects: 10 });
+      if (r && r.data) {
+        dailyCache.imageBuffer = Buffer.from(r.data);
+        return dailyCache.imageBuffer;
+      }
+    } catch (e) { console.warn('ensureDailyImageBuffer fetch stored url failed', e?.message || e); }
+  }
+  const got = await fetchRandomImage().catch(()=>null);
+  if (got && got.buffer) {
+    dailyCache.imageBuffer = got.buffer;
+    try {
+      if (got.url) {
+        await dailyMotivationCollection.updateOne({ date: dateStr }, { $set: { 'image.url': got.url, 'image.source': got.source } });
+        dailyCache.doc.image = { url: got.url, source: got.source };
+      }
+    } catch (e) {}
+    return dailyCache.imageBuffer;
+  }
+  return null;
+}
+
+// schedule pending send for a user/date
+async function preparePendingSendForUser(userId, dateStr, tryImmediate = false) {
+  try {
+    const exists = await pendingDailySendsCollection.findOne({ userId, date: dateStr });
+    if (exists) return;
+    await pendingDailySendsCollection.updateOne({ userId, date: dateStr }, { $set: { userId, date: dateStr, sent: false, createdAt: new Date() } }, { upsert: true });
+    if (tryImmediate) {
+      // try to send right away (used for recently active users)
+      try {
+        const ok = await sendDailyToUser(userId, dateStr);
+        if (ok) {
+          await pendingDailySendsCollection.updateOne({ userId, date: dateStr }, { $set: { sent: true, sentAt: new Date(), quoteSent: false } });
+        }
+      } catch (e) {
+        // leave pending
+      }
+    }
+  } catch (e) { console.warn('preparePendingSendForUser', e?.message || e); }
+}
+
+// sendDailyToUser: sends photo with caption = quote (if available). If quote not available and retries exhausted -> send wish instead.
+// returns true if sending succeeded (no throw)
+async function buildWish() {
+  return 'Хорошего дня!';
+}
+async function sendDailyToUser(userId, dateStr) {
+  try {
+    let doc = dailyCache.date === dateStr ? dailyCache.doc : await dailyMotivationCollection.findOne({ date: dateStr }).catch(()=>null);
+    if (!doc) {
+      doc = await fetchAndStoreDailyMotivation(dateStr).catch(()=>null);
+    }
+
+    // check retry doc to see if exhausted
+    const retryDoc = await dailyQuoteRetryCollection.findOne({ date: dateStr }).catch(()=>null);
+    const retriesExhausted = !!(retryDoc && retryDoc.exhausted);
+
+    // attempt to get image buffer
+    const buf = await ensureDailyImageBuffer(dateStr).catch(()=>null);
+
+    // decide caption: prefer quote if exists; if not and retries exhausted -> wish; else empty
+    let caption = '';
+    if (doc?.quote?.text) {
+      // translate to user's lang if possible
+      const lang = await resolveUserLang(userId);
+      let final = doc.quote.text;
+      if (lang && lang !== 'en') {
+        const tr = await translateOrNull(final, lang).catch(()=>null);
+        if (tr) final = tr;
+      }
+      caption = String(final).slice(0, QUOTE_CAPTION_MAX);
+    } else if (retriesExhausted) {
+      caption = String(await buildWish()).slice(0, QUOTE_CAPTION_MAX);
+    } else {
+      caption = '';
+    }
+
+    // send photo if available
+    if (buf) {
+      try {
+        if (caption) await bot.telegram.sendPhoto(userId, { source: buf }, { caption });
+        else await bot.telegram.sendPhoto(userId, { source: buf });
+      } catch (e) {
+        console.warn('sendDailyToUser sendPhoto failed', e?.message || e);
+      }
+    }
+
+    // If quote exists but wasn't used as caption (caption empty or different) -> send as text message
+    if (doc?.quote?.text) {
+      const lang = await resolveUserLang(userId);
+      let final = doc.quote.text;
+      if (lang && lang !== 'en') {
+        const tr = await translateOrNull(final, lang).catch(()=>null);
+        if (tr) final = tr;
+      }
+      // Avoid duplicate if caption equals final fully
+      if (!caption || caption !== String(final).slice(0, QUOTE_CAPTION_MAX)) {
+        try { await bot.telegram.sendMessage(userId, (doc.quote.author ? `${final}\n— ${doc.quote.author}` : final).slice(0, MESSAGE_TEXT_MAX)); }
+        catch (e) { console.warn('sendDailyToUser quote sendMessage failed', e?.message || e); }
+      }
+    } else if (retriesExhausted) {
+      // if retries exhausted and caption was empty (no image or no caption), send wish as text
+      if (!caption) {
+        const wish = await buildWish();
+        try { await bot.telegram.sendMessage(userId, wish); } catch (e) { /* ignore */ }
+      }
+    } else {
+      // quote missing and retries not exhausted: do nothing — pendingQuote flow will handle later
+    }
+
+    return true;
+  } catch (e) {
+    console.error('sendDailyToUser error', e?.message || e);
+    return false;
+  }
+}
+
+// process dailyQuoteRetry attempts
+async function processDailyQuoteRetry() {
+  try {
+    const now = new Date();
+    const doc = await dailyQuoteRetryCollection.findOne({ nextAttemptAt: { $lte: now } });
+    if (!doc) return;
+
+    const dateStr = doc.date;
+    const attempts = (doc.attempts || 0) + 1;
+    console.log('processDailyQuoteRetry attempt', attempts, 'for', dateStr);
+
+    const q = await fetchQuoteFromAny().catch(()=>null);
+    if (q && q.text) {
+      // store quote
+      await dailyMotivationCollection.updateOne({ date: dateStr }, { $set: { quote: { text: q.text, author: q.author || '', source: q.source || '' } } });
+      await dailyQuoteRetryCollection.deleteOne({ date: dateStr });
+      // refresh cache
+      const stored = await dailyMotivationCollection.findOne({ date: dateStr });
+      dailyCache.date = dateStr;
+      dailyCache.doc = stored;
+      dailyCache.imageBuffer = null;
+      console.log('Quote fetched on retry for', dateStr);
+
+      // send quote text to users who already got photo (pendingDailySends.sent == true but quoteSent != true)
+      const cursor = pendingDailySendsCollection.find({ date: dateStr, sent: true, $or: [{ quoteSent: { $exists: false } }, { quoteSent: false }] });
+      while (await cursor.hasNext()) {
+        const p = await cursor.next();
+        try {
+          const uid = p.userId;
+          const lang = await resolveUserLang(uid);
+          let final = stored.quote.text;
+          if (lang && lang !== 'en') {
+            const tr = await translateOrNull(final, lang).catch(()=>null);
+            if (tr) final = tr;
+          }
+          const out = stored.quote.author ? `${final}\n— ${stored.quote.author}` : final;
+          await bot.telegram.sendMessage(uid, String(out).slice(0, MESSAGE_TEXT_MAX));
+          await pendingDailySendsCollection.updateOne({ _id: p._id }, { $set: { quoteSent: true } });
+        } catch (e) {
+          console.warn('processDailyQuoteRetry: failed to send quote to', p.userId, e?.message || e);
+        }
+      }
+
+      return;
+    }
+
+    // no quote -> reschedule or mark exhausted
+    if (attempts >= MAX_RETRY_ATTEMPTS) {
+      await dailyQuoteRetryCollection.updateOne({ date: dateStr }, { $set: { attempts, exhausted: true } });
+      console.log('processDailyQuoteRetry exhausted for', dateStr);
+      // For users who will be sent photo later, they will receive wish fallback as caption/text by sendDailyToUser
+    } else {
+      await dailyQuoteRetryCollection.updateOne({ date: dateStr }, { $set: { attempts, nextAttemptAt: new Date(Date.now() + RETRY_INTERVAL_MS) } });
+      console.log('processDailyQuoteRetry rescheduled for', dateStr, 'attempts', attempts);
+    }
+  } catch (e) {
+    console.error('processDailyQuoteRetry error', e?.message || e);
+  }
+}
+setInterval(processDailyQuoteRetry, 60_000);
+
+// watcher to detect newly stored quotes and notify pending users (additional safety)
+let lastSeenQuoteDate = null;
+async function watchForNewQuotes() {
+  try {
+    const dateStr = new Date().toLocaleDateString('sv-SE', { timeZone: KYIV_TZ });
+    const doc = await dailyMotivationCollection.findOne({ date: dateStr });
+    if (!doc || !doc.quote || !doc.quote.text) return;
+    if (lastSeenQuoteDate === dateStr) return;
+    lastSeenQuoteDate = dateStr;
+    // send quote to users who had sent=true and !quoteSent
+    const cursor = pendingDailySendsCollection.find({ date: dateStr, sent: true, $or: [{ quoteSent: { $exists: false } }, { quoteSent: false }] });
+    while (await cursor.hasNext()) {
+      const p = await cursor.next();
+      try {
+        const uid = p.userId;
+        const lang = await resolveUserLang(uid);
+        let final = doc.quote.text;
+        if (lang && lang !== 'en') {
+          const tr = await translateOrNull(final, lang).catch(()=>null);
+          if (tr) final = tr;
+        }
+        const out = doc.quote.author ? `${final}\n— ${doc.quote.author}` : final;
+        await bot.telegram.sendMessage(uid, String(out).slice(0, MESSAGE_TEXT_MAX));
+        await pendingDailySendsCollection.updateOne({ _id: p._id }, { $set: { quoteSent: true } });
+      } catch (e) {
+        console.warn('watchForNewQuotes: failed to send quote to', p.userId, e?.message || e);
+      }
+    }
+  } catch (e) { console.warn('watchForNewQuotes error', e?.message || e); }
+}
+setInterval(watchForNewQuotes, 30_000);
+
+// ---------- daily schedule checker (04:00 fetch, 05:00 prepare sends) ----------
+let lastFetchDate = null;
+let lastPrepareDate = null;
+
+async function dailyScheduleChecker() {
+  try {
+    const now = new Date();
+    const kyivNow = new Date(now.toLocaleString('en-US', { timeZone: KYIV_TZ }));
+    const hour = kyivNow.getHours();
+    const dateStr = kyivNow.toLocaleDateString('sv-SE', { timeZone: KYIV_TZ });
+
+    // 04:00 fetch & store
+    if (hour >= IMAGE_FETCH_HOUR && lastFetchDate !== dateStr) {
+      try {
+        await fetchAndStoreDailyMotivation(dateStr);
+      } catch (e) { console.warn('dailyScheduleChecker fetch error', e?.message || e); }
+      lastFetchDate = dateStr;
+    }
+
+    // 05:00 prepare sends
+    if (hour >= PREPARE_SEND_HOUR && lastPrepareDate !== dateStr) {
+      try {
+        // iterate users and create pending sends; for recently active (ONLINE_WINDOW_MS) try immediate send
+        const cursor = usersCollection.find({}, { projection: { userId: 1, lastActive: 1 } });
+        const nowTs = Date.now();
+        while (await cursor.hasNext()) {
+          const u = await cursor.next();
+          if (!u || !u.userId) continue;
+          const lastActive = u.lastActive ? new Date(u.lastActive) : null;
+          const recentlyActive = lastActive && (nowTs - lastActive) <= ONLINE_WINDOW_MS;
+          if (recentlyActive) {
+            // try to send immediately; if fails, create pending
+            try {
+              const ok = await sendDailyToUser(u.userId, dateStr);
+              if (ok) {
+                await pendingDailySendsCollection.updateOne({ userId: u.userId, date: dateStr }, { $set: { sent: true, sentAt: new Date(), quoteSent: false } }, { upsert: true });
+                continue;
+              }
+            } catch (e) {
+              // fallthrough to create pending
+            }
+          }
+          // create pending to send on next user activity
+          await pendingDailySendsCollection.updateOne({ userId: u.userId, date: dateStr }, { $setOnInsert: { userId: u.userId, date: dateStr, sent: false, createdAt: new Date() } }, { upsert: true });
+        }
+        console.log('dailyScheduleChecker: prepared sends for', dateStr);
+      } catch (e) { console.error('dailyScheduleChecker prepare error', e?.message || e); }
+      lastPrepareDate = dateStr;
+    }
+  } catch (e) { console.error('dailyScheduleChecker main error', e?.message || e); }
+}
+setInterval(dailyScheduleChecker, 60_000);
+dailyScheduleChecker().catch(()=>{});
+
+// ---------- When user becomes active (middleware) - send pending daily sends ----------
+bot.use(async (ctx, next) => {
+  try {
+    const uid = ctx.from?.id;
+    if (!uid) return next();
+    // check pending for today
+    const dateStr = new Date().toLocaleDateString('sv-SE', { timeZone: KYIV_TZ });
+    try {
+      const pending = await pendingDailySendsCollection.findOne({ userId: uid, date: dateStr, sent: false });
+      if (pending) {
+        const ok = await sendDailyToUser(uid, dateStr);
+        if (ok) {
+          await pendingDailySendsCollection.updateOne({ _id: pending._id }, { $set: { sent: true, sentAt: new Date() } });
+        }
+      }
+    } catch (e) { /* ignore */ }
+  } catch (e) { /* ignore */ }
+  return next();
+});
+
+// ---------- Handlers (motivation button) ----------
+bot.hears('🌅 Прислать мотивацию', async (ctx) => {
+  try {
+    const dateStr = new Date().toLocaleDateString('sv-SE', { timeZone: KYIV_TZ });
+    await sendDailyToUser(ctx.from.id, dateStr);
+    // mark pending as sent to avoid duplicate later
+    await pendingDailySendsCollection.updateOne({ userId: ctx.from.id, date: dateStr }, { $set: { sent: true, sentAt: new Date(), quoteSent: true } }, { upsert: true });
+  } catch (e) {
+    console.error('motivation button error', e);
+    try { await ctx.reply('Ошибка при отправке мотивации'); } catch {}
+  }
+});
+
+// ---------- Rest of handlers (alerts) ----------
+// bot.start, create alerts flow, list, pagination, delete etc. (kept intact from original)
 bot.start(ctx => {
   ctx.session = {};
   ctx.reply('Привет! Я бот-алерт для крипты.', getMainMenu(ctx.from?.id));
@@ -609,9 +974,8 @@ bot.action(/show_delete_menu_(\d+)/, async (ctx) => {
       // edit only reply_markup so text remains
       await ctx.editMessageReplyMarkup({ inline_keyboard: inline });
     } catch (err) {
-      // fallback: if edit reply markup failed (some clients), send a new message preserving text + inline
+      // fallback: send a new message preserving text + inline
       try {
-        // try to reuse original text if available
         const originalText = ctx.update.callback_query.message?.text || 'Твои алерты';
         await ctx.reply(originalText, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: inline } });
       } catch (e) {
@@ -619,7 +983,7 @@ bot.action(/show_delete_menu_(\d+)/, async (ctx) => {
       }
     }
 
-    // async precise refresh: re-build inline with current prices and update reply_markup
+    // async precise refresh
     (async () => {
       try {
         const freshInline = await buildDeleteInlineForUser(ctx.from.id, { fast: false, sourcePage, totalPages });
@@ -632,7 +996,7 @@ bot.action(/show_delete_menu_(\d+)/, async (ctx) => {
   }
 });
 
-// раскрыть компактное меню на все записи — добавляем кнопки удаления, не заменяя текст
+// show_delete_menu_all
 bot.action('show_delete_menu_all', async (ctx) => {
   try {
     await ctx.answerCbQuery();
@@ -662,10 +1026,8 @@ bot.action('show_delete_menu_all', async (ctx) => {
 bot.action(/back_to_alerts(?:_p(\d+))?/, async (ctx) => {
   try {
     await ctx.answerCbQuery();
-    // если есть захваченное число — вернуть на ту страницу, иначе первая
     const requestedPage = ctx.match && ctx.match[1] ? Math.max(0, parseInt(ctx.match[1], 10)) : 0;
 
-    // Получаем уже быстрый рендер
     const { pages } = await renderAlertsList(ctx.from.id, { fast: true });
     const idx = Math.min(requestedPage, Math.max(0, pages.length - 1));
     const p = pages[idx] || pages[0];
@@ -676,7 +1038,7 @@ bot.action(/back_to_alerts(?:_p(\d+))?/, async (ctx) => {
       await ctx.reply(p.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: p.buttons } });
     }
 
-    // async точная подгрузка для актуализации
+    // async точная подгрузка
     (async () => {
       try {
         const fresh = await renderAlertsList(ctx.from.id, { fast: false });
@@ -703,35 +1065,62 @@ bot.action(/alerts_page_(\d+)_view/, async (ctx) => {
   } catch (e) { console.error('alerts_page action error', e); try { await ctx.answerCbQuery('Ошибка'); } catch {} }
 });
 
-// delete specific alert (del_<id>) — удаляем и обновляем только reply_markup текущего сообщения (сохраняем текст)
+// delete specific alert (authoritative page token is in callback_data: del_<id>_p<NUM|all>)
 bot.on('callback_query', async (ctx) => {
   try {
     const data = ctx.callbackQuery?.data;
     if (!data) return ctx.answerCbQuery();
-    if (data.startsWith('del_')) {
-      const id = data.replace('del_', '');
+
+    // try to parse authoritative token from callback_data
+    const m = data.match(/^del_([0-9a-fA-F]{24})_p(all|\d+)$/);
+    const mLegacy = !m && data.startsWith('del_') ? data.match(/^del_([0-9a-fA-F]{24})$/) : null;
+
+    if (m || mLegacy) {
+      const id = (m ? m[1] : mLegacy[1]);
+      const token = m ? m[2] : null; // 'all' or '0' | '1' | ...
+
       const doc = await alertsCollection.findOne({ _id: new ObjectId(id) });
       if (!doc) {
         await ctx.answerCbQuery('Алерт не найден');
         return;
       }
 
+      // determine sourcePage:
+      // 1) if token present -> authoritative (all or page number)
+      // 2) else fallback: compute page from cached alerts BEFORE deletion (legacy support)
+      let sourcePage = null; // null == "all"
+      if (token) {
+        sourcePage = (token === 'all') ? null : Math.max(0, parseInt(token, 10));
+      } else {
+        // legacy fallback: find index in cached alerts
+        try {
+          const alertsBefore = await getUserAlertsCached(ctx.from.id);
+          const idxBefore = alertsBefore.findIndex(a => String(a._id) === String(doc._id) || a._id?.toString() === id);
+          if (idxBefore >= 0) sourcePage = Math.floor(idxBefore / ENTRIES_PER_PAGE);
+          else sourcePage = 0;
+        } catch (e) {
+          sourcePage = 0;
+        }
+      }
+
+      // delete from DB
       await alertsCollection.deleteOne({ _id: new ObjectId(id) });
       invalidateUserAlertsCache(ctx.from.id);
 
-      // attempt to preserve page indicator if present in message text
-      let sourcePage = null, totalPages = null;
-      try {
-        const msgText = ctx.update.callback_query.message?.text || '';
-        const m = msgText.match(/Страница \*(\d+)\*\/(\d+)/);
-        if (m) { sourcePage = parseInt(m[1], 10) - 1; totalPages = parseInt(m[2], 10); }
-      } catch (e) {}
+      // recompute total pages after deletion
+      const alertsAfter = await getUserAlertsCached(ctx.from.id);
+      const computedTotalPages = Math.max(1, Math.ceil((alertsAfter?.length || 0) / ENTRIES_PER_PAGE));
 
-      // rebuild only inline keyboard for the same message
-      const inline = await buildDeleteInlineForUser(ctx.from.id, { fast: true, sourcePage: (typeof sourcePage === 'number' ? sourcePage : null), totalPages: (typeof totalPages === 'number' ? totalPages : null) });
+      if (sourcePage !== null) {
+        // clamp page into available range
+        sourcePage = Math.max(0, Math.min(sourcePage, computedTotalPages - 1));
+      }
+
+      // rebuild inline for that same page (or all)
+      const inline = await buildDeleteInlineForUser(ctx.from.id, { fast: true, sourcePage, totalPages: (sourcePage === null ? null : computedTotalPages) });
 
       if (!inline || inline.length === 0) {
-        // no more alerts — edit message to say so
+        // no more alerts
         try { await ctx.editMessageText('У тебя больше нет активных алертов.', { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [] } }); } catch {}
         await ctx.answerCbQuery('Алерт удалён');
         return;
@@ -740,7 +1129,7 @@ bot.on('callback_query', async (ctx) => {
       try {
         await ctx.editMessageReplyMarkup({ inline_keyboard: inline });
       } catch (err) {
-        // fallback: send new message with same text + inline
+        // fallback: send new message with inline
         try {
           const originalText = ctx.update.callback_query.message?.text || 'Твои алерты';
           await ctx.reply(originalText, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: inline } });
@@ -751,7 +1140,7 @@ bot.on('callback_query', async (ctx) => {
       return;
     }
 
-    // default answer
+    // default
     await ctx.answerCbQuery();
   } catch (e) {
     console.error('callback_query error', e);
