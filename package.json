@@ -4,14 +4,13 @@
   "type": "module",
   "main": "src/index.js",
   "scripts": {
-    "start": "node src/index.js"
+    "start": "node index.js"
   },
   "dependencies": {
     "axios": "^1.11.0",
     "dotenv": "^17.2.1",
     "express": "^5.1.0",
     "mongodb": "^6.18.0",
-    "node-cron": "^4.2.1",
     "telegraf": "^4.16.3"
   }
 }
