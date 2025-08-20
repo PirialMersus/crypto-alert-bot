@@ -1,4 +1,3 @@
-// index.js - полный файл (обновлён)
 import { Telegraf, session } from 'telegraf';
 import axios from 'axios';
 import dotenv from 'dotenv';
@@ -15,10 +14,13 @@ const AXIOS_TIMEOUT = process.env.AXIOS_TIMEOUT_MS ? parseInt(process.env.AXIOS_
 if (!BOT_TOKEN) throw new Error('BOT_TOKEN не задан в окружении');
 if (!MONGO_URI) throw new Error('MONGO_URI не задан в окружении');
 
+// интервал и ttl для централизованного кеша тикеров
+const TICKERS_REFRESH_INTERVAL = 60_000; // 1 мин
+const TICKERS_TTL = 55_000; // 55s
+
 const INACTIVE_DAYS = 30;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-const TICKERS_TTL = 10_000;
 const CACHE_TTL = 20_000;
 const BG_CHECK_INTERVAL = 60_000;
 
@@ -80,12 +82,13 @@ async function connectToMongo() {
   dailyQuoteRetryCollection = db.collection('daily_quote_retry');
   pendingDailySendsCollection = db.collection('pending_daily_sends');
   await ensureIndexes(db);
-  console.log('Connected to MongoDB and indexes are ready');
+  console.log('Connected to MongoDB and indexes are ready 🚀');
 }
 await connectToMongo();
 
 console.log('CREATOR_ID:', CREATOR_ID ?? 'not set');
 
+// --- caches ---
 const tickersCache = { time: 0, map: new Map() };
 const pricesCache = new Map();
 const alertsCache = new Map();
@@ -146,6 +149,14 @@ async function getPriceLevel1(symbol) {
 async function getPrice(symbol) {
   const map = await refreshAllTickers();
   if (map.has(symbol)) return map.get(symbol);
+  return await getPriceLevel1(symbol);
+}
+
+// getCachedPrice - центральная точка чтения цен
+async function getCachedPrice(symbol) {
+  const cached = tickersCache.map.get(symbol);
+  if (Number.isFinite(cached)) return cached;
+  // fallback редкий: level1
   return await getPriceLevel1(symbol);
 }
 
@@ -271,19 +282,14 @@ async function renderAlertsList(userId, options = { fast: false }) {
   const uniqueSymbols = [...new Set(alerts.map(a => a.symbol))];
   const priceMap = new Map();
 
-  if (!options.fast) {
-    await refreshAllTickers();
-    for (const s of uniqueSymbols) priceMap.set(s, await getPrice(s));
-  } else {
-    for (const a of alerts) {
-      const p = tickersCache.map.get(a.symbol);
-      if (Number.isFinite(p)) priceMap.set(a.symbol, p);
-      else {
-        const c = pricesCache.get(a.symbol);
-        if (c) priceMap.set(a.symbol, c.price);
-      }
+  // используем локальный кеш и редкий fallback на level1
+  for (const s of uniqueSymbols) {
+    const p = tickersCache.map.get(s);
+    if (Number.isFinite(p)) priceMap.set(s, p);
+    else {
+      const p2 = await getPriceLevel1(s);
+      if (Number.isFinite(p2)) priceMap.set(s, p2);
     }
-    if (Date.now() - tickersCache.time >= TICKERS_TTL) refreshAllTickers().catch(()=>{});
   }
 
   const lastViews = await getUserLastViews(userId);
@@ -342,19 +348,17 @@ async function buildDeleteInlineForUser(userId, opts = { fast: false, sourcePage
   const uniqueSymbols = [...new Set(alerts.map(a => a.symbol))];
   const priceMap = new Map();
 
-  if (!opts.fast) {
-    await refreshAllTickers();
-    for (const s of uniqueSymbols) priceMap.set(s, await getPrice(s));
-  } else {
-    for (const a of alerts) {
-      const p = tickersCache.map.get(a.symbol);
-      if (Number.isFinite(p)) priceMap.set(a.symbol, p);
+  for (const s of uniqueSymbols) {
+    const p = tickersCache.map.get(s);
+    if (Number.isFinite(p)) priceMap.set(s, p);
+    else {
+      const c = pricesCache.get(s);
+      if (c) priceMap.set(s, c.price);
       else {
-        const c = pricesCache.get(a.symbol);
-        if (c) priceMap.set(a.symbol, c.price);
+        const p2 = await getPriceLevel1(s);
+        if (Number.isFinite(p2)) priceMap.set(s, p2);
       }
     }
-    if (Date.now() - tickersCache.time >= TICKERS_TTL) refreshAllTickers().catch(()=>{});
   }
 
   const lastViews = await getUserLastViews(userId);
@@ -405,15 +409,8 @@ async function buildDeleteInlineForUser(userId, opts = { fast: false, sourcePage
 
 async function pushRecentSymbol(userId, symbol) {
   try {
-    await usersCollection.updateOne(
-      { userId },
-      { $pull: { recentSymbols: symbol } }
-    );
-    await usersCollection.updateOne(
-      { userId },
-      { $push: { recentSymbols: { $each: [symbol], $slice: -RECENT_SYMBOLS_MAX } } },
-      { upsert: true }
-    );
+    await usersCollection.updateOne({ userId }, { $pull: { recentSymbols: symbol } });
+    await usersCollection.updateOne({ userId }, { $push: { recentSymbols: { $each: [symbol], $slice: -RECENT_SYMBOLS_MAX } } }, { upsert: true });
   } catch (err) {
     console.error('pushRecentSymbol error', err);
   }
@@ -421,7 +418,6 @@ async function pushRecentSymbol(userId, symbol) {
 
 function getMainMenu(userId) {
   const keyboard = [[{ text: '➕ Создать алерт' }, { text: '📋 Мои алерты' }]];
-  // только владелец видит кнопку мотивации и статистику
   if (CREATOR_ID && String(userId) === String(CREATOR_ID)) {
     keyboard.push([{ text: '🌅 Прислать мотивацию' }]);
     keyboard.push([{ text: '👥 Количество активных пользователей' }]);
@@ -539,7 +535,6 @@ async function resolveUserLang(userId, ctxLang = null, ctxFromLang = null) {
   return 'ru';
 }
 
-// Возвращает наилучший доступный текст цитаты (lang->en->original)
 function getBestQuoteText(doc, lang = 'en') {
   if (!doc || !doc.quote) return null;
   const l = String(lang || 'en').split('-')[0];
@@ -555,7 +550,6 @@ async function fetchAndStoreDailyMotivation(dateStr) {
     const quote = await fetchQuoteFromAny().catch(()=>null);
     const img = await fetchRandomImage().catch(()=>null);
 
-    // лог результата fetchQuoteFromAny для диагностики (временно)
     console.log('DEBUG fetchQuoteFromAny result:', JSON.stringify(quote?.text ? { textPreview: quote.text.slice(0,120), author: quote.author, source: quote.source } : quote));
 
     let translations = null;
@@ -563,20 +557,9 @@ async function fetchAndStoreDailyMotivation(dateStr) {
       const original = String(quote.text);
       translations = { en: original, ru: null, uk: null };
 
-      try {
-        const enT = await translateOrNull(original, 'en').catch(()=>null);
-        translations.en = enT || original;
-      } catch (e) {}
-
-      try {
-        const ruT = await translateOrNull(original, 'ru').catch(()=>null);
-        translations.ru = ruT || translations.en || original;
-      } catch (e) {}
-
-      try {
-        const ukT = await translateOrNull(original, 'uk').catch(()=>null);
-        translations.uk = ukT || translations.en || original;
-      } catch (e) {}
+      try { const enT = await translateOrNull(original, 'en').catch(()=>null); translations.en = enT || original; } catch (e) {}
+      try { const ruT = await translateOrNull(original, 'ru').catch(()=>null); translations.ru = ruT || translations.en || original; } catch (e) {}
+      try { const ukT = await translateOrNull(original, 'uk').catch(()=>null); translations.uk = ukT || translations.en || original; } catch (e) {}
     }
 
     const doc = {
@@ -598,15 +581,7 @@ async function fetchAndStoreDailyMotivation(dateStr) {
     dailyCache.doc = stored;
     dailyCache.imageBuffer = null;
 
-    // лог того, что записалось (временно)
-    console.log('DEBUG stored dailyMotivation:', JSON.stringify({
-      date: dateStr,
-      hasQuote: !!stored?.quote,
-      originalPreview: stored?.quote?.original ? stored.quote.original.slice(0,120) : null,
-      translationsPresent: stored?.quote?.translations ? Object.keys(stored.quote.translations).reduce((acc,k)=>{ acc[k]=!!stored.quote.translations[k]; return acc; },{}) : null,
-      author: stored?.quote?.author || null,
-      image: !!stored?.image
-    }));
+    console.log('DEBUG stored dailyMotivation:', JSON.stringify({ date: dateStr, hasQuote: !!stored?.quote, originalPreview: stored?.quote?.original ? stored.quote.original.slice(0,120) : null, translationsPresent: stored?.quote?.translations ? Object.keys(stored.quote.translations).reduce((acc,k)=>{ acc[k]=!!stored.quote.translations[k]; return acc; },{}) : null, author: stored?.quote?.author || null, image: !!stored?.image }));
 
     if (!stored?.quote) {
       await dailyQuoteRetryCollection.updateOne({ date: dateStr }, { $set: { date: dateStr, attempts: 0, nextAttemptAt: new Date(Date.now() + RETRY_INTERVAL_MS) } }, { upsert: true });
@@ -655,23 +630,18 @@ async function ensureDailyImageBuffer(dateStr) {
   return null;
 }
 
-async function buildWish() {
-  return 'Хорошего дня!';
-}
+async function buildWish() { return 'Хорошего дня!'; }
 
 async function sendDailyToUser(userId, dateStr, opts = { disableNotification: false }) {
   try {
     let doc = dailyCache.date === dateStr ? dailyCache.doc : await dailyMotivationCollection.findOne({ date: dateStr }).catch(()=>null);
-    if (!doc) {
-      doc = await fetchAndStoreDailyMotivation(dateStr).catch(()=>null);
-    }
+    if (!doc) doc = await fetchAndStoreDailyMotivation(dateStr).catch(()=>null);
 
     const buf = await ensureDailyImageBuffer(dateStr).catch(()=>null);
 
     const lang = await resolveUserLang(userId);
     let quoteText = getBestQuoteText(doc, lang);
 
-    // последняя попытка получить цитату и переводы прямо перед отправкой (чтобы не отправлять только автора)
     if (!quoteText) {
       try {
         const q = await fetchQuoteFromAny().catch(()=>null);
@@ -682,7 +652,6 @@ async function sendDailyToUser(userId, dateStr, opts = { disableNotification: fa
           let tr = enT;
           try { tr = await translateOrNull(original, lang).catch(enT); } catch {}
           quoteText = tr || enT || original;
-          // пытаемся сохранить в БД (не критично)
           try {
             await dailyMotivationCollection.updateOne(
               { date: dateStr },
@@ -708,14 +677,11 @@ async function sendDailyToUser(userId, dateStr, opts = { disableNotification: fa
 
     const caption = String(quoteText).slice(0, QUOTE_CAPTION_MAX);
     if (buf) {
-      try {
-        await bot.telegram.sendPhoto(userId, { source: buf }, { caption, disable_notification: !!opts.disableNotification });
-      } catch (e) { console.warn('sendDailyToUser sendPhoto failed', e); return false; }
+      try { await bot.telegram.sendPhoto(userId, { source: buf }, { caption, disable_notification: !!opts.disableNotification }); } catch (e) { console.warn('sendDailyToUser sendPhoto failed', e); return false; }
     } else {
       try { await bot.telegram.sendMessage(userId, caption, { disable_notification: !!opts.disableNotification }); } catch (e) { console.warn('sendDailyToUser sendMessage failed', e); return false; }
     }
 
-    // отправляем автора отдельным сообщением (если есть и не включён в caption)
     if (doc?.quote?.author) {
       try {
         if (!caption.includes(doc.quote.author)) {
@@ -743,7 +709,6 @@ async function processDailyQuoteRetry() {
 
     const q = await fetchQuoteFromAny().catch(()=>null);
     if (q && q.text) {
-      // переводы
       let translations = { en: q.text, ru: null, uk: null };
       try { const enT = await translateOrNull(q.text, 'en').catch(()=>q.text); translations.en = enT || q.text; } catch {}
       try { const ruT = await translateOrNull(q.text, 'ru').catch(()=>translations.en); translations.ru = ruT || translations.en || q.text; } catch {}
@@ -761,15 +726,7 @@ async function processDailyQuoteRetry() {
       dailyCache.imageBuffer = null;
       console.log('Quote fetched on retry for', dateStr);
 
-      // отправляем цитату тем, кто получил изображение и ожидает цитату, но не permanentFail
-      const cursor = pendingDailySendsCollection.find({
-        date: dateStr,
-        sent: true,
-        $and: [
-          { $or: [{ quoteSent: { $exists: false } }, { quoteSent: false }] },
-          { $or: [{ permanentFail: { $exists: false } }, { permanentFail: false }] }
-        ]
-      });
+      const cursor = pendingDailySendsCollection.find({ date: dateStr, sent: true, $and: [ { $or: [{ quoteSent: { $exists: false } }, { quoteSent: false }] }, { $or: [{ permanentFail: { $exists: false } }, { permanentFail: false }] } ] });
       while (await cursor.hasNext()) {
         const p = await cursor.next();
         try {
@@ -809,14 +766,7 @@ async function watchForNewQuotes() {
     if (!doc || !doc.quote || !doc.quote.original) return;
     if (lastSeenQuoteDate === dateStr) return;
     lastSeenQuoteDate = dateStr;
-    const cursor = pendingDailySendsCollection.find({
-      date: dateStr,
-      sent: true,
-      $and: [
-        { $or: [{ quoteSent: { $exists: false } }, { quoteSent: false }] },
-        { $or: [{ permanentFail: { $exists: false } }, { permanentFail: false }] }
-      ]
-    });
+    const cursor = pendingDailySendsCollection.find({ date: dateStr, sent: true, $and: [ { $or: [{ quoteSent: { $exists: false } }, { quoteSent: false }] }, { $or: [{ permanentFail: { $exists: false } }, { permanentFail: false }] } ] });
     while (await cursor.hasNext()) {
       const p = await cursor.next();
       try {
@@ -834,6 +784,22 @@ async function watchForNewQuotes() {
   } catch (e) { console.warn('watchForNewQuotes error', e?.message || e); }
 }
 setInterval(watchForNewQuotes, 30_000);
+
+// --- Tickers refresher (Variant A) ---
+function startTickersRefresher() {
+  // initial fetch
+  refreshAllTickers().catch(err => console.warn('initial refreshAllTickers failed', err?.message || err));
+  // scheduled fetch
+  setInterval(async () => {
+    try {
+      await refreshAllTickers();
+    } catch (e) {
+      console.warn('scheduled refreshAllTickers failed', e?.message || e);
+    }
+  }, TICKERS_REFRESH_INTERVAL);
+}
+// start after mongodb connect
+startTickersRefresher();
 
 let lastFetchDate = null;
 let lastPrepareDate = null;
@@ -863,19 +829,10 @@ async function sendDailyAllUsers(dateStr) {
           await bot.telegram.sendMessage(uid, caption, { disable_notification: true });
         }
 
-        await pendingDailySendsCollection.updateOne(
-          { userId: u.userId, date: dateStr },
-          { $set: { sent: true, sentAt: new Date(), quoteSent: !!(doc?.quote?.original), permanentFail: false } },
-          { upsert: true }
-        );
+        await pendingDailySendsCollection.updateOne({ userId: u.userId, date: dateStr }, { $set: { sent: true, sentAt: new Date(), quoteSent: !!(doc?.quote?.original), permanentFail: false } }, { upsert: true });
       } catch (e) {
         try {
-          // ошибка отправки для данного пользователя — помечаем permanentFail, чтобы больше не пытаться автоматически
-          await pendingDailySendsCollection.updateOne(
-            { userId: u.userId, date: dateStr },
-            { $setOnInsert: { userId: u.userId, date: dateStr, sent: false, createdAt: new Date(), permanentFail: true } },
-            { upsert: true }
-          );
+          await pendingDailySendsCollection.updateOne({ userId: u.userId, date: dateStr }, { $setOnInsert: { userId: u.userId, date: dateStr, sent: false, createdAt: new Date(), permanentFail: true } }, { upsert: true });
         } catch (err) {}
       }
       await new Promise(r => setTimeout(r, 40));
@@ -893,9 +850,7 @@ async function dailyScheduleChecker() {
     const dateStr = kyivNow.toLocaleDateString('sv-SE', { timeZone: KYIV_TZ });
 
     if (hour === IMAGE_FETCH_HOUR && lastFetchDate !== dateStr) {
-      try {
-        await fetchAndStoreDailyMotivation(dateStr).catch(()=>null);
-      } catch (e) { console.warn('dailyScheduleChecker fetch error', e?.message || e); }
+      try { await fetchAndStoreDailyMotivation(dateStr).catch(()=>null); } catch (e) { console.warn('dailyScheduleChecker fetch error', e?.message || e); }
       lastFetchDate = dateStr;
 
       const sendTime = new Date(kyivNow);
@@ -931,19 +886,13 @@ bot.use(async (ctx, next) => {
     if (!uid) return next();
     const dateStr = new Date().toLocaleDateString('sv-SE', { timeZone: KYIV_TZ });
     try {
-      // не пробуем для пользователей, помеченных permanentFail
-      const pending = await pendingDailySendsCollection.findOne({
-        userId: uid,
-        date: dateStr,
-        sent: false,
-        $or: [{ permanentFail: { $exists: false } }, { permanentFail: false }]
-      });
+      const pending = await pendingDailySendsCollection.findOne({ userId: uid, date: dateStr, sent: false, $or: [{ permanentFail: { $exists: false } }, { permanentFail: false }] });
       if (pending) {
         const ok = await sendDailyToUser(uid, dateStr, { disableNotification: false });
         if (ok) {
           await pendingDailySendsCollection.updateOne({ _id: pending._id }, { $set: { sent: true, sentAt: new Date(), permanentFail: false } });
         } else {
-          await pendingDailySendsCollection.updateOne({ _id: pending._1d }, { $set: { permanentFail: true } }).catch(()=>{}); // safe guard (если update не удался — пропускаем)
+          await pendingDailySendsCollection.updateOne({ _id: pending._id }, { $set: { permanentFail: true } }).catch(()=>{});
         }
       }
     } catch (e) { }
@@ -969,10 +918,7 @@ bot.hears('🌅 Прислать мотивацию', async (ctx) => {
   }
 });
 
-bot.start(ctx => {
-  ctx.session = {};
-  ctx.reply('Привет! Я бот-алерт для крипты.', getMainMenu(ctx.from?.id));
-});
+bot.start(ctx => { ctx.session = {}; ctx.reply('Привет! Я бот-алерт для крипты.', getMainMenu(ctx.from?.id)); });
 
 bot.hears('➕ Создать алерт', async (ctx) => {
   ctx.session = { step: 'symbol' };
@@ -999,14 +945,10 @@ bot.hears('📋 Мои алерты', async (ctx) => {
 
 bot.hears('👥 Количество активных пользователей', async (ctx) => {
   try {
-    if (!CREATOR_ID || String(ctx.from.id) !== String(CREATOR_ID)) {
-      return ctx.reply('У вас нет доступа к этой команде.');
-    }
+    if (!CREATOR_ID || String(ctx.from.id) !== String(CREATOR_ID)) { return ctx.reply('У вас нет доступа к этой команде.'); }
 
     const now = Date.now();
-    if (statsCache.count !== null && (now - statsCache.time) < CACHE_TTL) {
-      return ctx.reply(`👥 Активных пользователей за последние ${INACTIVE_DAYS} дней: ${statsCache.count}`);
-    }
+    if (statsCache.count !== null && (now - statsCache.time) < CACHE_TTL) { return ctx.reply(`👥 Активных пользователей за последние ${INACTIVE_DAYS} дней: ${statsCache.count}`); }
 
     const cutoff = new Date(Date.now() - INACTIVE_DAYS * DAY_MS);
     let activeCount;
@@ -1027,52 +969,24 @@ bot.action(/show_delete_menu_(\d+)/, async (ctx) => {
     const totalPages = viewQuick.pageCount || 1;
 
     const inline = await buildDeleteInlineForUser(ctx.from.id, { fast: true, sourcePage, totalPages });
-    try {
-      await ctx.editMessageReplyMarkup({ inline_keyboard: inline });
-    } catch (err) {
-      try {
-        const originalText = ctx.update.callback_query.message?.text || 'Твои алерты';
-        await ctx.reply(originalText, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: inline } });
-      } catch (e) {
-        console.error('fallback reply failed', e);
-      }
+    try { await ctx.editMessageReplyMarkup({ inline_keyboard: inline }); } catch (err) {
+      try { const originalText = ctx.update.callback_query.message?.text || 'Твои алерты'; await ctx.reply(originalText, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: inline } }); } catch (e) { console.error('fallback reply failed', e); }
     }
 
-    (async () => {
-      try {
-        const freshInline = await buildDeleteInlineForUser(ctx.from.id, { fast: false, sourcePage, totalPages });
-        try { await ctx.editMessageReplyMarkup({ inline_keyboard: freshInline }); } catch {}
-      } catch (err) { console.error('async refresh delete menu err', err); }
-    })();
-  } catch (e) {
-    console.error('show_delete_menu error', e);
-    try { await ctx.answerCbQuery('Ошибка'); } catch {}
-  }
+    (async () => { try { const freshInline = await buildDeleteInlineForUser(ctx.from.id, { fast: false, sourcePage, totalPages }); try { await ctx.editMessageReplyMarkup({ inline_keyboard: freshInline }); } catch {} } catch (err) { console.error('async refresh delete menu err', err); } })();
+  } catch (e) { console.error('show_delete_menu error', e); try { await ctx.answerCbQuery('Ошибка'); } catch {} }
 });
 
 bot.action('show_delete_menu_all', async (ctx) => {
   try {
     await ctx.answerCbQuery();
     const inline = await buildDeleteInlineForUser(ctx.from.id, { fast: true, sourcePage: null, totalPages: null });
-    try {
-      await ctx.editMessageReplyMarkup({ inline_keyboard: inline });
-    } catch (err) {
-      try {
-        const originalText = ctx.update.callback_query.message?.text || 'Твои алерты';
-        await ctx.reply(originalText, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: inline } });
-      } catch (e) { console.error('fallback show_delete_menu_all reply failed', e); }
+    try { await ctx.editMessageReplyMarkup({ inline_keyboard: inline }); } catch (err) {
+      try { const originalText = ctx.update.callback_query.message?.text || 'Твои алерты'; await ctx.reply(originalText, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: inline } }); } catch (e) { console.error('fallback show_delete_menu_all reply failed', e); }
     }
 
-    (async () => {
-      try {
-        const freshInline = await buildDeleteInlineForUser(ctx.from.id, { fast: false, sourcePage: null, totalPages: null });
-        try { await ctx.editMessageReplyMarkup({ inline_keyboard: freshInline }); } catch {}
-      } catch (err) { console.error('async refresh show_delete_menu_all', err); }
-    })();
-  } catch (e) {
-    console.error('show_delete_menu_all error', e);
-    try { await ctx.answerCbQuery('Ошибка'); } catch {}
-  }
+    (async () => { try { const freshInline = await buildDeleteInlineForUser(ctx.from.id, { fast: false, sourcePage: null, totalPages: null }); try { await ctx.editMessageReplyMarkup({ inline_keyboard: freshInline }); } catch {} } catch (err) { console.error('async refresh show_delete_menu_all', err); } })();
+  } catch (e) { console.error('show_delete_menu_all error', e); try { await ctx.answerCbQuery('Ошибка'); } catch {} }
 });
 
 bot.action(/back_to_alerts(?:_p(\d+))?/, async (ctx) => {
@@ -1084,23 +998,10 @@ bot.action(/back_to_alerts(?:_p(\d+))?/, async (ctx) => {
     const idx = Math.min(requestedPage, Math.max(0, pages.length - 1));
     const p = pages[idx] || pages[0];
 
-    try {
-      await ctx.editMessageText(p.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: p.buttons } });
-    } catch {
-      await ctx.reply(p.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: p.buttons } });
-    }
+    try { await ctx.editMessageText(p.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: p.buttons } }); } catch { await ctx.reply(p.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: p.buttons } }); }
 
-    (async () => {
-      try {
-        const fresh = await renderAlertsList(ctx.from.id, { fast: false });
-        const fp = fresh.pages[idx] || fresh.pages[0];
-        try { await ctx.editMessageText(fp.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: fp.buttons } }); } catch {}
-      } catch (err) { console.error('async refresh back_to_alerts err', err); }
-    })();
-  } catch (e) {
-    console.error('back_to_alerts error', e);
-    try { await ctx.answerCbQuery('Ошибка'); } catch {}
-  }
+    (async () => { try { const fresh = await renderAlertsList(ctx.from.id, { fast: false }); const fp = fresh.pages[idx] || fresh.pages[0]; try { await ctx.editMessageText(fp.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: fp.buttons } }); } catch {} } catch (err) { console.error('async refresh back_to_alerts err', err); } })();
+  } catch (e) { console.error('back_to_alerts error', e); try { await ctx.answerCbQuery('Ошибка'); } catch {} }
 });
 
 bot.action(/alerts_page_(\d+)_view/, async (ctx) => {
@@ -1110,8 +1011,7 @@ bot.action(/alerts_page_(\d+)_view/, async (ctx) => {
     const { pages } = await renderAlertsList(ctx.from.id, { fast: false });
     const idx = Math.max(0, Math.min(pageIndex, pages.length - 1));
     const p = pages[idx];
-    try { await ctx.editMessageText(p.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: p.buttons } }); }
-    catch { await ctx.reply(p.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: p.buttons } }); }
+    try { await ctx.editMessageText(p.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: p.buttons } }); } catch { await ctx.reply(p.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: p.buttons } }); }
   } catch (e) { console.error('alerts_page action error', e); try { await ctx.answerCbQuery('Ошибка'); } catch {} }
 });
 
@@ -1128,23 +1028,12 @@ bot.on('callback_query', async (ctx) => {
       const token = m ? m[2] : null;
 
       const doc = await alertsCollection.findOne({ _id: new ObjectId(id) });
-      if (!doc) {
-        await ctx.answerCbQuery('Алерт не найден');
-        return;
-      }
+      if (!doc) { await ctx.answerCbQuery('Алерт не найден'); return; }
 
       let sourcePage = null;
-      if (token) {
-        sourcePage = (token === 'all') ? null : Math.max(0, parseInt(token, 10));
-      } else {
-        try {
-          const alertsBefore = await getUserAlertsCached(ctx.from.id);
-          const idxBefore = alertsBefore.findIndex(a => String(a._id) === String(doc._id) || a._id?.toString() === id);
-          if (idxBefore >= 0) sourcePage = Math.floor(idxBefore / ENTRIES_PER_PAGE);
-          else sourcePage = 0;
-        } catch (e) {
-          sourcePage = 0;
-        }
+      if (token) { sourcePage = (token === 'all') ? null : Math.max(0, parseInt(token, 10)); }
+      else {
+        try { const alertsBefore = await getUserAlertsCached(ctx.from.id); const idxBefore = alertsBefore.findIndex(a => String(a._id) === String(doc._id) || a._id?.toString() === id); if (idxBefore >= 0) sourcePage = Math.floor(idxBefore / ENTRIES_PER_PAGE); else sourcePage = 0; } catch (e) { sourcePage = 0; }
       }
 
       await alertsCollection.deleteOne({ _id: new ObjectId(id) });
@@ -1153,9 +1042,7 @@ bot.on('callback_query', async (ctx) => {
       const alertsAfter = await getUserAlertsCached(ctx.from.id);
       const computedTotalPages = Math.max(1, Math.ceil((alertsAfter?.length || 0) / ENTRIES_PER_PAGE));
 
-      if (sourcePage !== null) {
-        sourcePage = Math.max(0, Math.min(sourcePage, computedTotalPages - 1));
-      }
+      if (sourcePage !== null) { sourcePage = Math.max(0, Math.min(sourcePage, computedTotalPages - 1)); }
 
       const inline = await buildDeleteInlineForUser(ctx.from.id, { fast: true, sourcePage, totalPages: (sourcePage === null ? null : computedTotalPages) });
 
@@ -1165,24 +1052,14 @@ bot.on('callback_query', async (ctx) => {
         return;
       }
 
-      try {
-        await ctx.editMessageReplyMarkup({ inline_keyboard: inline });
-      } catch (err) {
-        try {
-          const originalText = ctx.update.callback_query.message?.text || 'Твои алерты';
-          await ctx.reply(originalText, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: inline } });
-        } catch (e) { console.error('fallback after delete failed', e); }
-      }
+      try { await ctx.editMessageReplyMarkup({ inline_keyboard: inline }); } catch (err) { try { const originalText = ctx.update.callback_query.message?.text || 'Твои алерты'; await ctx.reply(originalText, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: inline } }); } catch (e) { console.error('fallback after delete failed', e); } }
 
       await ctx.answerCbQuery('Алерт удалён');
       return;
     }
 
     await ctx.answerCbQuery();
-  } catch (e) {
-    console.error('callback_query error', e);
-    try { await ctx.answerCbQuery('Ошибка'); } catch {}
-  }
+  } catch (e) { console.error('callback_query error', e); try { await ctx.answerCbQuery('Ошибка'); } catch {} }
 });
 
 bot.on('text', async (ctx) => {
@@ -1196,15 +1073,12 @@ bot.on('text', async (ctx) => {
     if (ctx.session.step === 'symbol') {
       const base = text.toUpperCase();
       const symbol = `${base}-USDT`;
-      const price = await getPriceFast(symbol);
+      const price = await getCachedPrice(symbol);
       if (Number.isFinite(price)) {
         try { await pushRecentSymbol(ctx.from.id, base); } catch (e) { console.error('update recentSymbols failed', e); }
         ctx.session.symbol = symbol;
         ctx.session.step = 'alert_condition';
-        await ctx.reply(`✅ Монета: *${symbol}*\nТекущая цена: *${fmtNum(price)}*\nВыбери направление:`, {
-          parse_mode: 'Markdown',
-          reply_markup: { keyboard: [[{ text: '⬆️ Когда выше' }, { text: '⬇️ Когда ниже' }], [{ text: '↩️ Отмена' }]], resize_keyboard:true }
-        });
+        await ctx.reply(`✅ Монета: *${symbol}*\nТекущая цена: *${fmtNum(price)}*\nВыбери направление:`, { parse_mode: 'Markdown', reply_markup: { keyboard: [[{ text: '⬆️ Когда выше' }, { text: '⬇️ Когда ниже' }], [{ text: '↩️ Отмена' }]], resize_keyboard:true } });
       } else {
         await ctx.reply('Пара не найдена на KuCoin. Попробуй другой символ.');
         ctx.session = {};
@@ -1235,7 +1109,7 @@ bot.on('text', async (ctx) => {
       if (text === '⏭️ Без SL') {
         await alertsCollection.insertOne({ userId: ctx.from.id, symbol: ctx.session.symbol, condition: ctx.session.alertCondition, price: ctx.session.alertPrice, type: 'alert' });
         invalidateUserAlertsCache(ctx.from.id);
-        const cp = await getPriceFast(ctx.session.symbol);
+        const cp = await getCachedPrice(ctx.session.symbol);
         await ctx.reply(`✅ Алерт создан: *${ctx.session.symbol}* ${ctx.session.alertCondition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${fmtNum(ctx.session.alertPrice)}*\nТекущая цена: *${fmtNum(cp) ?? '—'}*`, { parse_mode: 'Markdown', ...getMainMenu(ctx.from.id) });
         ctx.session = {};
         return;
@@ -1259,7 +1133,7 @@ bot.on('text', async (ctx) => {
         { userId: ctx.from.id, symbol: ctx.session.symbol, condition: ctx.session.alertCondition, price: sl, type: 'sl', slDir, groupId }
       ]);
       invalidateUserAlertsCache(ctx.from.id);
-      const cp = await getPriceFast(ctx.session.symbol);
+      const cp = await getCachedPrice(ctx.session.symbol);
       await ctx.reply(`✅ Создана связка:\n🔔 *${ctx.session.symbol}* ${ctx.session.alertCondition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${fmtNum(ctx.session.alertPrice)}*\n🛑 SL (${slDir}) *${fmtNum(sl)}*\nТекущая: *${fmtNum(cp) ?? '—'}*`, { parse_mode: 'Markdown', ...getMainMenu(ctx.from.id) });
       ctx.session = {};
       return;
@@ -1275,7 +1149,7 @@ setInterval(async () => {
   try {
     const all = await getAllAlertsCached();
     if (!all.length) return;
-    await refreshAllTickers().catch(()=>{});
+    // не вызываем refreshAllTickers() здесь — рефрешер обновляет кеш регулярно
     const unique = [...new Set(all.map(a => a.symbol))];
     const priceMap = new Map();
     const missing = [];
@@ -1296,10 +1170,7 @@ setInterval(async () => {
       if (!Number.isFinite(cur)) continue;
       if ((a.condition === '>' && cur > a.price) || (a.condition === '<' && cur < a.price)) {
         const isSL = a.type === 'sl';
-        await bot.telegram.sendMessage(a.userId,
-          `${isSL ? '🛑 *Сработал стоп-лосс!*' : '🔔 *Сработал алерт!*'}\nМонета: *${a.symbol}*\nЦена сейчас: *${fmtNum(cur)}*\nУсловие: ${a.condition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${fmtNum(a.price)}*`,
-          { parse_mode: 'Markdown' }
-        );
+        await bot.telegram.sendMessage(a.userId, `${isSL ? '🛑 *Сработал стоп-лосс!*' : '🔔 *Сработал алерт!*'}\nМонета: *${a.symbol}*\nЦена сейчас: *${fmtNum(cur)}*\nУсловие: ${a.condition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${fmtNum(a.price)}*`, { parse_mode: 'Markdown' });
         await alertsCollection.deleteOne({ _id: a._id });
         invalidateUserAlertsCache(a.userId);
       }
@@ -1326,23 +1197,10 @@ setInterval(removeInactive, DAY_MS);
 
 bot.launch().then(() => console.log('Bot started'));
 
-// --- Debug endpoints (temporary, remove after tests) ---
-// test fetching quote from external APIs
+// debug endpoints (удали после тестов)
 app.get('/debug/quote-test', async (_req, res) => {
-  try {
-    const q = await fetchQuoteFromAny();
-    res.json({ ok: true, q });
-  } catch (e) {
-    res.json({ ok: false, err: String(e) });
-  }
+  try { const q = await fetchQuoteFromAny(); res.json({ ok: true, q }); } catch (e) { res.json({ ok: false, err: String(e) }); }
 });
-// show stored doc for today's date
 app.get('/debug/daily-doc', async (_req, res) => {
-  try {
-    const dateStr = new Date().toLocaleDateString('sv-SE', { timeZone: KYIV_TZ });
-    const doc = await dailyMotivationCollection.findOne({ date: dateStr });
-    res.json({ ok: true, date: dateStr, doc });
-  } catch (e) {
-    res.json({ ok: false, err: String(e) });
-  }
+  try { const dateStr = new Date().toLocaleDateString('sv-SE', { timeZone: KYIV_TZ }); const doc = await dailyMotivationCollection.findOne({ date: dateStr }); res.json({ ok: true, date: dateStr, doc }); } catch (e) { res.json({ ok: false, err: String(e) }); }
 });
