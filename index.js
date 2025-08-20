@@ -417,11 +417,14 @@ async function pushRecentSymbol(userId, symbol) {
 }
 
 function getMainMenu(userId) {
-  const keyboard = [[{ text: '➕ Создать алерт' }, { text: '📋 Мои алерты' }], [{ text: '🌅 Прислать мотивацию' }]];
-  if (CREATOR_ID && String(userId) === String(CREATOR_ID)) keyboard.push([{ text: '👥 Количество активных пользователей' }]);
+  const keyboard = [[{ text: '➕ Создать алерт' }, { text: '📋 Мои алерты' }]];
+  // Показываем кнопку мотивации только владельцу
+  if (CREATOR_ID && String(userId) === String(CREATOR_ID)) {
+    keyboard.push([{ text: '🌅 Прислать мотивацию' }]);
+    keyboard.push([{ text: '👥 Количество активных пользователей' }]);
+  }
   return { reply_markup: { keyboard, resize_keyboard: true } };
 }
-
 async function countDocumentsWithTimeout(filter, ms = 7000) {
   if (!usersCollection) throw new Error('usersCollection не инициализирована');
   return await Promise.race([
@@ -531,18 +534,48 @@ async function resolveUserLang(userId, ctxLang = null, ctxFromLang = null) {
   } catch (e) {}
   return 'ru';
 }
+
 async function fetchAndStoreDailyMotivation(dateStr) {
   try {
     const quote = await fetchQuoteFromAny().catch(()=>null);
     const img = await fetchRandomImage().catch(()=>null);
+
+    let translations = null;
+    if (quote && quote.text) {
+      const original = String(quote.text);
+      translations = { en: original, ru: null, uk: null };
+
+      try {
+        const enT = await translateOrNull(original, 'en').catch(()=>null);
+        translations.en = enT || original;
+      } catch (e) {}
+
+      try {
+        const ruT = await translateOrNull(original, 'ru').catch(()=>null);
+        translations.ru = ruT || translations.en || original;
+      } catch (e) {}
+
+      try {
+        const ukT = await translateOrNull(original, 'uk').catch(()=>null);
+        translations.uk = ukT || translations.en || original;
+      } catch (e) {}
+    }
+
     const doc = {
       date: dateStr,
-      quote: quote ? { text: quote.text, author: quote.author || '', source: quote.source || '' } : null,
+      quote: quote ? {
+        original: quote.text || '',
+        author: quote.author || '',
+        source: quote.source || '',
+        translations
+      } : null,
       image: img ? { url: img.url, source: img.source } : null,
       createdAt: new Date()
     };
+
     await dailyMotivationCollection.updateOne({ date: dateStr }, { $setOnInsert: doc }, { upsert: true });
     const stored = await dailyMotivationCollection.findOne({ date: dateStr });
+
     dailyCache.date = dateStr;
     dailyCache.doc = stored;
     dailyCache.imageBuffer = null;
@@ -597,6 +630,7 @@ async function ensureDailyImageBuffer(dateStr) {
 async function buildWish() {
   return 'Хорошего дня!';
 }
+
 async function sendDailyToUser(userId, dateStr, opts = { disableNotification: false }) {
   try {
     let doc = dailyCache.date === dateStr ? dailyCache.doc : await dailyMotivationCollection.findOne({ date: dateStr }).catch(()=>null);
@@ -604,24 +638,15 @@ async function sendDailyToUser(userId, dateStr, opts = { disableNotification: fa
       doc = await fetchAndStoreDailyMotivation(dateStr).catch(()=>null);
     }
 
-    const retryDoc = await dailyQuoteRetryCollection.findOne({ date: dateStr }).catch(()=>null);
-    const retriesExhausted = !!(retryDoc && retryDoc.exhausted);
-
     const buf = await ensureDailyImageBuffer(dateStr).catch(()=>null);
 
     let caption = '';
-    if (doc?.quote?.text) {
+    if (doc?.quote) {
       const lang = await resolveUserLang(userId);
-      let final = doc.quote.text;
-      if (lang && lang !== 'en') {
-        const tr = await translateOrNull(final, lang).catch(()=>null);
-        if (tr) final = tr;
-      }
-      caption = String(final).slice(0, QUOTE_CAPTION_MAX);
-    } else if (retriesExhausted) {
-      caption = String(await buildWish()).slice(0, QUOTE_CAPTION_MAX);
+      const tr = (doc.quote.translations && doc.quote.translations[lang]) ? doc.quote.translations[lang] : (doc.quote.original || '');
+      caption = String(tr).slice(0, QUOTE_CAPTION_MAX);
     } else {
-      caption = '';
+      caption = String(await buildWish()).slice(0, QUOTE_CAPTION_MAX);
     }
 
     if (buf) {
@@ -630,26 +655,19 @@ async function sendDailyToUser(userId, dateStr, opts = { disableNotification: fa
         else await bot.telegram.sendPhoto(userId, { source: buf }, { disable_notification: !!opts.disableNotification });
       } catch (e) {
         console.warn('sendDailyToUser sendPhoto failed', e?.message || e);
+        return false;
       }
     }
 
-    if (doc?.quote?.text) {
+    if (doc?.quote) {
       const lang = await resolveUserLang(userId);
-      let final = doc.quote.text;
-      if (lang && lang !== 'en') {
-        const tr = await translateOrNull(final, lang).catch(()=>null);
-        if (tr) final = tr;
-      }
-      if (!caption || caption !== String(final).slice(0, QUOTE_CAPTION_MAX)) {
-        try { await bot.telegram.sendMessage(userId, (doc.quote.author ? `${final}\n— ${doc.quote.author}` : final).slice(0, MESSAGE_TEXT_MAX), { disable_notification: !!opts.disableNotification }); }
-        catch (e) { console.warn('sendDailyToUser quote sendMessage failed', e?.message || e); }
-      }
-    } else if (retriesExhausted) {
-      if (!caption) {
-        const wish = await buildWish();
-        try { await bot.telegram.sendMessage(userId, wish, { disable_notification: !!opts.disableNotification }); } catch (e) { }
+      const tr = (doc.quote.translations && doc.quote.translations[lang]) ? doc.quote.translations[lang] : (doc.quote.original || '');
+      if (!caption || caption !== String(tr).slice(0, QUOTE_CAPTION_MAX)) {
+        try { await bot.telegram.sendMessage(userId, (doc.quote.author ? `${tr}\n— ${doc.quote.author}` : tr).slice(0, MESSAGE_TEXT_MAX), { disable_notification: !!opts.disableNotification }); }
+        catch (e) { console.warn('sendDailyToUser quote sendMessage failed', e?.message || e); return false; }
       }
     } else {
+      // ничего дополнительно не делать
     }
 
     return true;
@@ -671,7 +689,17 @@ async function processDailyQuoteRetry() {
 
     const q = await fetchQuoteFromAny().catch(()=>null);
     if (q && q.text) {
-      await dailyMotivationCollection.updateOne({ date: dateStr }, { $set: { quote: { text: q.text, author: q.author || '', source: q.source || '' } } });
+      // переводы
+      let translations = { en: q.text, ru: null, uk: null };
+      try { const enT = await translateOrNull(q.text, 'en').catch(()=>null); translations.en = enT || q.text; } catch {}
+      try { const ruT = await translateOrNull(q.text, 'ru').catch(()=>null); translations.ru = ruT || translations.en || q.text; } catch {}
+      try { const ukT = await translateOrNull(q.text, 'uk').catch(()=>null); translations.uk = ukT || translations.en || q.text; } catch {}
+
+      await dailyMotivationCollection.updateOne(
+        { date: dateStr },
+        { $set: { 'quote.original': q.text, 'quote.author': q.author || '', 'quote.source': q.source || '', 'quote.translations': translations } },
+        { upsert: true }
+      );
       await dailyQuoteRetryCollection.deleteOne({ date: dateStr });
       const stored = await dailyMotivationCollection.findOne({ date: dateStr });
       dailyCache.date = dateStr;
@@ -679,17 +707,22 @@ async function processDailyQuoteRetry() {
       dailyCache.imageBuffer = null;
       console.log('Quote fetched on retry for', dateStr);
 
-      const cursor = pendingDailySendsCollection.find({ date: dateStr, sent: true, $or: [{ quoteSent: { $exists: false } }, { quoteSent: false }] });
+      // отправляем цитату тем, кто получил изображение и ожидает цитату, но не permanentFail
+      const cursor = pendingDailySendsCollection.find({
+        date: dateStr,
+        sent: true,
+        $and: [
+          { $or: [{ quoteSent: { $exists: false } }, { quoteSent: false }] },
+          { $or: [{ permanentFail: { $exists: false } }, { permanentFail: false }] }
+        ]
+      });
       while (await cursor.hasNext()) {
         const p = await cursor.next();
         try {
           const uid = p.userId;
           const lang = await resolveUserLang(uid);
-          let final = stored.quote.text;
-          if (lang && lang !== 'en') {
-            const tr = await translateOrNull(final, lang).catch(()=>null);
-            if (tr) final = tr;
-          }
+          let final = stored.quote.translations && stored.quote.translations[lang] ? stored.quote.translations[lang] : stored.quote.original;
+          if (!final) final = stored.quote.original || '';
           const out = stored.quote.author ? `${final}\n— ${stored.quote.author}` : final;
           await bot.telegram.sendMessage(uid, String(out).slice(0, MESSAGE_TEXT_MAX));
           await pendingDailySendsCollection.updateOne({ _id: p._id }, { $set: { quoteSent: true } });
@@ -719,20 +752,24 @@ async function watchForNewQuotes() {
   try {
     const dateStr = new Date().toLocaleDateString('sv-SE', { timeZone: KYIV_TZ });
     const doc = await dailyMotivationCollection.findOne({ date: dateStr });
-    if (!doc || !doc.quote || !doc.quote.text) return;
+    if (!doc || !doc.quote || !doc.quote.original) return;
     if (lastSeenQuoteDate === dateStr) return;
     lastSeenQuoteDate = dateStr;
-    const cursor = pendingDailySendsCollection.find({ date: dateStr, sent: true, $or: [{ quoteSent: { $exists: false } }, { quoteSent: false }] });
+    const cursor = pendingDailySendsCollection.find({
+      date: dateStr,
+      sent: true,
+      $and: [
+        { $or: [{ quoteSent: { $exists: false } }, { quoteSent: false }] },
+        { $or: [{ permanentFail: { $exists: false } }, { permanentFail: false }] }
+      ]
+    });
     while (await cursor.hasNext()) {
       const p = await cursor.next();
       try {
         const uid = p.userId;
         const lang = await resolveUserLang(uid);
-        let final = doc.quote.text;
-        if (lang && lang !== 'en') {
-          const tr = await translateOrNull(final, lang).catch(()=>null);
-          if (tr) final = tr;
-        }
+        let final = doc.quote.translations && doc.quote.translations[lang] ? doc.quote.translations[lang] : doc.quote.original;
+        if (!final) final = doc.quote.original || '';
         const out = doc.quote.author ? `${final}\n— ${doc.quote.author}` : final;
         await bot.telegram.sendMessage(uid, String(out).slice(0, MESSAGE_TEXT_MAX));
         await pendingDailySendsCollection.updateOne({ _id: p._id }, { $set: { quoteSent: true } });
@@ -762,14 +799,11 @@ async function sendDailyAllUsers(dateStr) {
       try {
         const uid = u.userId;
         let caption = '';
-        if (doc?.quote?.text) {
+
+        if (doc?.quote) {
           const lang = await resolveUserLang(uid, u.preferredLang || null);
-          let final = doc.quote.text;
-          if (lang && lang !== 'en') {
-            const tr = await translateOrNull(final, lang).catch(()=>null);
-            if (tr) final = tr;
-          }
-          caption = String(final).slice(0, QUOTE_CAPTION_MAX);
+          const tr = (doc.quote.translations && doc.quote.translations[lang]) ? doc.quote.translations[lang] : (doc.quote.original || '');
+          caption = String(tr || doc.quote.original || '').slice(0, QUOTE_CAPTION_MAX);
         } else {
           caption = String(await buildWish()).slice(0, QUOTE_CAPTION_MAX);
         }
@@ -781,10 +815,18 @@ async function sendDailyAllUsers(dateStr) {
           await bot.telegram.sendMessage(uid, caption, { disable_notification: true });
         }
 
-        await pendingDailySendsCollection.updateOne({ userId: u.userId, date: dateStr }, { $set: { sent: true, sentAt: new Date(), quoteSent: !!doc?.quote?.text } }, { upsert: true });
+        await pendingDailySendsCollection.updateOne(
+          { userId: u.userId, date: dateStr },
+          { $set: { sent: true, sentAt: new Date(), quoteSent: !!(doc?.quote?.original), permanentFail: false } },
+          { upsert: true }
+        );
       } catch (e) {
         try {
-          await pendingDailySendsCollection.updateOne({ userId: u.userId, date: dateStr }, { $setOnInsert: { userId: u.userId, date: dateStr, sent: false, createdAt: new Date() } }, { upsert: true });
+          await pendingDailySendsCollection.updateOne(
+            { userId: u.userId, date: dateStr },
+            { $setOnInsert: { userId: u.userId, date: dateStr, sent: false, createdAt: new Date(), permanentFail: true } },
+            { upsert: true }
+          );
         } catch (err) {}
       }
       await new Promise(r => setTimeout(r, 40));
@@ -840,11 +882,19 @@ bot.use(async (ctx, next) => {
     if (!uid) return next();
     const dateStr = new Date().toLocaleDateString('sv-SE', { timeZone: KYIV_TZ });
     try {
-      const pending = await pendingDailySendsCollection.findOne({ userId: uid, date: dateStr, sent: false });
+      // не пробуем для пользователей, помеченных permanentFail
+      const pending = await pendingDailySendsCollection.findOne({
+        userId: uid,
+        date: dateStr,
+        sent: false,
+        $or: [{ permanentFail: { $exists: false } }, { permanentFail: false }]
+      });
       if (pending) {
         const ok = await sendDailyToUser(uid, dateStr, { disableNotification: false });
         if (ok) {
-          await pendingDailySendsCollection.updateOne({ _id: pending._id }, { $set: { sent: true, sentAt: new Date() } });
+          await pendingDailySendsCollection.updateOne({ _id: pending._id }, { $set: { sent: true, sentAt: new Date(), permanentFail: false } });
+        } else {
+          await pendingDailySendsCollection.updateOne({ _id: pending._id }, { $set: { permanentFail: true } });
         }
       }
     } catch (e) { }
@@ -854,9 +904,16 @@ bot.use(async (ctx, next) => {
 
 bot.hears('🌅 Прислать мотивацию', async (ctx) => {
   try {
+    if (!CREATOR_ID || String(ctx.from.id) !== String(CREATOR_ID)) {
+      return ctx.reply('У вас нет доступа к этой команде.');
+    }
     const dateStr = new Date().toLocaleDateString('sv-SE', { timeZone: KYIV_TZ });
-    await sendDailyToUser(ctx.from.id, dateStr);
-    await pendingDailySendsCollection.updateOne({ userId: ctx.from.id, date: dateStr }, { $set: { sent: true, sentAt: new Date(), quoteSent: true } }, { upsert: true });
+    const ok = await sendDailyToUser(ctx.from.id, dateStr, { disableNotification: false });
+    if (ok) {
+      await pendingDailySendsCollection.updateOne({ userId: ctx.from.id, date: dateStr }, { $set: { sent: true, sentAt: new Date(), quoteSent: true, permanentFail: false } }, { upsert: true });
+    } else {
+      await pendingDailySendsCollection.updateOne({ userId: ctx.from.id, date: dateStr }, { $set: { sent: false, createdAt: new Date(), permanentFail: true } }, { upsert: true });
+    }
   } catch (e) {
     console.error('motivation button error', e);
     try { await ctx.reply('Ошибка при отправке мотивации'); } catch {}
