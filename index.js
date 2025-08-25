@@ -477,6 +477,24 @@ async function fetchQuoteFromAny() {
   return null;
 }
 
+// --- NEW: Forismatic (русские цитаты)
+async function fetchQuoteForismatic() {
+  try {
+    // Forismatic иногда возвращает некорректный JSON, но чаще работает нормально.
+    const res = await httpGetWithRetry('https://api.forismatic.com/api/1.0/?method=getQuote&format=json&lang=ru', 1);
+    const d = res?.data;
+    if (!d) return null;
+    const text = d.quoteText || d.quoteText === '' ? d.quoteText : (d?.quote || null);
+    const author = d.quoteAuthor || d.author || '';
+    if (text && String(text).trim()) {
+      return { text: String(text).trim(), author: String(author || '').trim(), source: 'forismatic' };
+    }
+  } catch (e) {
+    console.warn('fetchQuoteForismatic failed', e?.message || e);
+  }
+  return null;
+}
+
 async function fetchRandomImage() {
   const sources = [
     { name: 'unsplash', url: UNSPLASH_RANDOM },
@@ -641,6 +659,41 @@ async function sendDailyToUser(userId, dateStr, opts = { disableNotification: fa
 
     const lang = await resolveUserLang(userId);
     let quoteText = getBestQuoteText(doc, lang);
+
+    // NEW: если пользователь RU/UK — попробуем подтянуть оригинал на русском,
+    // только если в сохранённом документе нет перевода для его языка.
+    if ((lang === 'ru' || lang === 'uk') && (!doc?.quote?.translations || !doc.quote.translations[lang])) {
+      try {
+        const foris = await fetchQuoteForismatic().catch(()=>null);
+        if (foris && foris.text) {
+          const originalRu = String(foris.text);
+          // переводы
+          let enT = originalRu;
+          try { enT = await translateOrNull(originalRu, 'en').catch(()=>originalRu); } catch (e) {}
+          let ukT = null;
+          try { ukT = await translateOrNull(originalRu, 'uk').catch(null); } catch (e) {}
+
+          const updates = {
+            'quote.original': originalRu,
+            'quote.author': foris.author || (doc?.quote?.author || ''),
+            'quote.source': foris.source || 'forismatic',
+            'quote.translations.en': enT,
+            'quote.translations.ru': originalRu
+          };
+          if (ukT) updates['quote.translations.uk'] = ukT;
+
+          try {
+            await dailyMotivationCollection.updateOne({ date: dateStr }, { $set: updates }, { upsert: true });
+            dailyCache.doc = await dailyMotivationCollection.findOne({ date: dateStr }).catch(()=>null);
+            doc = dailyCache.doc || doc;
+          } catch (e) { /* ignore db write errors */ }
+
+          quoteText = getBestQuoteText(doc, lang);
+        }
+      } catch (e) {
+        console.warn('sendDailyToUser: fetch russian original failed', e?.message || e);
+      }
+    }
 
     if (!quoteText) {
       try {
@@ -819,6 +872,38 @@ async function sendDailyAllUsers(dateStr) {
       try {
         const uid = u.userId;
         const lang = await resolveUserLang(uid, u.preferredLang || null);
+
+        // NEW: Если пользователь RU/UK и в doc нет ru/uk перевода — попробуем подтянуть оригинал на русском
+        if ((lang === 'ru' || lang === 'uk') && (!doc?.quote?.translations || !doc.quote.translations[lang])) {
+          try {
+            const foris = await fetchQuoteForismatic().catch(()=>null);
+            if (foris && foris.text) {
+              const originalRu = String(foris.text);
+              let enT = originalRu;
+              try { enT = await translateOrNull(originalRu, 'en').catch(()=>originalRu); } catch (e) {}
+              let ukT = null;
+              try { ukT = await translateOrNull(originalRu, 'uk').catch(null); } catch (e) {}
+
+              const updates = {
+                'quote.original': originalRu,
+                'quote.author': foris.author || (doc?.quote?.author || ''),
+                'quote.source': foris.source || 'forismatic',
+                'quote.translations.en': enT,
+                'quote.translations.ru': originalRu
+              };
+              if (ukT) updates['quote.translations.uk'] = ukT;
+
+              try {
+                await dailyMotivationCollection.updateOne({ date: dateStr }, { $set: updates }, { upsert: true });
+                doc = await dailyMotivationCollection.findOne({ date: dateStr }).catch(()=>doc);
+                dailyCache.doc = doc;
+              } catch (e) { /* ignore write errors */ }
+            }
+          } catch (e) {
+            console.warn('sendDailyAllUsers: fetch russian original failed for user', uid, e?.message || e);
+          }
+        }
+
         const text = getBestQuoteText(doc, lang) || String(await buildWish());
         const caption = String(text).slice(0, QUOTE_CAPTION_MAX);
 
