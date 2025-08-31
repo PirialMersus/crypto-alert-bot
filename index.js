@@ -251,7 +251,7 @@ function formatAlertEntry(a, idx, cur, last) {
   const title = isSL ? `*${idx+1}. ${a.symbol} — 🛑 SL*` : `*${idx+1}. ${a.symbol}*`;
   const conditionStr = a.condition === '>' ? '⬆️ выше' : '⬇️ ниже';
   let percent = '';
-  if (typeof cur === 'number' && typeof a.price === 'number') {
+  if (typeof cur === 'number' && typeof a.price === 'number' && a.price !== 0) {
     const diff = a.condition === '>' ? (a.price - cur) : (cur - a.price);
     percent = ` (осталось ${(diff / a.price * 100).toFixed(2)}% до срабатывания)`;
   }
@@ -576,8 +576,8 @@ async function fetchAndStoreDailyMotivation(dateStr) {
       translations = { en: original, ru: null, uk: null };
 
       try { const enT = await translateOrNull(original, 'en').catch(()=>null); translations.en = enT || original; } catch (e) {}
-      try { const ruT = await translateOrNull(original, 'ru').catch(()=>null); translations.ru = ruT || translations.en || original; } catch (e) {}
-      try { const ukT = await translateOrNull(original, 'uk').catch(()=>null); translations.uk = ukT || translations.en || original; } catch (e) {}
+      try { const ruT = await translateOrNull(original, 'ru').catch(()=>translations.en); translations.ru = ruT || translations.en || original; } catch (e) {}
+      try { const ukT = await translateOrNull(original, 'uk').catch(()=>translations.en); translations.uk = ukT || translations.en || original; } catch (e) {}
     }
 
     const doc = {
@@ -650,48 +650,61 @@ async function ensureDailyImageBuffer(dateStr) {
 
 async function buildWish() { return 'Хорошего дня!'; }
 
-async function sendDailyToUser(userId, dateStr, opts = { disableNotification: false }) {
+// NOTE: default opts.disableNotification = true to make automatic sends silent
+async function sendDailyToUser(userId, dateStr, opts = { disableNotification: true }) {
   try {
     let doc = dailyCache.date === dateStr ? dailyCache.doc : await dailyMotivationCollection.findOne({ date: dateStr }).catch(()=>null);
     if (!doc) doc = await fetchAndStoreDailyMotivation(dateStr).catch(()=>null);
 
     const buf = await ensureDailyImageBuffer(dateStr).catch(()=>null);
 
-    const lang = await resolveUserLang(userId);
+    // FORCED to Russian for daily motivation
+    const lang = 'ru';
     let quoteText = getBestQuoteText(doc, lang);
 
-    // NEW: если пользователь RU/UK — попробуем подтянуть оригинал на русском,
-    // только если в сохранённом документе нет перевода для его языка.
-    if ((lang === 'ru' || lang === 'uk') && (!doc?.quote?.translations || !doc.quote.translations[lang])) {
-      try {
-        const foris = await fetchQuoteForismatic().catch(()=>null);
-        if (foris && foris.text) {
-          const originalRu = String(foris.text);
-          // переводы
-          let enT = originalRu;
-          try { enT = await translateOrNull(originalRu, 'en').catch(()=>originalRu); } catch (e) {}
-          let ukT = null;
-          try { ukT = await translateOrNull(originalRu, 'uk').catch(null); } catch (e) {}
+    // Если перевод в doc отсутствует, попробуем перевести оригинал программно
+    if (!quoteText) {
+      // 1) если есть оригинал — попробуем перевести его в ru
+      const orig = doc?.quote?.original;
+      if (orig) {
+        try {
+          const tr = await translateOrNull(orig, 'ru').catch(()=>null);
+          if (tr) {
+            quoteText = tr;
+            // попытка обновить БД, чтобы в будущем не переводить снова
+            try {
+              await dailyMotivationCollection.updateOne({ date: dateStr }, { $set: { 'quote.translations.ru': tr } }, { upsert: false });
+              dailyCache.doc = await dailyMotivationCollection.findOne({ date: dateStr }).catch(()=>dailyCache.doc);
+            } catch (e) { /* ignore write errors */ }
+          }
+        } catch (e) { /* ignore translate errors */ }
+      }
 
-          const updates = {
-            'quote.original': originalRu,
-            'quote.author': foris.author || (doc?.quote?.author || ''),
-            'quote.source': foris.source || 'forismatic',
-            'quote.translations.en': enT,
-            'quote.translations.ru': originalRu
-          };
-          if (ukT) updates['quote.translations.uk'] = ukT;
-
-          try {
-            await dailyMotivationCollection.updateOne({ date: dateStr }, { $set: updates }, { upsert: true });
-            dailyCache.doc = await dailyMotivationCollection.findOne({ date: dateStr }).catch(()=>null);
-            doc = dailyCache.doc || doc;
-          } catch (e) { /* ignore db write errors */ }
-
-          quoteText = getBestQuoteText(doc, lang);
-        }
-      } catch (e) {
-        console.warn('sendDailyToUser: fetch russian original failed', e?.message || e);
+      // 2) если всё ещё нет текста — попробуем Forismatic (русские цитаты)
+      if (!quoteText) {
+        try {
+          const foris = await fetchQuoteForismatic().catch(()=>null);
+          if (foris && foris.text) {
+            const originalRu = String(foris.text);
+            quoteText = originalRu;
+            // сохраняем в БД перевод/оригинал
+            try {
+              const enT = await translateOrNull(originalRu, 'en').catch(()=>originalRu);
+              const ukT = await translateOrNull(originalRu, 'uk').catch(null);
+              const updates = {
+                'quote.original': originalRu,
+                'quote.author': foris.author || (doc?.quote?.author || ''),
+                'quote.source': foris.source || 'forismatic',
+                'quote.translations.en': enT,
+                'quote.translations.ru': originalRu
+              };
+              if (ukT) updates['quote.translations.uk'] = ukT;
+              await dailyMotivationCollection.updateOne({ date: dateStr }, { $set: updates }, { upsert: true });
+              dailyCache.doc = await dailyMotivationCollection.findOne({ date: dateStr }).catch(()=>dailyCache.doc);
+              doc = dailyCache.doc || doc;
+            } catch (e) { /* ignore db write errors */ }
+          }
+        } catch (e) { /* ignore */ }
       }
     }
 
@@ -871,40 +884,26 @@ async function sendDailyAllUsers(dateStr) {
       if (!u || !u.userId) continue;
       try {
         const uid = u.userId;
-        const lang = await resolveUserLang(uid, u.preferredLang || null);
 
-        // NEW: Если пользователь RU/UK и в doc нет ru/uk перевода — попробуем подтянуть оригинал на русском
-        if ((lang === 'ru' || lang === 'uk') && (!doc?.quote?.translations || !doc.quote.translations[lang])) {
+        // FORCE russian for mass sends
+        const lang = 'ru';
+
+        // If no russian translation exists, try to translate original and save
+        let ruText = getBestQuoteText(doc, 'ru');
+        if (!ruText && doc?.quote?.original) {
           try {
-            const foris = await fetchQuoteForismatic().catch(()=>null);
-            if (foris && foris.text) {
-              const originalRu = String(foris.text);
-              let enT = originalRu;
-              try { enT = await translateOrNull(originalRu, 'en').catch(()=>originalRu); } catch (e) {}
-              let ukT = null;
-              try { ukT = await translateOrNull(originalRu, 'uk').catch(null); } catch (e) {}
-
-              const updates = {
-                'quote.original': originalRu,
-                'quote.author': foris.author || (doc?.quote?.author || ''),
-                'quote.source': foris.source || 'forismatic',
-                'quote.translations.en': enT,
-                'quote.translations.ru': originalRu
-              };
-              if (ukT) updates['quote.translations.uk'] = ukT;
-
+            ruText = await translateOrNull(doc.quote.original, 'ru').catch(()=>null);
+            if (ruText) {
               try {
-                await dailyMotivationCollection.updateOne({ date: dateStr }, { $set: updates }, { upsert: true });
+                await dailyMotivationCollection.updateOne({ date: dateStr }, { $set: { 'quote.translations.ru': ruText } }, { upsert: false });
                 doc = await dailyMotivationCollection.findOne({ date: dateStr }).catch(()=>doc);
                 dailyCache.doc = doc;
-              } catch (e) { /* ignore write errors */ }
+              } catch (e) { /* ignore */ }
             }
-          } catch (e) {
-            console.warn('sendDailyAllUsers: fetch russian original failed for user', uid, e?.message || e);
-          }
+          } catch (e) { /* ignore */ }
         }
 
-        const text = getBestQuoteText(doc, lang) || String(await buildWish());
+        const text = (ruText || getBestQuoteText(doc, 'ru') || String(await buildWish()));
         const caption = String(text).slice(0, QUOTE_CAPTION_MAX);
 
         if (buf) {
@@ -973,7 +972,8 @@ bot.use(async (ctx, next) => {
     try {
       const pending = await pendingDailySendsCollection.findOne({ userId: uid, date: dateStr, sent: false, $or: [{ permanentFail: { $exists: false } }, { permanentFail: false }] });
       if (pending) {
-        const ok = await sendDailyToUser(uid, dateStr, { disableNotification: false });
+        // automatic send triggered when user becomes active — keep it silent to avoid waking
+        const ok = await sendDailyToUser(uid, dateStr, { disableNotification: true });
         if (ok) {
           await pendingDailySendsCollection.updateOne({ _id: pending._id }, { $set: { sent: true, sentAt: new Date(), permanentFail: false } });
         } else {
@@ -991,6 +991,7 @@ bot.hears('🌅 Прислать мотивацию', async (ctx) => {
       return ctx.reply('У вас нет доступа к этой команде.');
     }
     const dateStr = new Date().toLocaleDateString('sv-SE', { timeZone: KYIV_TZ });
+    // Manual send by creator — audible
     const ok = await sendDailyToUser(ctx.from.id, dateStr, { disableNotification: false });
     if (ok) {
       await pendingDailySendsCollection.updateOne({ userId: ctx.from.id, date: dateStr }, { $set: { sent: true, sentAt: new Date(), quoteSent: true, permanentFail: false } }, { upsert: true });
@@ -1264,21 +1265,110 @@ setInterval(async () => {
   } catch (e) { console.error('bg check error', e); }
 }, BG_CHECK_INTERVAL);
 
+// ---- removeInactive: раз в месяц проверяем и удаляем по правилам:
+// 1) если user.lastActive < now - 30d AND у него нет активных алертов => удалить
+// 2) если user.lastActive < now - 90d => удалить даже если есть активные алерты
+// удаление выполняется пачками для стабильности
 async function removeInactive() {
   try {
-    const cutoff = new Date(Date.now() - INACTIVE_DAYS * DAY_MS);
-    const inactive = await usersCollection.find({ lastActive: { $lt: cutoff } }).project({ userId:1 }).toArray();
-    if (!inactive.length) return;
-    const ids = inactive.map(u => u.userId);
-    await alertsCollection.deleteMany({ userId: { $in: ids } });
-    await lastViewsCollection.deleteMany({ userId: { $in: ids } });
-    await usersCollection.deleteMany({ userId: { $in: ids } });
-    ids.forEach(id => alertsCache.delete(id));
-    console.log(`Removed ${ids.length} inactive users`);
-  } catch (e) { console.error('removeInactive error', e); }
+    const cutoff30 = new Date(Date.now() - INACTIVE_DAYS * DAY_MS); // 30 дней
+    const cutoff90 = new Date(Date.now() - 90 * DAY_MS); // 90 дней
+
+    // получаем кандидатов: все пользователи с lastActive < cutoff30
+    const cursor = usersCollection.find({ lastActive: { $lt: cutoff30 } }, { projection: { userId: 1, lastActive: 1 } });
+    const toDeleteSet = new Set();
+
+    // обрабатываем по очереди (не грузим всю базу в память)
+    while (await cursor.hasNext()) {
+      const u = await cursor.next();
+      if (!u || !u.userId) continue;
+      const uid = u.userId;
+      try {
+        // если lastActive < cutoff90 — удаляем в любом случае
+        if (u.lastActive && (new Date(u.lastActive) < cutoff90)) {
+          toDeleteSet.add(uid);
+          continue;
+        }
+
+        // иначе проверяем, есть ли у пользователя активные алерты
+        const alertsCount = await alertsCollection.countDocuments({ userId: uid });
+        // правило: если алертов нет — удаляем (пользователь месяц не активничал и у него нет алертов)
+        if (!alertsCount) {
+          toDeleteSet.add(uid);
+        }
+      } catch (e) {
+        console.warn('removeInactive: error checking user', uid, e?.message || e);
+      }
+    }
+
+    const toDelete = Array.from(toDeleteSet);
+    if (!toDelete.length) {
+      // ничего для удаления — молча уходим (чтобы не спамить логи)
+      return;
+    }
+
+    console.log(`removeInactive: will remove ${toDelete.length} users (batching deletes)`);
+
+    // делаем удаление пачками по 200
+    const BATCH = 200;
+    for (let i = 0; i < toDelete.length; i += BATCH) {
+      const batch = toDelete.slice(i, i + BATCH);
+      try {
+        // удаляем связанные коллекции
+        await alertsCollection.deleteMany({ userId: { $in: batch } }).catch(()=>{});
+        await lastViewsCollection.deleteMany({ userId: { $in: batch } }).catch(()=>{});
+        await pendingDailySendsCollection.deleteMany({ userId: { $in: batch } }).catch(()=>{});
+        // не всегда есть записи в dailyQuoteRetry с userId, но попытаемся
+        await dailyQuoteRetryCollection.deleteMany({ userId: { $in: batch } }).catch(()=>{});
+        // удаляем самих пользователей
+        await usersCollection.deleteMany({ userId: { $in: batch } }).catch(()=>{});
+
+        // очищаем локальные кеши
+        for (const id of batch) {
+          alertsCache.delete(id);
+          lastViewsCache.delete(id);
+          usersActivityCache.delete(id);
+        }
+
+        console.log(`removeInactive: removed batch of ${batch.length} users`);
+      } catch (e) {
+        console.error('removeInactive: batch deletion error', e?.message || e);
+      }
+    }
+  } catch (e) {
+    console.error('removeInactive error', e?.message || e);
+  }
 }
+
+// безопасный планировщик для ежемесячной очистки.
+// Node не поддерживает setInterval > 2^31-1 ms, поэтому
+// используем стратегию: если месячный интервал вписывается — используем его,
+// иначе проверяем ежедневно и выполняем задачу когда прошло >= 30 дней.
+const MONTH_MS = 30 * DAY_MS;
+const MAX_INT32 = 2147483647;
+
 await removeInactive();
-setInterval(removeInactive, DAY_MS);
+
+if (MONTH_MS <= MAX_INT32) {
+  setInterval(removeInactive, MONTH_MS);
+  console.log('removeInactive scheduled every 30 days (safe interval).');
+} else {
+  // fallback: проверяем ежедневным интервалом и фактически выполняем задачу
+  // только когда прошло >= 30 дней с последнего выполнения.
+  let lastRunTs = Date.now();
+  setInterval(async () => {
+    try {
+      const now = Date.now();
+      if (now - lastRunTs >= MONTH_MS) {
+        await removeInactive();
+        lastRunTs = Date.now();
+      }
+    } catch (e) {
+      console.error('scheduled daily removeInactive error', e);
+    }
+  }, DAY_MS);
+  console.log('removeInactive scheduled daily (will run actual cleanup every 30 days).');
+}
 
 bot.launch().then(() => console.log('Bot started'));
 
