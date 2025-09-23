@@ -1,6 +1,6 @@
 // src/alerts.js
 import { ENTRIES_PER_PAGE, DELETE_MENU_LABEL, DELETE_LABEL_TARGET_LEN, BG_CHECK_INTERVAL } from './constants.js';
-import { alertsCollection } from './db.js';
+import { alertsCollection, alertsArchiveCollection, usersCollection } from './db.js';
 import { tickersCache, pricesCache, allAlertsCache, getUserAlertsCached, getAllAlertsCached, getUserLastViews, setUserLastViews, invalidateUserAlertsCache, getUserAlertsOrder } from './cache.js';
 import { getPriceLevel1 } from './prices.js';
 import { fmtNum, formatChangeWithIcons, padLabel } from './utils.js';
@@ -185,6 +185,78 @@ export async function buildDeleteInlineForUser(userId, opts = { fast: false, sou
   return inline;
 }
 
+export async function renderOldAlertsList(userId, opts = { days: 30, symbol: null, token: 'd30_q' }) {
+  const days = (opts && Number.isFinite(opts.days)) ? Math.max(1, Math.floor(opts.days)) : 30;
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+  // Build base query: archived alerts for this user within timeframe
+  const q = { userId, $or: [ { firedAt: { $exists: true } }, { deletedAt: { $exists: true } } ] };
+  q.$and = [{ createdAt: { $gte: since } }];
+
+  if (opts && opts.symbol) {
+    const sym = String(opts.symbol).toUpperCase();
+    // match either exact stored symbol or with -USDT suffix
+    q.$and.push({ $or: [{ symbol: sym }, { symbol: `${sym}-USDT` }] });
+  }
+
+  let docs = [];
+  try {
+    docs = await alertsArchiveCollection.find(q, { sort: { firedAt: -1, deletedAt: -1, createdAt: -1 } }).toArray();
+  } catch (e) {
+    console.warn('renderOldAlertsList: archive query failed', e?.message || e);
+    docs = [];
+  }
+
+  if (!docs || !docs.length) {
+    // more specific message when a symbol search yielded no results
+    let text;
+    if (opts && opts.symbol) {
+      text = `Нет старых алертов с тикером *${String(opts.symbol).toUpperCase()}* за выбранный период.`;
+    } else {
+      text = 'Нет старых алертов за выбранный период.';
+    }
+    const buttons = [[{ text: '↩️ Назад', callback_data: 'back_to_main' }]];
+    return { pages: [{ text, buttons }], pageCount: 1 };
+  }
+
+  const entries = docs.map((d, idx) => {
+    const status = d.firedAt ? '✅ Сработал' : (d.deletedAt ? '🗑️ Удалён' : 'ℹ️ Статус');
+    const when = d.firedAt ? d.firedAt : (d.deletedAt ? d.deletedAt : d.createdAt);
+    const priceStr = fmtNum(d.price);
+    const symbol = d.symbol;
+    const byType = d.type === 'sl' ? '🛑 SL' : '🔔 Алерт';
+    const reason = d.deleteReason ? `\nПричина удаления: ${d.deleteReason}` : '';
+    const firedInfo = d.firedPrice ? `\nЦена при срабатывании: *${fmtNum(d.firedPrice)}*` : '';
+    const txt = `*${idx+1}. ${symbol}* — ${byType}\nУсловие: ${d.condition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${priceStr}*\nСтатус: ${status}\nВремя: ${new Date(when).toLocaleString() || ''}${firedInfo}${reason}\n\n`;
+    return { text: txt, id: d._id?.toString?.() || `arch_${idx}` };
+  });
+
+  const pages = [];
+  for (let i = 0; i < entries.length; i += ENTRIES_PER_PAGE) {
+    let text = '📜 *Старые алерты:*\n\n';
+    const entryIndexes = [];
+    for (let j = i; j < Math.min(i + ENTRIES_PER_PAGE, entries.length); j++) {
+      text += entries[j].text;
+      entryIndexes.push(j);
+    }
+    pages.push({ text, entryIndexes, buttons: [] });
+  }
+
+  for (let p = 0; p < pages.length; p++) {
+    pages[p].text = pages[p].text + `Страница *${p+1}*/${pages.length}\n\n`;
+    const rows = [];
+    const nav = [];
+    const token = opts && opts.token ? opts.token : `d${days}_q${opts && opts.symbol ? encodeURIComponent(String(opts.symbol)) : ''}`;
+    if (p > 0) nav.push({ text: '◀️ Предыдущая страница', callback_data: `old_alerts_page_${p-1}_view_${token}` });
+    if (p < pages.length - 1) nav.push({ text: 'Следующая страница ▶️', callback_data: `old_alerts_page_${p+1}_view_${token}` });
+    if (nav.length) rows.push(nav);
+    rows.push([{ text: '↩️ Назад', callback_data: 'back_to_main' }]);
+    pages[p].buttons = rows;
+  }
+
+  return { pages, pageCount: pages.length };
+}
+
 export function startAlertsChecker(bot) {
   setInterval(async () => {
     try {
@@ -211,35 +283,46 @@ export function startAlertsChecker(bot) {
       for (const a of all) {
         const cur = priceMap.get(a.symbol) ?? (pricesCache.get(a.symbol)?.price);
         if (!Number.isFinite(cur)) continue;
-
         if ((a.condition === '>' && cur > a.price) || (a.condition === '<' && cur < a.price)) {
           const isSL = a.type === 'sl';
+          const text = `${isSL ? '🛑 *Сработал стоп-лосс!*' : '🔔 *Сработал алерт!*'}\nМонета: *${a.symbol}*\nЦена сейчас: *${fmtNum(cur)}*\nУсловие: ${a.condition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${fmtNum(a.price)}*`;
           try {
-            await bot.telegram.sendMessage(a.userId, `${isSL ? '🛑 *Сработал стоп-лосс!*' : '🔔 *Сработал алерт!*'}\nМонета: *${a.symbol}*\nЦена сейчас: *${fmtNum(cur)}*\nУсловие: ${a.condition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${fmtNum(a.price)}*`, { parse_mode: 'Markdown' });
-            await alertsCollection.deleteOne({ _id: a._id }).catch(()=>{});
+            await bot.telegram.sendMessage(a.userId, text, { parse_mode: 'Markdown' });
+            // move to archive
+            try {
+              await alertsArchiveCollection.insertOne({
+                ...a,
+                firedAt: new Date(),
+                firedPrice: cur,
+                archivedReason: 'fired',
+                archivedAt: new Date()
+              });
+            } catch (e) { console.warn('archive insert failed after send', e?.message || e); }
+            await alertsCollection.deleteOne({ _id: a._id });
             invalidateUserAlertsCache(a.userId);
           } catch (err) {
-            // логим кратко
-            console.warn('bg send error', err?.response?.error_code || err?.statusCode || err?.message || err);
-
-            const code = err?.response?.error_code || err?.statusCode || null;
-            const desc = err?.response?.description || err?.message || '';
-
-            if (code === 403 || /bot was blocked/i.test(String(desc))) {
-              try {
-                // удалим все алерты пользователя, чтобы не спамить дальше
-                await alertsCollection.deleteMany({ userId: a.userId }).catch(()=>{});
-                invalidateUserAlertsCache(a.userId);
-                // пометим пользователя, чтобы можно было посмотреть статистику
+            // handle blocked users: mark in usersCollection and archive alert with reason
+            try {
+              const code = err?.response?.error_code;
+              const description = err?.response?.description || String(err?.message || err);
+              if (code === 403 || /bot was blocked/i.test(description)) {
                 try {
-                  const { usersCollection } = await import('./db.js');
-                  await usersCollection.updateOne({ userId: a.userId }, { $set: { botBlocked: true } }, { upsert: true }).catch(()=>{});
-                } catch (e) { /* ignore */ }
-                console.info(`Removed all alerts for user ${a.userId} because bot was blocked (403).`);
-              } catch (e) {
-                console.error('Failed to cleanup alerts after 403', e);
+                  await usersCollection.updateOne({ userId: a.userId }, { $set: { botBlocked: true, botBlockedAt: new Date() } }, { upsert: true });
+                } catch (e) {}
+                try {
+                  await alertsArchiveCollection.insertOne({
+                    ...a,
+                    archivedAt: new Date(),
+                    archivedReason: 'bot_blocked',
+                    sendError: description
+                  });
+                } catch (e) { console.warn('archive insert failed after blocked', e?.message || e); }
+                await alertsCollection.deleteOne({ _id: a._id }).catch(()=>{});
+                invalidateUserAlertsCache(a.userId);
+              } else {
+                console.error('bg check error', err);
               }
-            }
+            } catch (ee) { console.error('bg check error handling failed', ee); }
           }
         }
       }

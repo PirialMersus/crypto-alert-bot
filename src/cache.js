@@ -1,4 +1,3 @@
-// src/cache.js
 import { CACHE_TTL, RECENT_SYMBOLS_MAX } from './constants.js';
 import { alertsCollection, lastViewsCollection, usersCollection } from './db.js';
 
@@ -10,16 +9,21 @@ export let allAlertsCache = { alerts: null, time: 0 };
 export let statsCache = { count: null, time: 0 };
 export const dailyCache = { date: null, doc: null, imageBuffer: null };
 
-// Временно снимаем лимит — можно вернуть позже
-export const DEFAULT_ALERT_LIMIT = Number.MAX_SAFE_INTEGER;
+export const DEFAULT_ALERT_LIMIT = 10;
 
 export async function getUserAlertsCached(userId) {
   const now = Date.now();
   const c = alertsCache.get(userId);
   if (c && (now - c.time) < CACHE_TTL) return c.alerts;
-  const alerts = await alertsCollection.find({ userId }).toArray();
-  alertsCache.set(userId, { alerts, time: now });
-  return alerts;
+  try {
+    const alerts = await alertsCollection.find({ userId }).toArray();
+    alertsCache.set(userId, { alerts, time: now });
+    return alerts;
+  } catch (e) {
+    console.warn('getUserAlertsCached: DB error, returning empty list', e?.message || e);
+    alertsCache.set(userId, { alerts: [], time: now });
+    return [];
+  }
 }
 
 export function invalidateUserAlertsCache(userId) {
@@ -29,20 +33,34 @@ export function invalidateUserAlertsCache(userId) {
 
 export async function getAllAlertsCached() {
   const now = Date.now();
-  if (allAlertsCache.alerts && (now - allAlertsCache.time) < CACHE_TTL) return allAlertsCache.alerts;
-  const all = await alertsCollection.find({}).toArray();
-  allAlertsCache = { alerts: all, time: Date.now() };
-  return all;
+  try {
+    if (allAlertsCache.alerts && (now - allAlertsCache.time) < CACHE_TTL) return allAlertsCache.alerts;
+    const all = await alertsCollection.find({}).toArray();
+    allAlertsCache = { alerts: all, time: Date.now() };
+    return all;
+  } catch (e) {
+    // Handle transient Mongo network errors gracefully: don't throw — return empty and back off for CACHE_TTL
+    console.warn('getAllAlertsCached: DB error, returning empty list for short backoff', e?.message || e);
+    allAlertsCache = { alerts: [], time: Date.now() };
+    return [];
+  }
 }
 
 export async function getUserLastViews(userId) {
   const now = Date.now();
   const cached = lastViewsCache.get(userId);
   if (cached && (now - cached.time) < CACHE_TTL) return cached.map;
-  const rows = await lastViewsCollection.find({ userId }).toArray();
-  const map = Object.fromEntries(rows.map(r => [r.symbol, (typeof r.lastPrice === 'number') ? r.lastPrice : null]));
-  lastViewsCache.set(userId, { map, time: now });
-  return map;
+  try {
+    const rows = await lastViewsCollection.find({ userId }).toArray();
+    const map = Object.fromEntries(rows.map(r => [r.symbol, (typeof r.lastPrice === 'number') ? r.lastPrice : null]));
+    lastViewsCache.set(userId, { map, time: now });
+    return map;
+  } catch (e) {
+    console.warn('getUserLastViews: DB error, returning empty map', e?.message || e);
+    const map = {};
+    lastViewsCache.set(userId, { map, time: now });
+    return map;
+  }
 }
 
 export async function setUserLastViews(userId, updates) {
@@ -50,15 +68,21 @@ export async function setUserLastViews(userId, updates) {
   const ops = Object.entries(updates).map(([symbol, lastPrice]) => ({
     updateOne: { filter: { userId, symbol }, update: { $set: { lastPrice } }, upsert: true }
   }));
-  await lastViewsCollection.bulkWrite(ops);
-  lastViewsCache.delete(userId);
+  try {
+    await lastViewsCollection.bulkWrite(ops);
+    lastViewsCache.delete(userId);
+  } catch (e) {
+    console.warn('setUserLastViews: bulkWrite failed', e?.message || e);
+    // best-effort: invalidate cache so next read will try again
+    lastViewsCache.delete(userId);
+  }
 }
 
 export async function getUserRecentSymbols(userId) {
   try {
     const u = await usersCollection.findOne({ userId }, { projection: { recentSymbols: 1 } });
     return Array.isArray(u?.recentSymbols) ? u.recentSymbols.slice(-6).reverse() : [];
-  } catch {
+  } catch (e) {
     return [];
   }
 }

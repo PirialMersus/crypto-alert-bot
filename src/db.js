@@ -13,7 +13,7 @@ export const client = new MongoClient(MONGO_URI, {
   socketTimeoutMS: 30000,
 });
 
-export let alertsCollection, usersCollection, lastViewsCollection, dailyMotivationCollection, dailyQuoteRetryCollection, pendingDailySendsCollection;
+export let alertsCollection, usersCollection, lastViewsCollection, dailyMotivationCollection, dailyQuoteRetryCollection, pendingDailySendsCollection, alertsArchiveCollection;
 let currentDbName = null;
 
 async function tryConnectWithRetries(attempts = 3) {
@@ -37,7 +37,6 @@ export async function connectToMongo() {
     await tryConnectWithRetries(3);
   } catch (e) {
     console.error('Failed to connect to MongoDB after retries:', e?.message || e);
-    // rethrow so caller sees problem; background tasks should handle absence of DB gracefully
     throw e;
   }
 
@@ -47,6 +46,7 @@ export async function connectToMongo() {
   currentDbName = isDev ? devDbName : null;
 
   alertsCollection = db.collection('alerts');
+  alertsArchiveCollection = db.collection('alerts_archive');
   usersCollection = db.collection('users');
   lastViewsCollection = db.collection('last_alerts_view');
   dailyMotivationCollection = db.collection('daily_motivation');
@@ -57,6 +57,9 @@ export async function connectToMongo() {
     await alertsCollection.createIndex({ userId: 1 });
     await alertsCollection.createIndex({ symbol: 1 });
     await alertsCollection.createIndex({ userId: 1, symbol: 1 });
+    await alertsArchiveCollection.createIndex({ userId: 1 });
+    await alertsArchiveCollection.createIndex({ firedAt: 1 });
+    await alertsArchiveCollection.createIndex({ deletedAt: 1 });
     await usersCollection.createIndex({ userId: 1 }, { unique: true });
     await usersCollection.createIndex({ lastActive: 1 });
     await lastViewsCollection.createIndex({ userId: 1, symbol: 1 }, { unique: true });

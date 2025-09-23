@@ -1,17 +1,10 @@
 // src/bot.js
-// Исправлено:
-// - При нажатии "➕ Создать алерт" теперь сразу проверяется текущее число активных алертов у пользователя.
-//   Если оно >= лимита, пользователь получает уведомление и создание не начинается.
-// - Убраны лишние символы перевода строки и убран URL в скобках из сообщения об обращении к администратору.
-// - Аналогичные правки в местах, где проверяется лимит при создании алерта и связки alert+SL (сообщения теперь в одну строку, без URL).
-// Комментарии по логике сохранены кратко вверху, остальной код не изменялся по функционалу.
-
 import { Telegraf, session } from 'telegraf';
 import dotenv from 'dotenv';
 import { connectToMongo, ObjectId, countDocumentsWithTimeout } from './db.js';
 import { createServer } from './server.js';
 import { startTickersRefresher, refreshAllTickers, getCachedPrice } from './prices.js';
-import { startAlertsChecker, renderAlertsList, buildDeleteInlineForUser } from './alerts.js';
+import { startAlertsChecker, renderAlertsList, buildDeleteInlineForUser, renderOldAlertsList } from './alerts.js';
 import { removeInactive } from './cleanup.js';
 import {
   getUserRecentSymbols,
@@ -42,7 +35,11 @@ bot.use(async (ctx, next) => {
   try {
     if (ctx.from && ctx.from.id) {
       const { usersCollection } = await import('./db.js');
-      await usersCollection.updateOne({ userId: ctx.from.id }, { $set: { userId: ctx.from.id, lastActive: new Date(), language_code: ctx.from.language_code || null } }, { upsert: true });
+      await usersCollection.updateOne(
+        { userId: ctx.from.id },
+        { $set: { userId: ctx.from.id, lastActive: new Date(), language_code: ctx.from.language_code || null } },
+        { upsert: true }
+      );
     }
   } catch (e) {
     console.warn('update lastActive failed', e?.message || e);
@@ -51,7 +48,11 @@ bot.use(async (ctx, next) => {
 });
 
 function getMainMenu(userId) {
-  const keyboard = [[{ text: '➕ Создать алерт' }, { text: '📋 Мои алерты' }], [{ text: '⚙️ Настройки' }]];
+  const keyboard = [
+    [{ text: '➕ Создать алерт' }, { text: '📋 Мои алерты' }],
+    [{ text: '⚙️ Настройки' }],
+    [{ text: '📜 Старые алерты' }, { text: '🔎 Поиск старых алертов' }]
+  ];
   if (CREATOR_ID && String(userId) === String(CREATOR_ID)) {
     keyboard.push([{ text: '🌅 Прислать мотивацию' }]);
     keyboard.push([{ text: '👥 Количество активных пользователей' }]);
@@ -148,6 +149,18 @@ bot.hears('📋 Мои алерты', async (ctx) => {
   }
 });
 
+bot.hears('📜 Старые алерты', async (ctx) => {
+  // Start flow to select days; we'll hide keyboard after a selection (handled in text handler)
+  ctx.session = { step: 'old_alerts_select_days' };
+  const kb = [[{ text: '7 дней' }, { text: '30 дней' }, { text: '90 дней' }], [{ text: '↩️ Отмена' }]];
+  await ctx.reply('Выбери период для просмотра старых алертов:', { reply_markup: { keyboard: kb, resize_keyboard: true } });
+});
+
+bot.hears('🔎 Поиск старых алертов', async (ctx) => {
+  ctx.session = { step: 'old_alerts_search' };
+  await ctx.reply('Введи запрос в формате: SYMBOL [DAYS]\nПримеры: "BTC", "BTC 30". По умолчанию DAYS=30.', { reply_markup: { keyboard: [[{ text: '↩️ Отмена' }]], resize_keyboard: true } });
+});
+
 bot.hears('🌅 Прислать мотивацию', async (ctx) => {
   try {
     if (!CREATOR_ID || String(ctx.from.id) !== String(CREATOR_ID)) return ctx.reply('У вас нет доступа к этой команде.');
@@ -176,7 +189,8 @@ bot.hears('👥 Количество активных пользователей
     const cutoff = new Date(Date.now() - INACTIVE_DAYS * DAY_MS);
     let activeCount;
     try {
-      activeCount = await countDocumentsWithTimeout('users', { lastActive: { $gte: cutoff } }, 7000);
+      // exclude users that we flagged as botBlocked
+      activeCount = await countDocumentsWithTimeout('users', { lastActive: { $gte: cutoff }, $or: [{ botBlocked: { $exists: false } }, { botBlocked: false }] }, 7000);
     }
     catch (err) {
       console.error('Ошибка/таймаут при подсчёте активных пользователей:', err);
@@ -285,6 +299,17 @@ bot.on('callback_query', async (ctx) => {
         } catch (e) { sourcePage = 0; }
       }
 
+      // archive before deleting
+      try {
+        const { alertsArchiveCollection } = await import('./db.js');
+        await alertsArchiveCollection.insertOne({
+          ...doc,
+          deletedAt: new Date(),
+          deleteReason: 'user_deleted',
+          archivedAt: new Date()
+        });
+      } catch (e) { console.warn('archive insert failed on user delete', e?.message || e); }
+
       const { alertsCollection: ac } = await import('./db.js');
       await ac.deleteOne({ _id: new ObjectId(id) });
       invalidateUserAlertsCache(ctx.from.id);
@@ -312,6 +337,25 @@ bot.on('callback_query', async (ctx) => {
       return;
     }
 
+    const mOldPage = data.match(/^old_alerts_page_(\d+)_view_(d(\d+)_q(.+))$/);
+    if (mOldPage) {
+      const pageIdx = parseInt(mOldPage[1], 10);
+      const token = mOldPage[2];
+      const mToken = token.match(/^d(\d+)_q(.*)$/);
+      const days = mToken ? parseInt(mToken[1], 10) : 30;
+      const q = mToken ? decodeURIComponent(mToken[2]) : '';
+      const opts = { days, symbol: q || null, token };
+      const { pages } = await renderOldAlertsList(ctx.from.id, opts);
+      const page = pages[Math.max(0, Math.min(pageIdx, pages.length - 1))] || pages[0];
+      try {
+        await ctx.editMessageText(page.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: page.buttons } });
+      } catch (e) {
+        try { await ctx.reply(page.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: page.buttons } }); } catch (e2) { console.error('old_alerts_page edit/reply failed', e2); }
+      }
+      await ctx.answerCbQuery();
+      return;
+    }
+
     await ctx.answerCbQuery();
   } catch (e) {
     console.error(e);
@@ -322,7 +366,31 @@ bot.on('callback_query', async (ctx) => {
 bot.on('text', async (ctx) => {
   try {
     const step = ctx.session.step;
-    const text = (ctx.message.text || '').trim();
+    const textRaw = (ctx.message.text || '').trim();
+    const text = textRaw;
+
+    // --- New: allow day-selection shortcuts even if session was cleared previously.
+    // Only intercept when user is NOT in an active create-alert flow (to avoid breaking numeric price input).
+    const daysMap = { '7 дней': 7, '30 дней': 30, '90 дней': 90 };
+    const numeric = parseInt(text.replace(/\D/g, ''), 10);
+    const isNumericDay = Number.isFinite(numeric) && [7, 30, 90].includes(numeric);
+    const normalized = text.toLowerCase();
+    const isDaysPhrase = daysMap[text] || daysMap[normalized] || isNumericDay || /^\d+\s*дн/i.test(text);
+    if (( !step || step === 'old_alerts_select_days' ) && isDaysPhrase) {
+      // handle as old alerts selection
+      const days = daysMap[text] || daysMap[normalized] || (isNumericDay ? numeric : 30);
+      const token = `d${days}_q`;
+      const { pages } = await renderOldAlertsList(ctx.from.id, { days, symbol: null, token });
+      const first = pages[0];
+      // clear session and remove reply keyboard
+      ctx.session = {};
+      if (first.buttons && first.buttons.length) {
+        await ctx.reply(first.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: first.buttons, remove_keyboard: true } });
+      } else {
+        await ctx.reply(first.text, getMainMenu(ctx.from.id));
+      }
+      return;
+    }
 
     if (!step && /^[A-Z0-9]{2,10}$/i.test(text)) ctx.session = { step: 'symbol' };
     if (!ctx.session.step) return;
@@ -395,7 +463,7 @@ bot.on('text', async (ctx) => {
             return;
           }
 
-          await ac.insertOne({ userId: ctx.from.id, symbol: ctx.session.symbol, condition: ctx.session.alertCondition, price: ctx.session.alertPrice, type: 'alert' });
+          await ac.insertOne({ userId: ctx.from.id, symbol: ctx.session.symbol, condition: ctx.session.alertCondition, price: ctx.session.alertPrice, type: 'alert', createdAt: new Date() });
           invalidateUserAlertsCache(ctx.from.id);
           const cp = await getCachedPrice(ctx.session.symbol);
           await ctx.reply(`✅ Алерт создан: *${ctx.session.symbol}* ${ctx.session.alertCondition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${fmtNum(ctx.session.alertPrice)}* Текущая цена: *${fmtNum(cp) ?? '—'}*`, { parse_mode: 'Markdown', ...getMainMenu(ctx.from.id) });
@@ -446,14 +514,50 @@ bot.on('text', async (ctx) => {
         const slDir = ctx.session.alertCondition === '<' ? 'ниже' : 'выше';
         const { alertsCollection: ac } = await import('./db.js');
         await ac.insertMany([
-          { userId: ctx.from.id, symbol: ctx.session.symbol, condition: ctx.session.alertCondition, price: ctx.session.alertPrice, type: 'alert', groupId },
-          { userId: ctx.from.id, symbol: ctx.session.symbol, condition: ctx.session.alertCondition, price: sl, type: 'sl', slDir, groupId }
+          { userId: ctx.from.id, symbol: ctx.session.symbol, condition: ctx.session.alertCondition, price: ctx.session.alertPrice, type: 'alert', groupId, createdAt: new Date() },
+          { userId: ctx.from.id, symbol: ctx.session.symbol, condition: ctx.session.alertCondition, price: sl, type: 'sl', slDir, groupId, createdAt: new Date() }
         ]);
         invalidateUserAlertsCache(ctx.from.id);
         const cp = await getCachedPrice(ctx.session.symbol);
         await ctx.reply(`✅ Создана связка: 🔔 *${ctx.session.symbol}* ${ctx.session.alertCondition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${fmtNum(ctx.session.alertPrice)}*  🛑 SL (${slDir}) *${fmtNum(sl)}* Текущая: *${fmtNum(cp) ?? '—'}*`, { parse_mode: 'Markdown', ...getMainMenu(ctx.from.id) });
       } catch (e) { console.error(e); await ctx.reply('Ошибка при создании связки'); }
       ctx.session = {};
+      return;
+    }
+
+    // Old alerts - user selected days (session-driven)
+    if (ctx.session.step === 'old_alerts_select_days') {
+      if (text === '↩️ Отмена') { ctx.session = {}; await ctx.reply('Отмена', getMainMenu(ctx.from.id)); return; }
+      const daysMapLocal = { '7 дней': 7, '30 дней': 30, '90 дней': 90 };
+      const days = daysMapLocal[text] || parseInt(text, 10) || 30;
+      const token = `d${days}_q`;
+      const { pages } = await renderOldAlertsList(ctx.from.id, { days, symbol: null, token });
+      const first = pages[0];
+      // clear session
+      ctx.session = {};
+      if (first.buttons && first.buttons.length) {
+        await ctx.reply(first.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: first.buttons, remove_keyboard: true } });
+      } else {
+        await ctx.reply(first.text, getMainMenu(ctx.from.id));
+      }
+      return;
+    }
+
+    // Old alerts search
+    if (ctx.session.step === 'old_alerts_search') {
+      if (text === '↩️ Отмена') { ctx.session = {}; await ctx.reply('Отмена', getMainMenu(ctx.from.id)); return; }
+      const parts = text.split(/\s+/).filter(Boolean);
+      const symbol = parts[0] || null;
+      const days = parts[1] ? Math.max(1, parseInt(parts[1], 10)) : 30;
+      const token = `d${days}_q${encodeURIComponent(String(symbol || ''))}`;
+      const { pages } = await renderOldAlertsList(ctx.from.id, { days, symbol, token });
+      const first = pages[0];
+      ctx.session = {};
+      if (first.buttons && first.buttons.length) {
+        await ctx.reply(first.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: first.buttons, remove_keyboard: true } });
+      } else {
+        await ctx.reply(first.text, getMainMenu(ctx.from.id));
+      }
       return;
     }
 

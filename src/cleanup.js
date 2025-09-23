@@ -1,5 +1,4 @@
-// src/cleanup.js
-import { usersCollection, alertsCollection, lastViewsCollection, pendingDailySendsCollection, dailyQuoteRetryCollection } from './db.js';
+import { usersCollection, alertsCollection, lastViewsCollection, pendingDailySendsCollection, dailyQuoteRetryCollection, alertsArchiveCollection } from './db.js';
 import { INACTIVE_DAYS, DAY_MS } from './constants.js';
 export async function removeInactive() {
   try {
@@ -23,6 +22,15 @@ export async function removeInactive() {
     for (let i = 0; i < toDelete.length; i += BATCH) {
       const batch = toDelete.slice(i, i + BATCH);
       try {
+        // archive alerts for these users before deleting
+        try {
+          const docs = await alertsCollection.find({ userId: { $in: batch } }).toArray();
+          if (docs && docs.length) {
+            const archived = docs.map(d => ({ ...d, deletedAt: new Date(), deleteReason: 'user_inactive_cleanup', archivedAt: new Date() }));
+            await alertsArchiveCollection.insertMany(archived).catch(()=>{});
+          }
+        } catch (e) { console.warn('archive during cleanup failed', e?.message || e); }
+
         await alertsCollection.deleteMany({ userId: { $in: batch } }).catch(()=>{});
         await lastViewsCollection.deleteMany({ userId: { $in: batch } }).catch(()=>{});
         await pendingDailySendsCollection.deleteMany({ userId: { $in: batch } }).catch(()=>{});

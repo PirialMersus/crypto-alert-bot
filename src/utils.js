@@ -19,20 +19,6 @@ export function padLabel(text, targetLen = 30) {
   return cur + '\u00A0'.repeat(needed);
 }
 export async function buildWish() { return 'Хорошего дня!'; }
-
-/**
- * safeSendTelegram — helper for centralized Telegram send handling.
- * - bot: telegraf bot instance
- * - method: string, e.g. 'sendMessage' | 'sendPhoto'
- * - args: array of arguments to pass to bot.telegram[method]
- *
- * On Telegram 403 (bot blocked) it will:
- *  - delete all alerts for the user (best-effort)
- *  - invalidate user alerts cache (best-effort)
- *  - mark user { botBlocked: true } in users collection (best-effort)
- *
- * It rethrows the original error so callers can handle it (and record statuses).
- */
 export async function safeSendTelegram(bot, method, args = [], on403 = async () => {}) {
   try {
     if (!bot || !bot.telegram || typeof bot.telegram[method] !== 'function') {
@@ -51,23 +37,22 @@ export async function safeSendTelegram(bot, method, args = [], on403 = async () 
             if (db && db.alertsCollection) {
               await db.alertsCollection.deleteMany({ userId: uid }).catch(()=>{});
             }
-          } catch (e) { /* ignore */ }
-
+          } catch (e) {}
           try {
             const cacheMod = await import('./cache.js');
             if (cacheMod && typeof cacheMod.invalidateUserAlertsCache === 'function') {
               cacheMod.invalidateUserAlertsCache(uid);
             }
-          } catch (e) { /* ignore */ }
-
+            try { if (cacheMod && cacheMod.statsCache) cacheMod.statsCache.time = 0; } catch (e) {}
+          } catch (e) {}
           try {
             const db = await import('./db.js');
             if (db && db.usersCollection) {
               await db.usersCollection.updateOne({ userId: uid }, { $set: { botBlocked: true } }, { upsert: true }).catch(()=>{});
             }
-          } catch (e) { /* ignore */ }
+          } catch (e) {}
         }
-      } catch (e) { /* swallow — cleanup should not crash caller */ }
+      } catch (e) {}
       try { await on403(); } catch (e) {}
     }
     throw err;
