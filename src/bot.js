@@ -1,4 +1,3 @@
-// src/bot.js
 import { Telegraf, session } from 'telegraf';
 import dotenv from 'dotenv';
 import { connectToMongo, ObjectId, countDocumentsWithTimeout } from './db.js';
@@ -222,7 +221,7 @@ bot.on('callback_query', async (ctx) => {
       return;
     }
 
-    const mShow = data.match(/^show_delete_menu_(all|\\d+)$/);
+    const mShow = data.match(/^show_delete_menu_(all|\d+)$/);
     if (mShow) {
       const token = mShow[1];
       const { pages } = await renderAlertsList(ctx.from.id, { fast: true });
@@ -306,7 +305,8 @@ bot.on('callback_query', async (ctx) => {
           ...doc,
           deletedAt: new Date(),
           deleteReason: 'user_deleted',
-          archivedAt: new Date()
+          archivedAt: new Date(),
+          archivedReason: 'user_deleted'
         });
       } catch (e) { console.warn('archive insert failed on user delete', e?.message || e); }
 
@@ -385,7 +385,7 @@ bot.on('text', async (ctx) => {
       // clear session and remove reply keyboard
       ctx.session = {};
       if (first.buttons && first.buttons.length) {
-        await ctx.reply(first.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: first.buttons, remove_keyboard: true } });
+        await ctx.reply(first.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: first.buttons }, remove_keyboard: true });
       } else {
         await ctx.reply(first.text, getMainMenu(ctx.from.id));
       }

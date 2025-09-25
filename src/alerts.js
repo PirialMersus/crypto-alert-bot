@@ -1,4 +1,3 @@
-// src/alerts.js
 import { ENTRIES_PER_PAGE, DELETE_MENU_LABEL, DELETE_LABEL_TARGET_LEN, BG_CHECK_INTERVAL } from './constants.js';
 import { alertsCollection, alertsArchiveCollection, usersCollection } from './db.js';
 import { tickersCache, pricesCache, allAlertsCache, getUserAlertsCached, getAllAlertsCached, getUserLastViews, setUserLastViews, invalidateUserAlertsCache, getUserAlertsOrder } from './cache.js';
@@ -189,26 +188,30 @@ export async function renderOldAlertsList(userId, opts = { days: 30, symbol: nul
   const days = (opts && Number.isFinite(opts.days)) ? Math.max(1, Math.floor(opts.days)) : 30;
   const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 
-  // Build base query: archived alerts for this user within timeframe
-  const q = { userId, $or: [ { firedAt: { $exists: true } }, { deletedAt: { $exists: true } } ] };
-  q.$and = [{ createdAt: { $gte: since } }];
+  // we will match any archive document that has firedAt OR deletedAt OR archivedAt within the period
+  const q = {
+    userId,
+    $or: [
+      { firedAt: { $exists: true, $gte: since } },
+      { deletedAt: { $exists: true, $gte: since } },
+      { archivedAt: { $exists: true, $gte: since } }
+    ]
+  };
 
   if (opts && opts.symbol) {
     const sym = String(opts.symbol).toUpperCase();
-    // match either exact stored symbol or with -USDT suffix
-    q.$and.push({ $or: [{ symbol: sym }, { symbol: `${sym}-USDT` }] });
+    q.$and = [{ $or: [{ symbol: sym }, { symbol: `${sym}-USDT` }] }];
   }
 
   let docs = [];
   try {
-    docs = await alertsArchiveCollection.find(q, { sort: { firedAt: -1, deletedAt: -1, createdAt: -1 } }).toArray();
+    docs = await alertsArchiveCollection.find(q, { sort: { firedAt: -1, deletedAt: -1, archivedAt: -1, createdAt: -1 } }).toArray();
   } catch (e) {
     console.warn('renderOldAlertsList: archive query failed', e?.message || e);
     docs = [];
   }
 
   if (!docs || !docs.length) {
-    // more specific message when a symbol search yielded no results
     let text;
     if (opts && opts.symbol) {
       text = `Нет старых алертов с тикером *${String(opts.symbol).toUpperCase()}* за выбранный период.`;
@@ -221,11 +224,11 @@ export async function renderOldAlertsList(userId, opts = { days: 30, symbol: nul
 
   const entries = docs.map((d, idx) => {
     const status = d.firedAt ? '✅ Сработал' : (d.deletedAt ? '🗑️ Удалён' : 'ℹ️ Статус');
-    const when = d.firedAt ? d.firedAt : (d.deletedAt ? d.deletedAt : d.createdAt);
+    const when = d.firedAt || d.deletedAt || d.archivedAt || d.createdAt;
     const priceStr = fmtNum(d.price);
     const symbol = d.symbol;
     const byType = d.type === 'sl' ? '🛑 SL' : '🔔 Алерт';
-    const reason = d.deleteReason ? `\nПричина удаления: ${d.deleteReason}` : '';
+    const reason = d.deleteReason ? `\nПричина удаления: ${d.deleteReason}` : (d.archivedReason ? `\nПричина архива: ${d.archivedReason}` : '');
     const firedInfo = d.firedPrice ? `\nЦена при срабатывании: *${fmtNum(d.firedPrice)}*` : '';
     const txt = `*${idx+1}. ${symbol}* — ${byType}\nУсловие: ${d.condition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${priceStr}*\nСтатус: ${status}\nВремя: ${new Date(when).toLocaleString() || ''}${firedInfo}${reason}\n\n`;
     return { text: txt, id: d._id?.toString?.() || `arch_${idx}` };
@@ -288,13 +291,13 @@ export function startAlertsChecker(bot) {
           const text = `${isSL ? '🛑 *Сработал стоп-лосс!*' : '🔔 *Сработал алерт!*'}\nМонета: *${a.symbol}*\nЦена сейчас: *${fmtNum(cur)}*\nУсловие: ${a.condition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${fmtNum(a.price)}*`;
           try {
             await bot.telegram.sendMessage(a.userId, text, { parse_mode: 'Markdown' });
-            // move to archive
+            // archive triggered alert and remove from active collection
             try {
               await alertsArchiveCollection.insertOne({
                 ...a,
                 firedAt: new Date(),
                 firedPrice: cur,
-                archivedReason: 'fired',
+                archivedReason: 'triggered',
                 archivedAt: new Date()
               });
             } catch (e) { console.warn('archive insert failed after send', e?.message || e); }
