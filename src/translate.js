@@ -1,6 +1,5 @@
 import { httpGetWithRetry, httpClient } from './httpClient.js';
 const LIBRE_ENDPOINTS = ['https://libretranslate.de/translate', 'https://libretranslate.com/translate'];
-
 async function translateViaGoogle(text, target) {
   if (!text) return null;
   try {
@@ -10,7 +9,7 @@ async function translateViaGoogle(text, target) {
     const data = res?.data;
     if (Array.isArray(data) && Array.isArray(data[0])) {
       const out = data[0].map(seg => (Array.isArray(seg) ? seg[0] : '')).join('');
-      if (out && out.trim() && !isProbablyHtml(out)) return out.trim();
+      if (out && out.trim()) return out.trim();
     }
   } catch (e) {}
   return null;
@@ -24,8 +23,10 @@ async function translateViaLibre(text, target) {
       const d = resp?.data;
       const cand = d?.translatedText || d?.result || d?.translated_text || (typeof d === 'string' ? d : null);
       if (cand && String(cand).trim()) {
-        const cleaned = stripHtml(String(cand).trim());
-        if (cleaned && !isProbablyHtml(cleaned)) return cleaned;
+        const s = String(cand).trim();
+        // reject likely HTML pages returned by endpoints
+        if (/<\s*html|<!doctype|<meta|<title/i.test(s)) continue;
+        return s;
       }
     } catch (e) {}
   }
@@ -41,7 +42,6 @@ function normalizePunctuation(s) {
   if (!s) return s;
   let out = s.replace(/\r\n|\r/g, '\n');
   out = out.replace(/\s+([,.:;!?])/g, '$1');
-  out = out.replace(/([,.:;!?])([^\s\n])/g, '$1 $2');
   out = out.replace(/\s{2,}/g, ' ');
   out = out.replace(/[ \t]+\n/g, '\n');
   out = out.replace(/«\s+/g, '«').replace(/\s+»/g, '»');
@@ -97,19 +97,6 @@ function scoreCandidate(candidate, targetLang, original) {
   score += Math.min(10, punctuationCount);
   return score;
 }
-function isProbablyHtml(s) {
-  if (!s || typeof s !== 'string') return false;
-  const low = s.slice(0, 200).toLowerCase();
-  if (low.includes('<!doctype') || low.includes('<html') || low.includes('<head') || low.includes('<body')) return true;
-  // if contains many tags
-  const tags = (s.match(/<[^>]+>/g) || []).length;
-  if (tags >= 3) return true;
-  return false;
-}
-function stripHtml(s) {
-  if (!s) return s;
-  return s.replace(/<[^>]*>/g, ' ').replace(/\s{2,}/g, ' ').trim();
-}
 export async function translateOrNull(text, targetLang) {
   if (!text) return null;
   if (!targetLang) return null;
@@ -129,13 +116,13 @@ export async function translateOrNull(text, targetLang) {
       const en = await translateViaGoogle(text, 'en').catch(()=>null);
       if (en) {
         const back = await translateViaGoogle(en, t).catch(()=>null);
-        if (back && !isProbablyHtml(back)) candidates.push({ src: 'back_google', text: back, score: scoreCandidate(back, t, text) });
+        if (back) candidates.push({ src: 'back_google', text: back, score: scoreCandidate(back, t, text) });
         const backL = await translateViaLibre(en, t).catch(()=>null);
-        if (backL && !isProbablyHtml(backL)) candidates.push({ src: 'back_libre', text: backL, score: scoreCandidate(backL, t, text) });
+        if (backL) candidates.push({ src: 'back_libre', text: backL, score: scoreCandidate(backL, t, text) });
       }
     } catch (e) {}
   }
-  candidates = candidates.filter(c => c && c.text && !isProbablyHtml(c.text)).sort((a,b) => b.score - a.score);
+  candidates = candidates.filter(c => c && c.text).sort((a,b) => b.score - a.score);
   let best = candidates.length ? candidates[0].text : null;
   if (best) {
     const after = postEditByLang(best, t);

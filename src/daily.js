@@ -1,10 +1,8 @@
-// src/daily.js
 import { httpGetWithRetry, httpClient } from './httpClient.js';
 import { dailyCache } from './cache.js';
 import { dailyMotivationCollection, dailyQuoteRetryCollection, pendingDailySendsCollection } from './db.js';
 import { RETRY_INTERVAL_MS, QUOTE_CAPTION_MAX, MESSAGE_TEXT_MAX, KYIV_TZ } from './constants.js';
 import { translateOrNull } from './translate.js';
-import { safeSendTelegram } from './utils.js';
 
 const QUOTABLE_RANDOM = 'https://api.quotable.io/random';
 const ZEN_QUOTES = 'https://zenquotes.io/api/today';
@@ -31,11 +29,22 @@ async function tryGetArrayBuffer(url, opts = {}) {
   return null;
 }
 
+function isLikelyHTML(s) {
+  if (!s || typeof s !== 'string') return false;
+  const snippet = s.slice(0, 500).toLowerCase();
+  if (/<\s*html|<!doctype|<meta|<title|<script|<\/html>/.test(snippet)) return true;
+  // too many angle brackets
+  const lt = (s.match(/</g) || []).length;
+  const gt = (s.match(/>/g) || []).length;
+  if (lt > 4 && gt > 4) return true;
+  return false;
+}
+
 export async function fetchQuoteQuotable() {
   try {
     const res = await httpGetWithRetry(QUOTABLE_RANDOM, 1);
     const d = res?.data;
-    if (d?.content) return { text: d.content, author: d.author || '', source: 'quotable' };
+    if (d?.content && !isLikelyHTML(d.content)) return { text: d.content, author: d.author || '', source: 'quotable' };
   } catch (e) { console.warn('fetchQuoteQuotable failed', e?.message || e); }
   return null;
 }
@@ -44,7 +53,7 @@ export async function fetchQuoteZen() {
   try {
     const res = await httpGetWithRetry(ZEN_QUOTES, 1);
     const d = res?.data;
-    if (Array.isArray(d) && d[0] && d[0].q) return { text: d[0].q, author: d[0].a || '', source: 'zen' };
+    if (Array.isArray(d) && d[0] && d[0].q && !isLikelyHTML(d[0].q)) return { text: d[0].q, author: d[0].a || '', source: 'zen' };
   } catch (e) { console.warn('fetchQuoteZen failed', e?.message || e); }
   return null;
 }
@@ -55,8 +64,8 @@ export async function fetchQuoteTypefit() {
     const arr = res?.data;
     if (Array.isArray(arr) && arr.length) {
       const cand = arr[Math.floor(Math.random() * arr.length)];
-      if (cand && (cand.text || cand.quote || cand.content)) {
-        const text = cand.text || cand.quote || cand.content;
+      const text = cand?.text || cand?.quote || cand?.content;
+      if (text && !isLikelyHTML(text)) {
         return { text: text, author: cand.author || '', source: 'typefit' };
       }
     }
@@ -71,7 +80,7 @@ export async function fetchQuoteForismatic() {
     if (!d) return null;
     const text = d.quoteText || d.quote || '';
     const author = d.quoteAuthor || d.author || '';
-    if (text && String(text).trim()) return { text: String(text).trim(), author: String(author || '').trim(), source: 'forismatic' };
+    if (text && String(text).trim() && !isLikelyHTML(text)) return { text: String(text).trim(), author: String(author || '').trim(), source: 'forismatic' };
   } catch (e) { console.warn('fetchQuoteForismatic failed', e?.message || e); }
   return null;
 }
@@ -232,13 +241,18 @@ export async function sendDailyToUser(bot, userId, dateStr, opts = { disableNoti
     let quoteText = null;
     const original = doc?.quote?.original || (doc?.quote?.translations && doc.quote.translations.en) || null;
 
+    // If stored quote looks like HTML, ignore it and try to fetch a new one
+    if (original && isLikelyHTML(original)) {
+      doc.quote = null;
+    }
+
     if (doc?.quote) {
       if (doc.quote.translations && doc.quote.translations[lang]) {
-        quoteText = doc.quote.translations[lang];
+        if (!isLikelyHTML(doc.quote.translations[lang])) quoteText = doc.quote.translations[lang];
       } else if (original) {
         try {
           const tr = await translateOrNull(original, lang).catch(()=>null);
-          if (tr) {
+          if (tr && !isLikelyHTML(tr)) {
             quoteText = tr;
             try {
               const upd = { ['quote.translations.'+lang]: tr };
@@ -252,10 +266,10 @@ export async function sendDailyToUser(bot, userId, dateStr, opts = { disableNoti
 
     if (!quoteText) {
       const orig = doc?.quote?.original;
-      if (orig) {
+      if (orig && !isLikelyHTML(orig)) {
         try {
           const tr = await translateOrNull(orig, 'ru').catch(()=>null);
-          if (tr) {
+          if (tr && !isLikelyHTML(tr)) {
             quoteText = tr;
             try {
               await dailyMotivationCollection.updateOne({ date: dateStr }, { $set: { 'quote.translations.ru': tr } }, { upsert: false });
@@ -268,7 +282,7 @@ export async function sendDailyToUser(bot, userId, dateStr, opts = { disableNoti
       if (!quoteText) {
         try {
           const foris = await fetchQuoteForismatic().catch(()=>null);
-          if (foris && foris.text) {
+          if (foris && foris.text && !isLikelyHTML(foris.text)) {
             const originalRu = String(foris.text);
             quoteText = originalRu;
             try {
@@ -294,7 +308,7 @@ export async function sendDailyToUser(bot, userId, dateStr, opts = { disableNoti
     if (!quoteText) {
       try {
         const q = await fetchQuoteFromAny().catch(()=>null);
-        if (q && q.text) {
+        if (q && q.text && !isLikelyHTML(q.text)) {
           const originalTxt = String(q.text);
           let enT = originalTxt;
           try { enT = await translateOrNull(originalTxt, 'en').catch(()=>originalTxt); } catch {}
@@ -339,13 +353,9 @@ export async function sendDailyToUser(bot, userId, dateStr, opts = { disableNoti
     if (!quoteText) {
       const fallback = String(await import('./utils.js').then(m=>m.buildWish())).slice(0, QUOTE_CAPTION_MAX);
       if (buf) {
-        try {
-          await safeSendTelegram(bot, 'sendPhoto', [userId, { source: buf }, { caption: fallback, disable_notification: !!opts.disableNotification }]);
-        } catch (e) { console.warn('sendDailyToUser sendPhoto failed fallback', e); await recordSendStatus(false, false); return false; }
+        try { await bot.telegram.sendPhoto(userId, { source: buf }, { caption: fallback, disable_notification: !!opts.disableNotification }); } catch (e) { console.warn('sendDailyToUser sendPhoto failed fallback', e); await recordSendStatus(false, false); return false; }
       } else {
-        try {
-          await safeSendTelegram(bot, 'sendMessage', [userId, fallback, { disable_notification: !!opts.disableNotification }]);
-        } catch (e) { console.warn('sendDailyToUser sendMessage failed fallback', e); await recordSendStatus(false, false); return false; }
+        try { await bot.telegram.sendMessage(userId, fallback, { disable_notification: !!opts.disableNotification }); } catch (e) { console.warn('sendDailyToUser sendMessage failed fallback', e); await recordSendStatus(false, false); return false; }
       }
       await recordSendStatus(true, false);
       return true;
@@ -353,21 +363,15 @@ export async function sendDailyToUser(bot, userId, dateStr, opts = { disableNoti
 
     const caption = String(quoteText).slice(0, QUOTE_CAPTION_MAX);
     if (buf) {
-      try {
-        await safeSendTelegram(bot, 'sendPhoto', [userId, { source: buf }, { caption, disable_notification: !!opts.disableNotification }]);
-      } catch (e) { console.warn('sendDailyToUser sendPhoto failed', e); await recordSendStatus(false, !!quoteText); return false; }
+      try { await bot.telegram.sendPhoto(userId, { source: buf }, { caption, disable_notification: !!opts.disableNotification }); } catch (e) { console.warn('sendDailyToUser sendPhoto failed', e); await recordSendStatus(false, !!quoteText); return false; }
     } else {
-      try {
-        await safeSendTelegram(bot, 'sendMessage', [userId, caption, { disable_notification: !!opts.disableNotification }]);
-      } catch (e) { console.warn('sendDailyToUser sendMessage failed', e); await recordSendStatus(false, !!quoteText); return false; }
+      try { await bot.telegram.sendMessage(userId, caption, { disable_notification: !!opts.disableNotification }); } catch (e) { console.warn('sendDailyToUser sendMessage failed', e); await recordSendStatus(false, !!quoteText); return false; }
     }
 
     if (doc?.quote?.author) {
       try {
         if (!caption.includes(doc.quote.author)) {
-          try {
-            await safeSendTelegram(bot, 'sendMessage', [userId, `— ${doc.quote.author}`.slice(0, MESSAGE_TEXT_MAX), { disable_notification: !!opts.disableNotification }]);
-          } catch (e) { /* ignore */ }
+          await bot.telegram.sendMessage(userId, `— ${doc.quote.author}`.slice(0, MESSAGE_TEXT_MAX), { disable_notification: !!opts.disableNotification });
         }
       } catch (e) { /* ignore */ }
     }
@@ -399,7 +403,7 @@ export async function processDailyQuoteRetry(bot) {
     const attempts = (doc.attempts || 0) + 1;
 
     const q = await fetchQuoteFromAny(2).catch(()=>null);
-    if (q && q.text) {
+    if (q && q.text && !isLikelyHTML(q.text)) {
       let translations = { en: q.text, ru: null, uk: null };
       try { const enT = await translateOrNull(q.text, 'en').catch(()=>q.text); translations.en = enT || q.text; } catch {}
       try { const ruT = await translateOrNull(q.text, 'ru').catch(()=>translations.en); translations.ru = ruT || translations.en || q.text; } catch {}
@@ -425,13 +429,9 @@ export async function processDailyQuoteRetry(bot) {
           let final = stored.quote.translations && stored.quote.translations[lang] ? stored.quote.translations[lang] : stored.quote.original;
           if (!final) final = stored.quote.original || '';
           const out = stored.quote.author ? `${final}\n— ${stored.quote.author}` : final;
-          try {
-            await safeSendTelegram(bot, 'sendMessage', [uid, String(out).slice(0, MESSAGE_TEXT_MAX)]);
-            await pendingDailySendsCollection.updateOne({ _id: p._id }, { $set: { quoteSent: true } });
-          } catch (e) {
-            console.warn('processDailyQuoteRetry: failed to send', e);
-          }
-        } catch (e) { console.warn('processDailyQuoteRetry: failed to process pending send', e); }
+          await bot.telegram.sendMessage(uid, String(out).slice(0, MESSAGE_TEXT_MAX));
+          await pendingDailySendsCollection.updateOne({ _id: p._id }, { $set: { quoteSent: true } });
+        } catch (e) { console.warn('processDailyQuoteRetry: failed to send', e); }
       }
 
       return;
@@ -464,11 +464,9 @@ export async function watchForNewQuotes(bot) {
         let final = doc.quote.translations && doc.quote.translations[lang] ? doc.quote.translations[lang] : doc.quote.original;
         if (!final) final = doc.quote.original || '';
         const out = doc.quote.author ? `${final}\n— ${doc.quote.author}` : final;
-        try {
-          await safeSendTelegram(bot, 'sendMessage', [uid, String(out).slice(0, MESSAGE_TEXT_MAX)]);
-          await pendingDailySendsCollection.updateOne({ _id: p._id }, { $set: { quoteSent: true } });
-        } catch (e) { console.warn('watchForNewQuotes: failed to send', e); }
-      } catch (e) { console.warn('watchForNewQuotes: failed to process pending', e); }
+        await bot.telegram.sendMessage(uid, String(out).slice(0, MESSAGE_TEXT_MAX));
+        await pendingDailySendsCollection.updateOne({ _id: p._id }, { $set: { quoteSent: true } });
+      } catch (e) { console.warn('watchForNewQuotes: failed to send', e); }
     }
   } catch (e) { console.warn('watchForNewQuotes error', e); }
 }

@@ -14,7 +14,8 @@ import {
   invalidateUserAlertsCache,
   statsCache,
   getUserAlertLimit,
-  setUserAlertLimit
+  setUserAlertLimit,
+  resolveUserLang
 } from './cache.js';
 import { fmtNum } from './utils.js';
 import { sendDailyToUser, processDailyQuoteRetry, watchForNewQuotes, fetchAndStoreDailyMotivation } from './daily.js';
@@ -46,118 +47,116 @@ bot.use(async (ctx, next) => {
   return next();
 });
 
-function getMainMenu(userId) {
-  const keyboard = [
-    [{ text: '➕ Создать алерт' }, { text: '📋 Мои алерты' }],
-    [{ text: '⚙️ Настройки' }],
-    [{ text: '📜 Старые алерты' }, { text: '🔎 Поиск старых алертов' }]
-  ];
+function getMainMenuSync(userId, lang = 'ru') {
+  const isEn = String(lang).split('-')[0] === 'en';
+  const create = isEn ? '➕ Create alert' : '➕ Создать алерт';
+  const my = isEn ? '📋 My alerts' : '📋 Мои алерты';
+  const settings = isEn ? '⚙️ Settings' : '⚙️ Настройки';
+  const old = isEn ? '📜 Old alerts' : '📜 Старые алерты';
+  const search = isEn ? '🔎 Search old alerts' : '🔎 Поиск старых алертов';
+  const motivate = isEn ? '🌅 Send motivation' : '🌅 Прислать мотивацию';
+  const stats = isEn ? '👥 Active users' : '👥 Количество активных пользователей';
+  const kb = [[{ text: create }, { text: my }], [{ text: settings }], [{ text: old }, { text: search }]];
   if (CREATOR_ID && String(userId) === String(CREATOR_ID)) {
-    keyboard.push([{ text: '🌅 Прислать мотивацию' }]);
-    keyboard.push([{ text: '👥 Количество активных пользователей' }]);
+    kb.push([{ text: motivate }], [{ text: stats }]);
   }
-  return { reply_markup: { keyboard, resize_keyboard: true } };
+  return { reply_markup: { keyboard: kb, resize_keyboard: true } };
 }
 
-bot.start(ctx => { ctx.session = {}; ctx.reply('Привет! Я бот-алерт для крипты.', getMainMenu(ctx.from?.id)); });
+async function buildSettingsInlineForUser(userId) {
+  const order = await getUserAlertsOrder(userId).catch(()=> 'new_bottom');
+  const lang = await resolveUserLang(userId).catch(()=> 'ru');
+  const isTop = order === 'new_top';
+  const isEn = String(lang).split('-')[0] === 'en';
+  const orderLeft = isTop ? (isEn ? '✅ New on top' : '✅ Новые сверху') : (isEn ? 'New on top' : 'Новые сверху');
+  const orderRight = !isTop ? (isEn ? '✅ New on bottom' : '✅ Новые снизу') : (isEn ? 'New on bottom' : 'Новые снизу');
+  const langEn = (isEn ? '✅ English' : 'English');
+  const langRu = (!isEn ? '✅ Русский' : 'Русский');
+  return {
+    inline_keyboard: [
+      [
+        { text: orderLeft, callback_data: 'set_order_new_top' },
+        { text: orderRight, callback_data: 'set_order_new_bottom' }
+      ],
+      [
+        { text: langEn, callback_data: 'set_lang_en' },
+        { text: langRu, callback_data: 'set_lang_ru' }
+      ],
+      [{ text: isEn ? '↩️ Back' : '↩️ Назад', callback_data: 'back_to_main' }]
+    ]
+  };
+}
 
-bot.hears('⚙️ Настройки', async (ctx) => {
-  try {
-    const uid = ctx.from.id;
-    const order = await getUserAlertsOrder(uid).catch(()=> 'new_bottom');
-    const isTop = order === 'new_top';
-    const inline = {
-      inline_keyboard: [
-        [
-          { text: isTop ? '✅ Новые сверху' : 'Новые сверху', callback_data: 'set_order_new_top' },
-          { text: !isTop ? '✅ Новые снизу' : 'Новые снизу', callback_data: 'set_order_new_bottom' }
-        ],
-        [{ text: '↩️ Назад', callback_data: 'back_to_main' }]
-      ]
-    };
-    await ctx.reply('Настройки отображения алертов:', { reply_markup: inline });
-  } catch (e) {
-    console.error(e);
-    try { await ctx.reply('Ошибка при открытии настроек'); } catch {}
-  }
+bot.start(async (ctx) => {
+  ctx.session = {};
+  const lang = await resolveUserLang(ctx.from?.id, null, ctx.from?.language_code);
+  const isEn = String(lang).split('-')[0] === 'en';
+  const greet = isEn ? 'Hello! I am a crypto alert bot.' : 'Привет! Я бот-алерт для крипты.';
+  await ctx.reply(`${greet}\n${isEn ? '(Language: English)' : '(Язык: Русский)'}`, getMainMenuSync(ctx.from.id, lang));
 });
 
-bot.hears('Новые сверху', async (ctx) => {
-  try {
-    await setUserAlertsOrder(ctx.from.id, 'new_top');
-    await ctx.reply('Порядок установлен: новые сверху', getMainMenu(ctx.from.id));
-  } catch (e) {
-    console.error(e);
-    try { await ctx.reply('Ошибка при установке порядка'); } catch {}
-  }
-});
-
-bot.hears('Новые снизу (по умолчанию)', async (ctx) => {
-  try {
-    await setUserAlertsOrder(ctx.from.id, 'new_bottom');
-    await ctx.reply('Порядок установлен: новые снизу', getMainMenu(ctx.from.id));
-  } catch (e) {
-    console.error(e);
-    try { await ctx.reply('Ошибка при установке порядка'); } catch {}
-  }
-});
+bot.hears('⚙️ Настройки', async (ctx) => { const inline = await buildSettingsInlineForUser(ctx.from.id); await ctx.reply('Настройки отображения алертов:', { reply_markup: inline }); });
+bot.hears('⚙️ Settings', async (ctx) => { const inline = await buildSettingsInlineForUser(ctx.from.id); await ctx.reply('Display settings:', { reply_markup: inline }); });
 
 bot.hears('➕ Создать алерт', async (ctx) => {
-  // Сразу проверяем лимит перед началом процесса создания алерта
   try {
-    const { alertsCollection } = await import('./db.js');
-    const limit = await getUserAlertLimit(ctx.from.id).catch(()=>10);
-    let currentCount = 0;
-    try {
-      currentCount = await alertsCollection.countDocuments({ userId: ctx.from.id });
-    } catch (e) {
-      console.warn('countDocuments failed during create-start check', e?.message || e);
-      const recent = await getUserAlertsCached(ctx.from.id).catch(()=>[]);
-      currentCount = (recent?.length || 0);
-    }
-    if (currentCount >= limit) {
-      await ctx.reply(`У тебя уже ${currentCount} алертов — достигнут лимит ${limit}. Если нужно увеличить лимит, напиши мне: @pirial_gena`, getMainMenu(ctx.from.id));
-      return;
-    }
+    ctx.session = { step: 'symbol' };
+    refreshAllTickers().catch(()=>{});
+    const recent = await getUserRecentSymbols(ctx.from.id);
+    const suggest = [...new Set([...recent, ...['BTC','ETH','SOL','BNB','XRP','DOGE']])].slice(0,6).map(s=>({ text: s }));
+    const kb = suggest.length ? [suggest, [{ text: '↩️ Отмена' }, { text: '↩️ Cancel' }]] : [[{ text: '↩️ Отмена' }, { text: '↩️ Cancel' }]];
+    ctx.reply('Введи символ (например BTC) или нажми кнопку:', { reply_markup: { keyboard: kb, resize_keyboard: true } });
   } catch (e) {
-    console.warn('pre-create limit check failed, allowing create flow', e?.message || e);
-    // если проверка упала — не мешаем пользователю, продолжаем
+    ctx.session = {};
+    await ctx.reply('Ошибка при запуске создания алерта');
   }
-
-  ctx.session = { step: 'symbol' };
-  refreshAllTickers().catch(()=>{});
-  const recent = await getUserRecentSymbols(ctx.from.id);
-  const suggest = [...new Set([...recent, ...['BTC','ETH','SOL','BNB','XRP','DOGE']])].slice(0,6).map(s=>({ text: s }));
-  const kb = suggest.length ? [suggest, [{ text: '↩️ Отмена' }]] : [[{ text: '↩️ Отмена' }]];
-  ctx.reply('Введи символ (например BTC) или нажми кнопку:', { reply_markup: { keyboard: kb, resize_keyboard: true } });
 });
+bot.hears('➕ Create alert', async (ctx) => { ctx.session = { step: 'symbol' }; await ctx.reply('Enter symbol (e.g. BTC) or press a button:'); });
 
-bot.hears('↩️ Отмена', ctx => { ctx.session = {}; ctx.reply('Отмена ✅', getMainMenu(ctx.from.id)); });
+bot.hears('↩️ Отмена', async (ctx) => { ctx.session = {}; const lang = await resolveUserLang(ctx.from.id); await ctx.reply('Отмена ✅', getMainMenuSync(ctx.from.id, lang)); });
+bot.hears('↩️ Cancel', async (ctx) => { ctx.session = {}; const lang = await resolveUserLang(ctx.from.id); await ctx.reply('Cancelled ✅', getMainMenuSync(ctx.from.id, lang)); });
 
 bot.hears('📋 Мои алерты', async (ctx) => {
   try {
     try { await bot.telegram.sendChatAction(ctx.chat.id, 'typing'); } catch (_){ }
-  } catch (e) { console.error(e); }
-  try {
-    const { pages } = await renderAlertsList(ctx.from.id, { fast: false });
+    const lang = await resolveUserLang(ctx.from.id);
+    const { pages } = await renderAlertsList(ctx.from.id, { fast: false, lang });
     const first = pages[0];
     await ctx.reply(first.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: first.buttons } });
   } catch (e) {
-    console.error(e);
-    ctx.reply('Ошибка при получении алертов.');
+    await ctx.reply('Ошибка при получении алертов.');
+  }
+});
+bot.hears('📋 My alerts', async (ctx) => {
+  try {
+    const lang = await resolveUserLang(ctx.from.id);
+    const { pages } = await renderAlertsList(ctx.from.id, { fast: false, lang });
+    const first = pages[0];
+    await ctx.reply(first.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: first.buttons } });
+  } catch (e) {
+    await ctx.reply('Error fetching alerts.');
   }
 });
 
 bot.hears('📜 Старые алерты', async (ctx) => {
-  // Start flow to select days; we'll hide keyboard after a selection (handled in text handler)
   ctx.session = { step: 'old_alerts_select_days' };
-  const kb = [[{ text: '7 дней' }, { text: '30 дней' }, { text: '90 дней' }], [{ text: '↩️ Отмена' }]];
+  const lang = await resolveUserLang(ctx.from.id);
+  const kb = [[{ text: lang && String(lang).split('-')[0] === 'en' ? '7 days' : '7 дней' }, { text: lang && String(lang).split('-')[0] === 'en' ? '30 days' : '30 дней' }, { text: lang && String(lang).split('-')[0] === 'en' ? '90 days' : '90 дней' }], [{ text: '↩️ Отмена' }, { text: '↩️ Cancel' }]];
   await ctx.reply('Выбери период для просмотра старых алертов:', { reply_markup: { keyboard: kb, resize_keyboard: true } });
+});
+bot.hears('📜 Old alerts', async (ctx) => {
+  ctx.session = { step: 'old_alerts_select_days' };
+  const kb = [[{ text: '7 days' }, { text: '30 days' }, { text: '90 days' }], [{ text: '↩️ Cancel' }]];
+  await ctx.reply('Choose a period to view old alerts:', { reply_markup: { keyboard: kb, resize_keyboard: true } });
 });
 
 bot.hears('🔎 Поиск старых алертов', async (ctx) => {
   ctx.session = { step: 'old_alerts_search' };
-  await ctx.reply('Введи запрос в формате: SYMBOL [DAYS]\nПримеры: "BTC", "BTC 30". По умолчанию DAYS=30.', { reply_markup: { keyboard: [[{ text: '↩️ Отмена' }]], resize_keyboard: true } });
+  await ctx.reply('Введи запрос в формате: SYMBOL [DAYS]\nПримеры: "BTC", "BTC 30". По умолчанию DAYS=30.', { reply_markup: { keyboard: [[{ text: '↩️ Отмена' }, { text: '↩️ Cancel' }]], resize_keyboard: true } });
+});
+bot.hears('🔎 Search old alerts', async (ctx) => {
+  ctx.session = { step: 'old_alerts_search' };
+  await ctx.reply('Enter query in format: SYMBOL [DAYS]\nExamples: "BTC", "BTC 30". Default DAYS=30.', { reply_markup: { keyboard: [[{ text: '↩️ Cancel' }]], resize_keyboard: true } });
 });
 
 bot.hears('🌅 Прислать мотивацию', async (ctx) => {
@@ -173,65 +172,65 @@ bot.hears('🌅 Прислать мотивацию', async (ctx) => {
       await pendingDailySendsCollection.updateOne({ userId: ctx.from.id, date: dateStr }, { $set: { sent: false, createdAt: new Date(), permanentFail: true } }, { upsert: true });
     }
   } catch (e) {
-    console.error(e);
-    try { await ctx.reply('Ошибка при отправке мотивации'); } catch {}
+    await ctx.reply('Ошибка при отправке мотивации');
   }
 });
+bot.hears('🌅 Send motivation', async (ctx) => { await ctx.reply('Not implemented in test flow.'); });
 
-bot.hears('👥 Количество активных пользователей', async (ctx) => {
+async function handleActiveUsers(ctx) {
   try {
     if (!CREATOR_ID || String(ctx.from.id) !== String(CREATOR_ID)) { return ctx.reply('У вас нет доступа к этой команде.'); }
-
     const now = Date.now();
     if (statsCache.count !== null && (now - statsCache.time) < CACHE_TTL) { return ctx.reply(`👥 Активных пользователей за последние ${INACTIVE_DAYS} дней: ${statsCache.count}`); }
-
     const cutoff = new Date(Date.now() - INACTIVE_DAYS * DAY_MS);
     let activeCount;
     try {
-      // exclude users that we flagged as botBlocked
       activeCount = await countDocumentsWithTimeout('users', { lastActive: { $gte: cutoff }, $or: [{ botBlocked: { $exists: false } }, { botBlocked: false }] }, 7000);
     }
     catch (err) {
-      console.error('Ошибка/таймаут при подсчёте активных пользователей:', err);
       return ctx.reply('Ошибка получения статистики (таймаут или проблема с БД). Попробуйте позже.');
     }
-
     statsCache.count = activeCount;
     statsCache.time = now;
     await ctx.reply(`👥 Активных пользователей за последние ${INACTIVE_DAYS} дней: ${activeCount}`);
-  } catch (e) { console.error('stats handler error', e); try { await ctx.reply('Ошибка получения статистики.'); } catch {} }
-});
+  } catch (e) {
+    await ctx.reply('Ошибка получения статистики.');
+  }
+}
+
+bot.hears('👥 Количество активных пользователей', async (ctx) => { await handleActiveUsers(ctx); });
+bot.hears('👥 Active users', async (ctx) => { await handleActiveUsers(ctx); });
 
 bot.on('callback_query', async (ctx) => {
   try {
     const data = ctx.callbackQuery?.data;
     if (!data) return ctx.answerCbQuery();
 
+    const lang = await resolveUserLang(ctx.from.id);
+
     const mPage = data.match(/^alerts_page_(\d+)_view$/);
     if (mPage) {
       const pageIdx = parseInt(mPage[1], 10);
-      const { pages } = await renderAlertsList(ctx.from.id, { fast: true });
+      const { pages } = await renderAlertsList(ctx.from.id, { fast: true, lang });
       const page = pages[Math.max(0, Math.min(pageIdx, pages.length - 1))] || pages[0];
       try {
         await ctx.editMessageText(page.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: page.buttons } });
-      } catch (e) {
-        try { await ctx.reply(page.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: page.buttons } }); } catch (e2) { console.error('alerts_page edit/reply failed', e2); }
-      }
+      } catch (e) { try { await ctx.reply(page.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: page.buttons } }); } catch {} }
       await ctx.answerCbQuery();
       return;
     }
 
-    const mShow = data.match(/^show_delete_menu_(all|\d+)$/);
+    const mShow = data.match(/^show_delete_menu_(all|\\d+)$/);
     if (mShow) {
       const token = mShow[1];
-      const { pages } = await renderAlertsList(ctx.from.id, { fast: true });
+      const { pages } = await renderAlertsList(ctx.from.id, { fast: true, lang });
       const totalPages = pages.length;
       let sourcePage = null;
       if (token !== 'all') sourcePage = Math.max(0, Math.min(parseInt(token, 10), totalPages - 1));
-      const inline = await buildDeleteInlineForUser(ctx.from.id, { fast: true, sourcePage, totalPages: (sourcePage === null ? null : totalPages) });
+      const inline = await buildDeleteInlineForUser(ctx.from.id, { fast: true, sourcePage, totalPages: (sourcePage === null ? null : totalPages), lang });
       try { await ctx.editMessageReplyMarkup({ inline_keyboard: inline }); }
       catch (err) {
-        try { const originalText = ctx.update.callback_query.message?.text || 'Твои алерты'; await ctx.reply(originalText, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: inline } }); } catch (e) { console.error('show_delete_menu reply failed', e); }
+        try { const originalText = ctx.update.callback_query.message?.text || 'Your alerts'; await ctx.reply(originalText, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: inline } }); } catch {}
       }
       await ctx.answerCbQuery();
       return;
@@ -240,10 +239,10 @@ bot.on('callback_query', async (ctx) => {
     const mBack = data.match(/^back_to_alerts(?:_p(\d+))?$/);
     if (mBack) {
       const p = mBack[1] ? parseInt(mBack[1], 10) : 0;
-      const { pages } = await renderAlertsList(ctx.from.id, { fast: true });
+      const { pages } = await renderAlertsList(ctx.from.id, { fast: true, lang });
       const page = pages[Math.max(0, Math.min(p, pages.length - 1))] || pages[0];
       try { await ctx.editMessageText(page.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: page.buttons } }); }
-      catch (e) { try { await ctx.reply(page.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: page.buttons } }); } catch (e2) { console.error('back_to_alerts failed', e2); } }
+      catch (e) { try { await ctx.reply(page.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: page.buttons } }); } catch {} }
       await ctx.answerCbQuery();
       return;
     }
@@ -252,38 +251,20 @@ bot.on('callback_query', async (ctx) => {
     if (mSet) {
       const order = mSet[1];
       await setUserAlertsOrder(ctx.from.id, order).catch(()=>{});
-      const orderNow = await getUserAlertsOrder(ctx.from.id).catch(()=> 'new_bottom');
-      const isTop = orderNow === 'new_top';
-      const inline = {
-        inline_keyboard: [
-          [
-            { text: isTop ? '✅ Новые сверху' : 'Новые сверху', callback_data: 'set_order_new_top' },
-            { text: !isTop ? '✅ Новые снизу' : 'Новые снизу', callback_data: 'set_order_new_bottom' }
-          ],
-          [{ text: '↩️ Назад', callback_data: 'back_to_main' }]
-        ]
-      };
+      const inline = await buildSettingsInlineForUser(ctx.from.id);
       try {
         await ctx.editMessageReplyMarkup(inline);
-      } catch (e) {
-        try { await ctx.reply('Порядок установлен', { reply_markup: inline }); } catch (e2) { console.error('set_order fallback failed', e2); }
-      }
+      } catch (e) { try { await ctx.reply('Порядок установлен', { reply_markup: inline }); } catch {} }
       await ctx.answerCbQuery('Порядок установлен');
       return;
     }
 
-    if (data === 'back_to_main') {
-      try { await ctx.reply('Возврат в меню', getMainMenu(ctx.from.id)); } catch (e) { console.error('back_to_main failed', e); }
-      await ctx.answerCbQuery();
-      return;
-    }
+    const mDel = data.match(/^del_([0-9a-fA-F]{24})_p(all|\d+)$/);
+    const mLegacy = !mDel && data.startsWith('del_') ? data.match(/^del_([0-9a-fA-F]{24})$/) : null;
 
-    const m = data.match(/^del_([0-9a-fA-F]{24})_p(all|\d+)$/);
-    const mLegacy = !m && data.startsWith('del_') ? data.match(/^del_([0-9a-fA-F]{24})$/) : null;
-
-    if (m || mLegacy) {
-      const id = (m ? m[1] : mLegacy[1]);
-      const token = m ? m[2] : null;
+    if (mDel || mLegacy) {
+      const id = (mDel ? mDel[1] : mLegacy[1]);
+      const token = mDel ? mDel[2] : null;
       const { alertsCollection } = await import('./db.js');
       const doc = await alertsCollection.findOne({ _id: new ObjectId(id) });
       if (!doc) { await ctx.answerCbQuery('Алерт не найден'); return; }
@@ -298,17 +279,15 @@ bot.on('callback_query', async (ctx) => {
         } catch (e) { sourcePage = 0; }
       }
 
-      // archive before deleting
       try {
         const { alertsArchiveCollection } = await import('./db.js');
         await alertsArchiveCollection.insertOne({
           ...doc,
           deletedAt: new Date(),
           deleteReason: 'user_deleted',
-          archivedAt: new Date(),
-          archivedReason: 'user_deleted'
+          archivedAt: new Date()
         });
-      } catch (e) { console.warn('archive insert failed on user delete', e?.message || e); }
+      } catch (e) {}
 
       const { alertsCollection: ac } = await import('./db.js');
       await ac.deleteOne({ _id: new ObjectId(id) });
@@ -318,7 +297,7 @@ bot.on('callback_query', async (ctx) => {
       const computedTotalPages = Math.max(1, Math.ceil((alertsAfter?.length || 0) / 20));
       if (sourcePage !== null) { sourcePage = Math.max(0, Math.min(sourcePage, computedTotalPages - 1)); }
 
-      const inline = await buildDeleteInlineForUser(ctx.from.id, { fast: true, sourcePage, totalPages: (sourcePage === null ? null : computedTotalPages) });
+      const inline = await buildDeleteInlineForUser(ctx.from.id, { fast: true, sourcePage, totalPages: (sourcePage === null ? null : computedTotalPages), lang });
 
       if (!inline || inline.length === 0) {
         try { await ctx.editMessageText('У тебя больше нет активных алертов.', { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [] } }); } catch {}
@@ -330,35 +309,48 @@ bot.on('callback_query', async (ctx) => {
         try {
           const originalText = ctx.update.callback_query.message?.text || 'Твои алерты';
           await ctx.reply(originalText, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: inline } });
-        } catch (e) { console.error('delete fallback failed', e); }
+        } catch (e) {}
       }
 
       await ctx.answerCbQuery('Алерт удалён');
       return;
     }
 
-    const mOldPage = data.match(/^old_alerts_page_(\d+)_view_(d(\d+)_q(.+))$/);
+    const mOldPage = data.match(/^old_alerts_page_(\d+)_view_(d(\d+)_q(.*))$/);
     if (mOldPage) {
       const pageIdx = parseInt(mOldPage[1], 10);
       const token = mOldPage[2];
       const mToken = token.match(/^d(\d+)_q(.*)$/);
       const days = mToken ? parseInt(mToken[1], 10) : 30;
       const q = mToken ? decodeURIComponent(mToken[2]) : '';
-      const opts = { days, symbol: q || null, token };
+      const opts = { days, symbol: q || null, token, lang };
       const { pages } = await renderOldAlertsList(ctx.from.id, opts);
       const page = pages[Math.max(0, Math.min(pageIdx, pages.length - 1))] || pages[0];
       try {
         await ctx.editMessageText(page.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: page.buttons } });
       } catch (e) {
-        try { await ctx.reply(page.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: page.buttons } }); } catch (e2) { console.error('old_alerts_page edit/reply failed', e2); }
+        try { await ctx.reply(page.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: page.buttons } }); } catch {}
       }
+      await ctx.answerCbQuery();
+      return;
+    }
+
+    const mSetLang = data.match(/^set_lang_(ru|en)$/);
+    if (mSetLang) {
+      const newLang = mSetLang[1];
+      try {
+        const { usersCollection } = await import('./db.js');
+        await usersCollection.updateOne({ userId: ctx.from.id }, { $set: { preferredLang: newLang } }, { upsert: true });
+        await ctx.reply(newLang === 'en' ? 'Language switched to English.' : 'Я переключился на русский.', getMainMenuSync(ctx.from.id, newLang));
+        const inline = await buildSettingsInlineForUser(ctx.from.id);
+        try { await ctx.editMessageReplyMarkup(inline); } catch {}
+      } catch (e) {}
       await ctx.answerCbQuery();
       return;
     }
 
     await ctx.answerCbQuery();
   } catch (e) {
-    console.error(e);
     try { await ctx.answerCbQuery('Ошибка'); } catch {}
   }
 });
@@ -369,25 +361,25 @@ bot.on('text', async (ctx) => {
     const textRaw = (ctx.message.text || '').trim();
     const text = textRaw;
 
-    // --- New: allow day-selection shortcuts even if session was cleared previously.
-    // Only intercept when user is NOT in an active create-alert flow (to avoid breaking numeric price input).
-    const daysMap = { '7 дней': 7, '30 дней': 30, '90 дней': 90 };
+    const daysMap = {
+      '7 дней': 7, '30 дней': 30, '90 дней': 90,
+      '7 days': 7, '30 days': 30, '90 days': 90
+    };
     const numeric = parseInt(text.replace(/\D/g, ''), 10);
     const isNumericDay = Number.isFinite(numeric) && [7, 30, 90].includes(numeric);
     const normalized = text.toLowerCase();
-    const isDaysPhrase = daysMap[text] || daysMap[normalized] || isNumericDay || /^\d+\s*дн/i.test(text);
+    const isDaysPhrase = daysMap[text] || daysMap[normalized] || isNumericDay || /^\d+\s*дн/i.test(text) || /^\d+\s*day/i.test(text);
     if (( !step || step === 'old_alerts_select_days' ) && isDaysPhrase) {
-      // handle as old alerts selection
       const days = daysMap[text] || daysMap[normalized] || (isNumericDay ? numeric : 30);
       const token = `d${days}_q`;
-      const { pages } = await renderOldAlertsList(ctx.from.id, { days, symbol: null, token });
+      const lang = await resolveUserLang(ctx.from.id);
+      const { pages } = await renderOldAlertsList(ctx.from.id, { days, symbol: null, token, lang });
       const first = pages[0];
-      // clear session and remove reply keyboard
       ctx.session = {};
       if (first.buttons && first.buttons.length) {
-        await ctx.reply(first.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: first.buttons }, remove_keyboard: true });
+        await ctx.reply(first.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: first.buttons } });
       } else {
-        await ctx.reply(first.text, getMainMenu(ctx.from.id));
+        await ctx.reply(first.text, getMainMenuSync(ctx.from.id, lang));
       }
       return;
     }
@@ -405,7 +397,7 @@ bot.on('text', async (ctx) => {
         ctx.session.step = 'alert_condition';
         await ctx.reply(`✅ Монета: *${symbol}* Текущая цена: *${fmtNum(price)}* Выбери направление:`, {
           parse_mode: 'Markdown',
-          reply_markup: { keyboard: [[{ text: '⬆️ Когда выше' }, { text: '⬇️ Когда ниже' }], [{ text: '↩️ Отмена' }]], resize_keyboard:true }
+          reply_markup: { keyboard: [[{ text: '⬆️ Когда выше' }, { text: '⬇️ Когда ниже' }, { text: '⬆️ When above' }, { text: '⬇️ When below' }], [{ text: '↩️ Отмена' }, { text: '↩️ Cancel' }]], resize_keyboard:true }
         });
       } else {
         await ctx.reply('Пара не найдена на KuCoin. Попробуй другой символ.');
@@ -415,11 +407,11 @@ bot.on('text', async (ctx) => {
     }
 
     if (ctx.session.step === 'alert_condition') {
-      if (text === '⬆️ Когда выше') ctx.session.alertCondition = '>';
-      else if (text === '⬇️ Когда ниже') ctx.session.alertCondition = '<';
+      if (text === '⬆️ Когда выше' || text === '⬆️ When above') ctx.session.alertCondition = '>';
+      else if (text === '⬇️ Когда ниже' || text === '⬇️ When below') ctx.session.alertCondition = '<';
       else { await ctx.reply('Выбери ⬆️ или ⬇️'); return; }
       ctx.session.step = 'alert_price';
-      await ctx.reply('Введи цену уведомления:', { reply_markup: { keyboard: [[{ text: '↩️ Отмена' }]], resize_keyboard:true } });
+      await ctx.reply('Введи цену уведомления:', { reply_markup: { keyboard: [[{ text: '↩️ Отмена' }, { text: '↩️ Cancel' }]], resize_keyboard:true } });
       return;
     }
 
@@ -429,36 +421,35 @@ bot.on('text', async (ctx) => {
       ctx.session.alertPrice = v;
       ctx.session.step = 'ask_sl';
       const hint = ctx.session.alertCondition === '>' ? 'SL будет выше (для шорта — логика обратная)' : 'SL будет ниже';
-      await ctx.reply(`Добавить стоп-лосс? ${hint}`, { reply_markup: { keyboard: [[{ text: '🛑 Добавить SL' }, { text: '⏭️ Без SL' }], [{ text: '↩️ Отмена' }]], resize_keyboard:true } });
+      await ctx.reply(`Добавить стоп-лосс? ${hint}`, { reply_markup: { keyboard: [[{ text: '🛑 Добавить SL' }, { text: '⏭️ Без SL' }, { text: '🛑 Add SL' }, { text: '⏭️ Skip SL' }], [{ text: '↩️ Отмена' }, { text: '↩️ Cancel' }]], resize_keyboard:true } });
       return;
     }
 
     if (ctx.session.step === 'ask_sl') {
       const { alertsCollection } = await import('./db.js');
-      const limit = await getUserAlertLimit(ctx.from.id).catch(()=>10);
+      const limit = await getUserAlertLimit(ctx.from.id).catch(()=>1000000000);
       let currentCount = 0;
       try {
         currentCount = await alertsCollection.countDocuments({ userId: ctx.from.id });
       } catch (e) {
-        console.warn('countDocuments failed, falling back to cache count', e?.message || e);
         const currentAlerts = await getUserAlertsCached(ctx.from.id).catch(()=>[]);
         currentCount = (currentAlerts?.length || 0);
       }
 
       if (currentCount >= limit) {
-        await ctx.reply(`У тебя уже ${currentCount} алертов — достигнут лимит ${limit}. Если нужно увеличить лимит, напиши мне: @pirial_gena`, getMainMenu(ctx.from.id));
+        const lang = await resolveUserLang(ctx.from.id);
+        await ctx.reply(`У тебя уже ${currentCount} алертов — достигнут лимит ${limit}. Если нужно увеличить лимит, напиши мне: @pirial_gena`, getMainMenuSync(ctx.from.id, lang));
         ctx.session = {};
         return;
       }
 
-      if (text === '⏭️ Без SL') {
+      if (text === '⏭️ Без SL' || text === '⏭️ Skip SL') {
         try {
           const { alertsCollection: ac } = await import('./db.js');
-
-          // ещё разная проверка прямо перед вставкой (чтобы минимизировать гонки)
           const beforeInsertCount = await ac.countDocuments({ userId: ctx.from.id }).catch(()=>currentCount);
           if (beforeInsertCount >= limit) {
-            await ctx.reply(`У тебя уже ${beforeInsertCount} алертов — достигнут лимит ${limit}. Если нужно увеличить лимит, напиши мне: @pirial_gena`, getMainMenu(ctx.from.id));
+            const lang = await resolveUserLang(ctx.from.id);
+            await ctx.reply(`У тебя уже ${beforeInsertCount} алертов — достигнут лимит ${limit}. Если нужно увеличить лимит, напиши мне: @pirial_gena`, getMainMenuSync(ctx.from.id, lang));
             ctx.session = {};
             return;
           }
@@ -466,14 +457,15 @@ bot.on('text', async (ctx) => {
           await ac.insertOne({ userId: ctx.from.id, symbol: ctx.session.symbol, condition: ctx.session.alertCondition, price: ctx.session.alertPrice, type: 'alert', createdAt: new Date() });
           invalidateUserAlertsCache(ctx.from.id);
           const cp = await getCachedPrice(ctx.session.symbol);
-          await ctx.reply(`✅ Алерт создан: *${ctx.session.symbol}* ${ctx.session.alertCondition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${fmtNum(ctx.session.alertPrice)}* Текущая цена: *${fmtNum(cp) ?? '—'}*`, { parse_mode: 'Markdown', ...getMainMenu(ctx.from.id) });
-        } catch (e) { console.error(e); await ctx.reply('Ошибка при создании алерта'); }
+          const lang = await resolveUserLang(ctx.from.id);
+          await ctx.reply(`✅ Алерт создан: *${ctx.session.symbol}* ${ctx.session.alertCondition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${fmtNum(ctx.session.alertPrice)}* Текущая цена: *${fmtNum(cp) ?? '—'}*`, { parse_mode: 'Markdown', ...getMainMenuSync(ctx.from.id, lang) });
+        } catch (e) { await ctx.reply('Ошибка при создании алерта'); }
         ctx.session = {};
         return;
       }
-      if (text === '🛑 Добавить SL') {
+      if (text === '🛑 Добавить SL' || text === '🛑 Add SL') {
         ctx.session.step = 'sl_price';
-        await ctx.reply('Введи цену стоп-лосса:', { reply_markup: { keyboard: [[{ text: '↩️ Отмена' }]], resize_keyboard:true } });
+        await ctx.reply('Введи цену стоп-лосса:', { reply_markup: { keyboard: [[{ text: '↩️ Отмена' }, { text: '↩️ Cancel' }]], resize_keyboard:true } });
         return;
       }
       await ctx.reply('Выбери опцию: 🛑 Добавить SL / ⏭️ Без SL');
@@ -485,28 +477,28 @@ bot.on('text', async (ctx) => {
       if (!Number.isFinite(sl)) { await ctx.reply('Введите корректное число SL'); return; }
 
       const { alertsCollection } = await import('./db.js');
-      const limit = await getUserAlertLimit(ctx.from.id).catch(()=>10);
+      const limit = await getUserAlertLimit(ctx.from.id).catch(()=>1000000000);
       let currentCount = 0;
       try {
         currentCount = await alertsCollection.countDocuments({ userId: ctx.from.id });
       } catch (e) {
-        console.warn('countDocuments failed, falling back to cache count', e?.message || e);
         const currentAlerts = await getUserAlertsCached(ctx.from.id).catch(()=>[]);
         currentCount = (currentAlerts?.length || 0);
       }
 
       if (currentCount + 2 > limit) {
-        await ctx.reply(`Нельзя создать связку (уведомление + SL). У тебя сейчас ${currentCount} алертов, лимит ${limit}. Чтобы увеличить лимит напиши: @pirial_gena`, getMainMenu(ctx.from.id));
+        const lang = await resolveUserLang(ctx.from.id);
+        await ctx.reply(`Нельзя создать связку (уведомление + SL). У тебя сейчас ${currentCount} алертов, лимит ${limit}. Чтобы увеличить лимит напиши: @pirial_gena`, getMainMenuSync(ctx.from.id, lang));
         ctx.session = {};
         return;
       }
 
       try {
         const groupId = new ObjectId().toString();
-
         const beforeInsertCount = await alertsCollection.countDocuments({ userId: ctx.from.id }).catch(()=>currentCount);
         if (beforeInsertCount + 2 > limit) {
-          await ctx.reply(`Нельзя создать связку (уведомление + SL). У тебя сейчас ${beforeInsertCount} алертов, лимит ${limit}. Чтобы увеличить лимит напиши: @pirial_gena`, getMainMenu(ctx.from.id));
+          const lang = await resolveUserLang(ctx.from.id);
+          await ctx.reply(`Нельзя создать связку (уведомление + SL). У тебя сейчас ${beforeInsertCount} алертов, лимит ${limit}. Чтобы увеличить лимит напиши: @pirial_gena`, getMainMenuSync(ctx.from.id, lang));
           ctx.session = {};
           return;
         }
@@ -519,51 +511,50 @@ bot.on('text', async (ctx) => {
         ]);
         invalidateUserAlertsCache(ctx.from.id);
         const cp = await getCachedPrice(ctx.session.symbol);
-        await ctx.reply(`✅ Создана связка: 🔔 *${ctx.session.symbol}* ${ctx.session.alertCondition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${fmtNum(ctx.session.alertPrice)}*  🛑 SL (${slDir}) *${fmtNum(sl)}* Текущая: *${fmtNum(cp) ?? '—'}*`, { parse_mode: 'Markdown', ...getMainMenu(ctx.from.id) });
-      } catch (e) { console.error(e); await ctx.reply('Ошибка при создании связки'); }
+        const lang = await resolveUserLang(ctx.from.id);
+        await ctx.reply(`✅ Создана связка: 🔔 *${ctx.session.symbol}* ${ctx.session.alertCondition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${fmtNum(ctx.session.alertPrice)}*  🛑 SL (${slDir}) *${fmtNum(sl)}* Текущая: *${fmtNum(cp) ?? '—'}*`, { parse_mode: 'Markdown', ...getMainMenuSync(ctx.from.id, lang) });
+      } catch (e) { await ctx.reply('Ошибка при создании связки'); }
       ctx.session = {};
       return;
     }
 
-    // Old alerts - user selected days (session-driven)
     if (ctx.session.step === 'old_alerts_select_days') {
-      if (text === '↩️ Отмена') { ctx.session = {}; await ctx.reply('Отмена', getMainMenu(ctx.from.id)); return; }
-      const daysMapLocal = { '7 дней': 7, '30 дней': 30, '90 дней': 90 };
+      if (text === '↩️ Отмена' || text === '↩️ Cancel') { ctx.session = {}; const lang = await resolveUserLang(ctx.from.id); await ctx.reply('Отмена', getMainMenuSync(ctx.from.id, lang)); return; }
+      const daysMapLocal = { '7 дней': 7, '30 дней': 30, '90 дней': 90, '7 days': 7, '30 days': 30, '90 days': 90 };
       const days = daysMapLocal[text] || parseInt(text, 10) || 30;
       const token = `d${days}_q`;
-      const { pages } = await renderOldAlertsList(ctx.from.id, { days, symbol: null, token });
+      const lang = await resolveUserLang(ctx.from.id);
+      const { pages } = await renderOldAlertsList(ctx.from.id, { days, symbol: null, token, lang });
       const first = pages[0];
-      // clear session
       ctx.session = {};
       if (first.buttons && first.buttons.length) {
-        await ctx.reply(first.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: first.buttons, remove_keyboard: true } });
+        await ctx.reply(first.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: first.buttons } });
       } else {
-        await ctx.reply(first.text, getMainMenu(ctx.from.id));
+        await ctx.reply(first.text, getMainMenuSync(ctx.from.id, lang));
       }
       return;
     }
 
-    // Old alerts search
     if (ctx.session.step === 'old_alerts_search') {
-      if (text === '↩️ Отмена') { ctx.session = {}; await ctx.reply('Отмена', getMainMenu(ctx.from.id)); return; }
+      if (text === '↩️ Отмена' || text === '↩️ Cancel') { ctx.session = {}; const lang = await resolveUserLang(ctx.from.id); await ctx.reply('Отмена', getMainMenuSync(ctx.from.id, lang)); return; }
       const parts = text.split(/\s+/).filter(Boolean);
       const symbol = parts[0] || null;
       const days = parts[1] ? Math.max(1, parseInt(parts[1], 10)) : 30;
       const token = `d${days}_q${encodeURIComponent(String(symbol || ''))}`;
-      const { pages } = await renderOldAlertsList(ctx.from.id, { days, symbol, token });
+      const lang = await resolveUserLang(ctx.from.id);
+      const { pages } = await renderOldAlertsList(ctx.from.id, { days, symbol, token, lang });
       const first = pages[0];
       ctx.session = {};
       if (first.buttons && first.buttons.length) {
-        await ctx.reply(first.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: first.buttons, remove_keyboard: true } });
+        await ctx.reply(first.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: first.buttons } });
       } else {
-        await ctx.reply(first.text, getMainMenu(ctx.from.id));
+        await ctx.reply(first.text, getMainMenuSync(ctx.from.id, lang));
       }
       return;
     }
 
   } catch (e) {
-    console.error('text handler error', e);
-    try { await ctx.reply('Произошла ошибка, попробуй ещё раз.'); } catch {}
+    await ctx.reply('Произошла ошибка, попробуй ещё раз.');
     ctx.session = {};
   }
 });
@@ -594,8 +585,7 @@ bot.command('set_alert_limit', async (ctx) => {
     await ctx.reply(`Лимит для пользователя ${targetId} установлен: ${newLim}`);
     try { await bot.telegram.sendMessage(targetId, `Тебе установлен лимит алертов: ${newLim} (вручную от администратора)`); } catch {}
   } catch (e) {
-    console.error('set_alert_limit error', e);
-    try { await ctx.reply('Ошибка при выполнении команды'); } catch {}
+    await ctx.reply('Ошибка при выполнении команды');
   }
 });
 
@@ -619,8 +609,7 @@ bot.command('get_alert_limit', async (ctx) => {
     const lim = await getUserAlertLimit(targetId);
     await ctx.reply(`Лимит для пользователя ${targetId}: ${lim}`);
   } catch (e) {
-    console.error('get_alert_limit error', e);
-    try { await ctx.reply('Ошибка при выполнении команды'); } catch {}
+    await ctx.reply('Ошибка при выполнении команды');
   }
 });
 
@@ -640,7 +629,6 @@ bot.command('refresh_daily', async (ctx) => {
         await ctx.reply('Кэш dailyCache очищен.');
       }
     } catch (e) {
-      console.warn('Не удалось очистить dailyCache', e);
       await ctx.reply('⚠️ Не удалось очистить кэш в памяти (см логи). Продолжаю.');
     }
 
@@ -656,7 +644,6 @@ bot.command('refresh_daily', async (ctx) => {
         await ctx.reply('Превью цитаты: не удалось загрузить новую цитату (источники вернули пусто).');
       }
     } catch (e) {
-      console.error('preview fetchQuote error', e);
       await ctx.reply(`Ошибка при получении превью цитаты: ${String(e?.message || e)}`);
     }
 
@@ -674,7 +661,6 @@ bot.command('refresh_daily', async (ctx) => {
         await ctx.reply('Превью картинки: функция fetchRandomImage недоступна.');
       }
     } catch (e) {
-      console.error('preview fetchImage error', e);
       await ctx.reply(`Ошибка при получении превью картинки: ${String(e?.message || e)}`);
     }
 
@@ -687,7 +673,6 @@ bot.command('refresh_daily', async (ctx) => {
         await ctx.reply('⚠️ fetchAndStoreDailyMotivation вернул null/undefined (в БД мог остаться старый документ).');
       }
     } catch (e) {
-      console.error('fetchAndStoreDailyMotivation error', e);
       await ctx.reply(`Ошибка при сохранении мотивации: ${String(e?.message || e)}`);
     }
 
@@ -700,7 +685,6 @@ bot.command('refresh_daily', async (ctx) => {
         await ctx.reply('В БД нет документа для сегодняшней даты после сохранения.');
       }
     } catch (e) {
-      console.error('read stored doc error', e);
       await ctx.reply(`Ошибка при чтении doc из БД: ${String(e?.message || e)}`);
     }
 
@@ -712,7 +696,6 @@ bot.command('refresh_daily', async (ctx) => {
         await ctx.reply('Картинка не загружена (будет отправлён текст без изображения).');
       }
     } catch (e) {
-      console.error('ensureDailyImageBuffer error', e);
       await ctx.reply(`Ошибка при загрузке изображения: ${String(e?.message || e)}`);
     }
 
@@ -721,13 +704,11 @@ bot.command('refresh_daily', async (ctx) => {
       if (ok) await ctx.reply('Готово — мотивация обновлена и отправлена тебе.');
       else await ctx.reply('Мотивация сохранена, но отправка не удалась (см логи).');
     } catch (e) {
-      console.error('sendDailyToUser error', e);
       await ctx.reply(`Ошибка при отправке мотивации: ${String(e?.message || e)}`);
     }
 
   } catch (e) {
-    console.error('refresh_daily top-level error', e);
-    try { await ctx.reply('Внутренняя ошибка: ' + String(e?.message || e)); } catch {}
+    await ctx.reply('Внутренняя ошибка: ' + String(e?.message || e));
   }
 });
 
@@ -743,7 +724,7 @@ export async function startBot() {
   setInterval(() => watchForNewQuotes(bot), 30_000);
 
   const dateStrNow = new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Kyiv' });
-  try { await fetchAndStoreDailyMotivation(dateStrNow).catch(()=>{}); } catch (e) { console.warn('initial fetchAndStoreDailyMotivation failed', e); }
+  try { await fetchAndStoreDailyMotivation(dateStrNow).catch(()=>{}); } catch (e) {}
 
   let lastFetchDay = null;
   let lastPrepareDay = null;
@@ -755,12 +736,12 @@ export async function startBot() {
       const hour = kyivNow.getHours();
 
       if (day !== lastFetchDay && hour === IMAGE_FETCH_HOUR) {
-        try { await fetchAndStoreDailyMotivation(day, { force: true }); } catch (e) { console.warn('daily fetch failed', e); }
+        try { await fetchAndStoreDailyMotivation(day, { force: true }); } catch (e) {}
         lastFetchDay = day;
       }
 
       if (day !== lastPrepareDay && hour === PREPARE_SEND_HOUR) {
-        try { await fetchAndStoreDailyMotivation(day, { force: false }); } catch (e) { console.warn('daily prepare failed', e); }
+        try { await fetchAndStoreDailyMotivation(day, { force: false }); } catch (e) {}
         lastPrepareDay = day;
 
         try {
@@ -782,7 +763,7 @@ export async function startBot() {
                 try {
                   const ok = await sendDailyToUser(bot, targetId, dateStr, { disableNotification: false, forceRefresh: false }).catch(()=>false);
                   await pendingDailySendsCollection.updateOne({ userId: targetId, date: dateStr }, { $set: { sent: !!ok, sentAt: ok ? new Date() : null, quoteSent: !!ok, permanentFail: !ok } }, { upsert: true });
-                } catch (e) { console.warn('scheduled broadcast send failed to', targetId, e); }
+                } catch (e) {}
               }));
               batch = [];
             }
@@ -792,23 +773,20 @@ export async function startBot() {
               try {
                 const ok = await sendDailyToUser(bot, targetId, dateStr, { disableNotification: false, forceRefresh: false }).catch(()=>false);
                 await pendingDailySendsCollection.updateOne({ userId: targetId, date: dateStr }, { $set: { sent: !!ok, sentAt: ok ? new Date() : null, quoteSent: !!ok, permanentFail: !ok } }, { upsert: true });
-              } catch (e) { console.warn('scheduled broadcast send failed to', targetId, e); }
+              } catch (e) {}
             }));
           }
-        } catch (e) {
-          console.warn('scheduled daily broadcast failed', e);
-        }
+        } catch (e) {}
       }
-    } catch (e) { console.warn('daily scheduler error', e); }
+    } catch (e) {}
   }, 60_000);
 
   setInterval(async () => {
     try {
       await removeInactive();
-    } catch (e) { console.warn('weekly removeInactive failed', e); }
+    } catch (e) {}
   }, 7 * DAY_MS);
 
   await bot.launch();
-  console.log('Bot started');
   return { server };
 }
