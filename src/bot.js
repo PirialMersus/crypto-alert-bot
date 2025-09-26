@@ -1,3 +1,4 @@
+// src/bot.js
 import { Telegraf, session } from 'telegraf';
 import dotenv from 'dotenv';
 import { connectToMongo, ObjectId, countDocumentsWithTimeout } from './db.js';
@@ -104,14 +105,19 @@ bot.hears('➕ Создать алерт', async (ctx) => {
     refreshAllTickers().catch(()=>{});
     const recent = await getUserRecentSymbols(ctx.from.id);
     const suggest = [...new Set([...recent, ...['BTC','ETH','SOL','BNB','XRP','DOGE']])].slice(0,6).map(s=>({ text: s }));
-    const kb = suggest.length ? [suggest, [{ text: '↩️ Отмена' }, { text: '↩️ Cancel' }]] : [[{ text: '↩️ Отмена' }, { text: '↩️ Cancel' }]];
-    ctx.reply('Введи символ (например BTC) или нажми кнопку:', { reply_markup: { keyboard: kb, resize_keyboard: true } });
+    const lang = await resolveUserLang(ctx.from.id);
+    const isEn = String(lang).split('-')[0] === 'en';
+    const cancelRow = isEn ? [{ text: '↩️ Cancel' }] : [{ text: '↩️ Отмена' }];
+    const kb = suggest.length ? [suggest, cancelRow] : [cancelRow];
+    const prompt = isEn ? 'Enter symbol (e.g. BTC) or press a button:' : 'Введи символ (например BTC) или нажми кнопку:';
+    ctx.reply(prompt, { reply_markup: { keyboard: kb, resize_keyboard: true } });
   } catch (e) {
     ctx.session = {};
     await ctx.reply('Ошибка при запуске создания алерта');
   }
 });
-bot.hears('➕ Create alert', async (ctx) => { ctx.session = { step: 'symbol' }; await ctx.reply('Enter symbol (e.g. BTC) or press a button:'); });
+
+bot.hears('➕ Create alert', async (ctx) => { ctx.session = { step: 'symbol' }; const lang = await resolveUserLang(ctx.from.id); const isEn = String(lang).split('-')[0] === 'en'; const cancelRow = isEn ? [{ text: '↩️ Cancel' }] : [{ text: '↩️ Отмена' }]; await ctx.reply('Enter symbol (e.g. BTC) or press a button:', { reply_markup: { keyboard: [cancelRow], resize_keyboard: true } }); });
 
 bot.hears('↩️ Отмена', async (ctx) => { ctx.session = {}; const lang = await resolveUserLang(ctx.from.id); await ctx.reply('Отмена ✅', getMainMenuSync(ctx.from.id, lang)); });
 bot.hears('↩️ Cancel', async (ctx) => { ctx.session = {}; const lang = await resolveUserLang(ctx.from.id); await ctx.reply('Cancelled ✅', getMainMenuSync(ctx.from.id, lang)); });
@@ -141,8 +147,9 @@ bot.hears('📋 My alerts', async (ctx) => {
 bot.hears('📜 Старые алерты', async (ctx) => {
   ctx.session = { step: 'old_alerts_select_days' };
   const lang = await resolveUserLang(ctx.from.id);
-  const kb = [[{ text: lang && String(lang).split('-')[0] === 'en' ? '7 days' : '7 дней' }, { text: lang && String(lang).split('-')[0] === 'en' ? '30 days' : '30 дней' }, { text: lang && String(lang).split('-')[0] === 'en' ? '90 days' : '90 дней' }], [{ text: '↩️ Отмена' }, { text: '↩️ Cancel' }]];
-  await ctx.reply('Выбери период для просмотра старых алертов:', { reply_markup: { keyboard: kb, resize_keyboard: true } });
+  const isEn = String(lang).split('-')[0] === 'en';
+  const kb = [[{ text: isEn ? '7 days' : '7 дней' }, { text: isEn ? '30 days' : '30 дней' }, { text: isEn ? '90 days' : '90 дней' }], [ isEn ? { text: '↩️ Cancel' } : { text: '↩️ Отмена' } ]];
+  await ctx.reply(isEn ? 'Choose a period to view old alerts:' : 'Выбери период для просмотра старых алертов:', { reply_markup: { keyboard: kb, resize_keyboard: true } });
 });
 bot.hears('📜 Old alerts', async (ctx) => {
   ctx.session = { step: 'old_alerts_select_days' };
@@ -152,7 +159,9 @@ bot.hears('📜 Old alerts', async (ctx) => {
 
 bot.hears('🔎 Поиск старых алертов', async (ctx) => {
   ctx.session = { step: 'old_alerts_search' };
-  await ctx.reply('Введи запрос в формате: SYMBOL [DAYS]\nПримеры: "BTC", "BTC 30". По умолчанию DAYS=30.', { reply_markup: { keyboard: [[{ text: '↩️ Отмена' }, { text: '↩️ Cancel' }]], resize_keyboard: true } });
+  const lang = await resolveUserLang(ctx.from.id);
+  const cancel = String(lang).split('-')[0] === 'en' ? '↩️ Cancel' : '↩️ Отмена';
+  await ctx.reply(String(lang).split('-')[0] === 'en' ? 'Enter query in format: SYMBOL [DAYS]\nExamples: "BTC", "BTC 30". Default DAYS=30.' : 'Введи запрос в формате: SYMBOL [DAYS]\nПримеры: "BTC", "BTC 30". По умолчанию DAYS=30.', { reply_markup: { keyboard: [[{ text: cancel }]], resize_keyboard: true } });
 });
 bot.hears('🔎 Search old alerts', async (ctx) => {
   ctx.session = { step: 'old_alerts_search' };
@@ -395,9 +404,11 @@ bot.on('text', async (ctx) => {
         try { await pushRecentSymbol(ctx.from.id, base); } catch (e) {}
         ctx.session.symbol = symbol;
         ctx.session.step = 'alert_condition';
-        await ctx.reply(`✅ Монета: *${symbol}* Текущая цена: *${fmtNum(price)}* Выбери направление:`, {
+        const lang = await resolveUserLang(ctx.from.id);
+        const isEn = String(lang).split('-')[0] === 'en';
+        await ctx.reply(`${isEn ? '✅ Coin:' : '✅ Монета:'} *${symbol}* ${isEn ? 'Current price:' : 'Текущая цена:'} *${fmtNum(price)}* ${isEn ? 'Choose direction:' : 'Выбери направление:'}`, {
           parse_mode: 'Markdown',
-          reply_markup: { keyboard: [[{ text: '⬆️ Когда выше' }, { text: '⬇️ Когда ниже' }, { text: '⬆️ When above' }, { text: '⬇️ When below' }], [{ text: '↩️ Отмена' }, { text: '↩️ Cancel' }]], resize_keyboard:true }
+          reply_markup: { keyboard: [[{ text: isEn ? '⬆️ When above' : '⬆️ Когда выше' }, { text: isEn ? '⬇️ When below' : '⬇️ Когда ниже' }], [ { text: isEn ? '↩️ Cancel' : '↩️ Отмена' } ] ], resize_keyboard:true }
         });
       } else {
         await ctx.reply('Пара не найдена на KuCoin. Попробуй другой символ.');
@@ -407,11 +418,13 @@ bot.on('text', async (ctx) => {
     }
 
     if (ctx.session.step === 'alert_condition') {
-      if (text === '⬆️ Когда выше' || text === '⬆️ When above') ctx.session.alertCondition = '>';
-      else if (text === '⬇️ Когда ниже' || text === '⬇️ When below') ctx.session.alertCondition = '<';
-      else { await ctx.reply('Выбери ⬆️ или ⬇️'); return; }
+      const lang = await resolveUserLang(ctx.from.id);
+      const isEn = String(lang).split('-')[0] === 'en';
+      if (text === (isEn ? '⬆️ When above' : '⬆️ Когда выше')) ctx.session.alertCondition = '>';
+      else if (text === (isEn ? '⬇️ When below' : '⬇️ Когда ниже')) ctx.session.alertCondition = '<';
+      else { await ctx.reply(isEn ? 'Choose ⬆️ or ⬇️' : 'Выбери ⬆️ или ⬇️'); return; }
       ctx.session.step = 'alert_price';
-      await ctx.reply('Введи цену уведомления:', { reply_markup: { keyboard: [[{ text: '↩️ Отмена' }, { text: '↩️ Cancel' }]], resize_keyboard:true } });
+      await ctx.reply(isEn ? 'Enter alert price:' : 'Введи цену уведомления:', { reply_markup: { keyboard: [[ { text: isEn ? '↩️ Cancel' : '↩️ Отмена' } ]], resize_keyboard:true } });
       return;
     }
 
@@ -420,8 +433,10 @@ bot.on('text', async (ctx) => {
       if (!Number.isFinite(v)) { await ctx.reply('Введите корректное число'); return; }
       ctx.session.alertPrice = v;
       ctx.session.step = 'ask_sl';
-      const hint = ctx.session.alertCondition === '>' ? 'SL будет выше (для шорта — логика обратная)' : 'SL будет ниже';
-      await ctx.reply(`Добавить стоп-лосс? ${hint}`, { reply_markup: { keyboard: [[{ text: '🛑 Добавить SL' }, { text: '⏭️ Без SL' }, { text: '🛑 Add SL' }, { text: '⏭️ Skip SL' }], [{ text: '↩️ Отмена' }, { text: '↩️ Cancel' }]], resize_keyboard:true } });
+      const lang = await resolveUserLang(ctx.from.id);
+      const isEn = String(lang).split('-')[0] === 'en';
+      const hint = ctx.session.alertCondition === '>' ? (isEn ? 'SL will be above (for short break — inverse logic)' : 'SL будет выше (для шорта — логика обратная)') : (isEn ? 'SL will be below' : 'SL будет ниже');
+      await ctx.reply((isEn ? 'Add stop-loss?' : 'Добавить стоп-лосс?') + ` ${hint}`, { reply_markup: { keyboard: [[{ text: isEn ? '🛑 Add SL' : '🛑 Добавить SL' }, { text: isEn ? '⏭️ Skip SL' : '⏭️ Без SL' }], [ { text: isEn ? '↩️ Cancel' : '↩️ Отмена' } ]], resize_keyboard:true } });
       return;
     }
 
@@ -443,13 +458,16 @@ bot.on('text', async (ctx) => {
         return;
       }
 
-      if (text === '⏭️ Без SL' || text === '⏭️ Skip SL') {
+      const lang = await resolveUserLang(ctx.from.id);
+      const isEn = String(lang).split('-')[0] === 'en';
+
+      if (text === (isEn ? '⏭️ Skip SL' : '⏭️ Без SL')) {
         try {
           const { alertsCollection: ac } = await import('./db.js');
           const beforeInsertCount = await ac.countDocuments({ userId: ctx.from.id }).catch(()=>currentCount);
           if (beforeInsertCount >= limit) {
-            const lang = await resolveUserLang(ctx.from.id);
-            await ctx.reply(`У тебя уже ${beforeInsertCount} алертов — достигнут лимит ${limit}. Если нужно увеличить лимит, напиши мне: @pirial_gena`, getMainMenuSync(ctx.from.id, lang));
+            const lang2 = await resolveUserLang(ctx.from.id);
+            await ctx.reply(`У тебя уже ${beforeInsertCount} алертов — достигнут лимит ${limit}. Если нужно увеличить лимит, напиши мне: @pirial_gena`, getMainMenuSync(ctx.from.id, lang2));
             ctx.session = {};
             return;
           }
@@ -457,18 +475,20 @@ bot.on('text', async (ctx) => {
           await ac.insertOne({ userId: ctx.from.id, symbol: ctx.session.symbol, condition: ctx.session.alertCondition, price: ctx.session.alertPrice, type: 'alert', createdAt: new Date() });
           invalidateUserAlertsCache(ctx.from.id);
           const cp = await getCachedPrice(ctx.session.symbol);
-          const lang = await resolveUserLang(ctx.from.id);
-          await ctx.reply(`✅ Алерт создан: *${ctx.session.symbol}* ${ctx.session.alertCondition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${fmtNum(ctx.session.alertPrice)}* Текущая цена: *${fmtNum(cp) ?? '—'}*`, { parse_mode: 'Markdown', ...getMainMenuSync(ctx.from.id, lang) });
+          const lang3 = await resolveUserLang(ctx.from.id);
+          await ctx.reply(`${isEn ? '✅ Alert created:' : '✅ Алерт создан:'} *${ctx.session.symbol}* ${ctx.session.alertCondition === '>' ? (isEn ? '⬆️ above' : '⬆️ выше') : (isEn ? '⬇️ below' : '⬇️ ниже')} *${fmtNum(ctx.session.alertPrice)}* ${isEn ? 'Current price:' : 'Текущая цена:'} *${fmtNum(cp) ?? '—'}*`, { parse_mode: 'Markdown', ...getMainMenuSync(ctx.from.id, lang3) });
         } catch (e) { await ctx.reply('Ошибка при создании алерта'); }
         ctx.session = {};
         return;
       }
-      if (text === '🛑 Добавить SL' || text === '🛑 Add SL') {
+      if (text === (isEn ? '🛑 Add SL' : '🛑 Добавить SL')) {
         ctx.session.step = 'sl_price';
-        await ctx.reply('Введи цену стоп-лосса:', { reply_markup: { keyboard: [[{ text: '↩️ Отмена' }, { text: '↩️ Cancel' }]], resize_keyboard:true } });
+        const lang2 = await resolveUserLang(ctx.from.id);
+        const isEn2 = String(lang2).split('-')[0] === 'en';
+        await ctx.reply(isEn2 ? 'Enter stop-loss price:' : 'Введи цену стоп-лосса:', { reply_markup: { keyboard: [[{ text: isEn2 ? '↩️ Cancel' : '↩️ Отмена' }]], resize_keyboard:true } });
         return;
       }
-      await ctx.reply('Выбери опцию: 🛑 Добавить SL / ⏭️ Без SL');
+      await ctx.reply(isEn ? 'Choose option: 🛑 Add SL / ⏭️ Skip SL' : 'Выбери опцию: 🛑 Добавить SL / ⏭️ Без SL');
       return;
     }
 
