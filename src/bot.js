@@ -229,7 +229,8 @@ bot.on('callback_query', async (ctx) => {
       return;
     }
 
-    const mShow = data.match(/^show_delete_menu_(all|\\d+)$/);
+    // fixed: use \d (not \\d) here — previously the regex never matched
+    const mShow = data.match(/^show_delete_menu_(all|\d+)$/);
     if (mShow) {
       const token = mShow[1];
       const { pages } = await renderAlertsList(ctx.from.id, { fast: true, lang });
@@ -268,14 +269,30 @@ bot.on('callback_query', async (ctx) => {
       return;
     }
 
-    const mDel = data.match(/^del_([0-9a-fA-F]{24})_p(all|\d+)$/);
-    const mLegacy = !mDel && data.startsWith('del_') ? data.match(/^del_([0-9a-fA-F]{24})$/) : null;
+    // permissive delete matcher: captures id (non-greedy) and page token
+    const mDel = data.match(/^del_(.+?)_p(all|\d+)$/);
+    const mLegacy = !mDel && data.startsWith('del_') ? data.match(/^del_(.+)$/) : null;
 
     if (mDel || mLegacy) {
-      const id = (mDel ? mDel[1] : mLegacy[1]);
+      const idRaw = (mDel ? mDel[1] : mLegacy[1]);
       const token = mDel ? mDel[2] : null;
       const { alertsCollection } = await import('./db.js');
-      const doc = await alertsCollection.findOne({ _id: new ObjectId(id) });
+
+      // Try to find doc by multiple strategies: ObjectId, string _id, or custom id field
+      let doc = null;
+      try {
+        if (ObjectId && typeof ObjectId.isValid === 'function' && ObjectId.isValid(idRaw)) {
+          try { doc = await alertsCollection.findOne({ _id: new ObjectId(idRaw) }); } catch (e) { doc = null; }
+        }
+      } catch (e) { /* ignore */ }
+
+      if (!doc) {
+        try { doc = await alertsCollection.findOne({ _id: idRaw }); } catch (e) { doc = null; }
+      }
+      if (!doc) {
+        try { doc = await alertsCollection.findOne({ id: idRaw }); } catch (e) { doc = null; }
+      }
+
       if (!doc) { await ctx.answerCbQuery('Алерт не найден'); return; }
 
       let sourcePage = null;
@@ -283,7 +300,7 @@ bot.on('callback_query', async (ctx) => {
       else {
         try {
           const alertsBefore = await getUserAlertsCached(ctx.from.id);
-          const idxBefore = alertsBefore.findIndex(a => String(a._id) === String(doc._id) || a._id?.toString() === id);
+          const idxBefore = alertsBefore.findIndex(a => String(a._id) === String(doc._id) || a._id?.toString?.() === String(doc._id) || String(a._id) === String(idRaw));
           if (idxBefore >= 0) sourcePage = Math.floor(idxBefore / 20); else sourcePage = 0;
         } catch (e) { sourcePage = 0; }
       }
@@ -299,7 +316,11 @@ bot.on('callback_query', async (ctx) => {
       } catch (e) {}
 
       const { alertsCollection: ac } = await import('./db.js');
-      await ac.deleteOne({ _id: new ObjectId(id) });
+      try {
+        if (doc && doc._id) await ac.deleteOne({ _id: doc._id });
+        else await ac.deleteOne({ _id: idRaw }).catch(()=>{});
+      } catch (e) {}
+
       invalidateUserAlertsCache(ctx.from.id);
 
       const alertsAfter = await getUserAlertsCached(ctx.from.id);
