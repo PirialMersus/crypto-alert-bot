@@ -1,3 +1,4 @@
+// src/daily.js
 import { httpGetWithRetry, httpClient } from './httpClient.js';
 import { dailyCache } from './cache.js';
 import { dailyMotivationCollection, dailyQuoteRetryCollection, pendingDailySendsCollection } from './db.js';
@@ -24,7 +25,7 @@ async function tryGetArrayBuffer(url, opts = {}) {
       return { buffer: buf, url: finalUrl || url };
     }
   } catch (e) {
-    // caller will log
+    // ignore
   }
   return null;
 }
@@ -33,11 +34,22 @@ function isLikelyHTML(s) {
   if (!s || typeof s !== 'string') return false;
   const snippet = s.slice(0, 500).toLowerCase();
   if (/<\s*html|<!doctype|<meta|<title|<script|<\/html>/.test(snippet)) return true;
-  // too many angle brackets
   const lt = (s.match(/</g) || []).length;
   const gt = (s.match(/>/g) || []).length;
   if (lt > 4 && gt > 4) return true;
   return false;
+}
+
+function detectSimpleLang(s) {
+  if (!s || typeof s !== 'string') return 'en';
+  try {
+    // prefer Unicode script detection if available
+    if (/\p{Script=Cyrillic}/u.test(s)) return 'ru';
+  } catch (e) {
+    // fallback to simple Cyrillic chars
+    if (/[А-Яа-яЁё]/.test(s)) return 'ru';
+  }
+  return 'en';
 }
 
 export async function fetchQuoteQuotable() {
@@ -86,7 +98,6 @@ export async function fetchQuoteForismatic() {
 }
 
 export async function fetchQuoteFromAny(attempts = 2) {
-  // Try several sources, prefer forismatic/typefit (these are often more stable)
   for (let a = 0; a < attempts; a++) {
     let q = null;
     q = await fetchQuoteForismatic().catch(()=>null);
@@ -97,7 +108,6 @@ export async function fetchQuoteFromAny(attempts = 2) {
     if (q && q.text) return q;
     q = await fetchQuoteZen().catch(()=>null);
     if (q && q.text) return q;
-    // small delay between attempts
     await new Promise(r => setTimeout(r, 300 * (a+1)));
   }
   return null;
@@ -126,7 +136,6 @@ export async function fetchRandomImage() {
 
 export async function fetchAndStoreDailyMotivation(dateStr, opts = { force: false }) {
   try {
-    // make several attempts for quote and image if force requested
     const quoteAttempts = (opts && opts.force) ? 3 : 2;
     const imgAttempts = (opts && opts.force) ? 3 : 1;
 
@@ -142,9 +151,16 @@ export async function fetchAndStoreDailyMotivation(dateStr, opts = { force: fals
       if (!img) await new Promise(r => setTimeout(r, 200 * (i+1)));
     }
 
-    // Build doc — translations are set only when we have a quote
-    let translations = null;
-    if (quote && quote.text) translations = { en: quote.text, ru: null, uk: null };
+    // detect language of the fetched quote (simple heuristic)
+    let originalLang = 'en';
+    if (quote && quote.text) originalLang = detectSimpleLang(quote.text);
+
+    // Build translations object sensibly based on detected language
+    let translations = { en: null, ru: null, uk: null };
+    if (quote && quote.text) {
+      if (originalLang === 'ru') translations.ru = quote.text;
+      else translations.en = quote.text;
+    }
 
     const doc = {
       date: dateStr,
@@ -152,6 +168,7 @@ export async function fetchAndStoreDailyMotivation(dateStr, opts = { force: fals
         original: quote.text,
         author: quote.author || '',
         source: quote.source || '',
+        originalLang,
         translations
       } : null,
       image: img ? { url: img.url, source: img.source } : null,
@@ -159,13 +176,11 @@ export async function fetchAndStoreDailyMotivation(dateStr, opts = { force: fals
     };
 
     if (opts && opts.force) {
-      // If force requested but we got nothing (no quote and no img), throw — so admin sees failure
       if (!doc.quote && !doc.image) {
         throw new Error('fetchAndStoreDailyMotivation: force requested but unable to fetch quote or image from sources (network or sources failure).');
       }
       await dailyMotivationCollection.updateOne({ date: dateStr }, { $set: doc }, { upsert: true });
     } else {
-      // Only insert-once behavior
       await dailyMotivationCollection.updateOne({ date: dateStr }, { $setOnInsert: doc }, { upsert: true });
     }
 
@@ -236,95 +251,46 @@ export async function sendDailyToUser(bot, userId, dateStr, opts = { disableNoti
     if (!doc) doc = await fetchAndStoreDailyMotivation(dateStr).catch(()=>null);
 
     const buf = await ensureDailyImageBuffer(dateStr).catch(()=>null);
-    const lang = 'ru';
+    const lang = await import('./cache.js').then(m => m.resolveUserLang(userId)).catch(()=> 'ru');
 
     let quoteText = null;
-    const original = doc?.quote?.original || (doc?.quote?.translations && doc.quote.translations.en) || null;
+    const storedQuote = doc?.quote || null;
+    const original = storedQuote?.original || (storedQuote?.translations && (storedQuote.translations.en || storedQuote.translations.ru)) || null;
+    const originalLang = storedQuote?.originalLang || (storedQuote?.translations && storedQuote.translations.ru ? 'ru' : 'en');
 
-    // If stored quote looks like HTML, ignore it and try to fetch a new one
     if (original && isLikelyHTML(original)) {
-      doc.quote = null;
+      if (storedQuote) storedQuote.original = null;
     }
 
-    if (doc?.quote) {
-      if (doc.quote.translations && doc.quote.translations[lang]) {
-        if (!isLikelyHTML(doc.quote.translations[lang])) quoteText = doc.quote.translations[lang];
-      } else if (original) {
-        try {
-          const tr = await translateOrNull(original, lang).catch(()=>null);
-          if (tr && !isLikelyHTML(tr)) {
-            quoteText = tr;
-            try {
-              const upd = { ['quote.translations.'+lang]: tr };
-              await dailyMotivationCollection.updateOne({ date: dateStr }, { $set: upd }, { upsert: false });
-              dailyCache.doc = await dailyMotivationCollection.findOne({ date: dateStr }).catch(()=>dailyCache.doc);
-            } catch (e) { /* ignore write errors */ }
-          }
-        } catch (e) { /* ignore translate errors */ }
-      }
+    // 1) prefer an explicit translation for requested language
+    if (storedQuote?.translations && storedQuote.translations[lang]) {
+      if (!isLikelyHTML(storedQuote.translations[lang])) quoteText = storedQuote.translations[lang];
     }
 
-    if (!quoteText) {
-      const orig = doc?.quote?.original;
-      if (orig && !isLikelyHTML(orig)) {
-        try {
-          const tr = await translateOrNull(orig, 'ru').catch(()=>null);
-          if (tr && !isLikelyHTML(tr)) {
-            quoteText = tr;
-            try {
-              await dailyMotivationCollection.updateOne({ date: dateStr }, { $set: { 'quote.translations.ru': tr } }, { upsert: false });
-              dailyCache.doc = await dailyMotivationCollection.findOne({ date: dateStr }).catch(()=>dailyCache.doc);
-            } catch (e) { /* ignore write errors */ }
-          }
-        } catch (e) { /* ignore */ }
-      }
-
-      if (!quoteText) {
-        try {
-          const foris = await fetchQuoteForismatic().catch(()=>null);
-          if (foris && foris.text && !isLikelyHTML(foris.text)) {
-            const originalRu = String(foris.text);
-            quoteText = originalRu;
-            try {
-              const enT = await translateOrNull(originalRu, 'en').catch(()=>originalRu);
-              const ukT = await translateOrNull(originalRu, 'uk').catch(null);
-              const updates = {
-                'quote.original': originalRu,
-                'quote.author': foris.author || (doc?.quote?.author || ''),
-                'quote.source': foris.source || 'forismatic',
-                'quote.translations.en': enT,
-                'quote.translations.ru': originalRu
-              };
-              if (ukT) updates['quote.translations.uk'] = ukT;
-              await dailyMotivationCollection.updateOne({ date: dateStr }, { $set: updates }, { upsert: true });
-              dailyCache.doc = await dailyMotivationCollection.findOne({ date: dateStr }).catch(()=>dailyCache.doc);
-              doc = dailyCache.doc || doc;
-            } catch (e) { /* ignore db write errors */ }
-          }
-        } catch (e) { /* ignore */ }
-      }
+    // 2) if we don't have translation, but original was in the target language — use original
+    if (!quoteText && storedQuote && storedQuote.original && storedQuote.originalLang === lang) {
+      if (!isLikelyHTML(storedQuote.original)) quoteText = storedQuote.original;
     }
 
-    if (!quoteText) {
+    // 3) If still nothing, prefer any existing translation in a suitable language (e.g. translations.en when lang==='en')
+    if (!quoteText && storedQuote?.translations) {
+      if (lang === 'en' && storedQuote.translations.en && !isLikelyHTML(storedQuote.translations.en)) quoteText = storedQuote.translations.en;
+      if (lang === 'ru' && storedQuote.translations.ru && !isLikelyHTML(storedQuote.translations.ru)) quoteText = storedQuote.translations.ru;
+    }
+
+    // 4) Last resort — translate original -> lang (if original exists)
+    if (!quoteText && original) {
       try {
-        const q = await fetchQuoteFromAny().catch(()=>null);
-        if (q && q.text && !isLikelyHTML(q.text)) {
-          const originalTxt = String(q.text);
-          let enT = originalTxt;
-          try { enT = await translateOrNull(originalTxt, 'en').catch(()=>originalTxt); } catch {}
-          let tr = enT;
-          try { tr = await translateOrNull(originalTxt, lang).catch(enT); } catch {}
-          quoteText = tr || enT || originalTxt;
+        const tr = await translateOrNull(original, lang).catch(()=>null);
+        if (tr && !isLikelyHTML(tr)) {
+          quoteText = tr;
           try {
-            await dailyMotivationCollection.updateOne(
-              { date: dateStr },
-              { $set: { 'quote.original': originalTxt, 'quote.author': q.author || '', 'quote.source': q.source || '', 'quote.translations.en': enT, ['quote.translations.'+lang]: tr } },
-              { upsert: true }
-            );
-            dailyCache.doc = await dailyMotivationCollection.findOne({ date: dateStr }).catch(()=>null);
-          } catch (e) { /* ignore */ }
+            const upd = { ['quote.translations.'+lang]: tr };
+            await dailyMotivationCollection.updateOne({ date: dateStr }, { $set: upd }, { upsert: false });
+            dailyCache.doc = await dailyMotivationCollection.findOne({ date: dateStr }).catch(()=>dailyCache.doc);
+          } catch (e) { /* ignore write errors */ }
         }
-      } catch (e) { console.warn('Final fetch attempt failed', e); }
+      } catch (e) { /* ignore translate errors */ }
     }
 
     // Helper to record pendingDailySends status (best-effort)
@@ -345,7 +311,6 @@ export async function sendDailyToUser(bot, userId, dateStr, opts = { disableNoti
           );
         }
       } catch (e) {
-        // swallow - this is best-effort to avoid breaking sends
         console.warn('recordSendStatus failed', e?.message || e);
       }
     }
@@ -368,10 +333,10 @@ export async function sendDailyToUser(bot, userId, dateStr, opts = { disableNoti
       try { await bot.telegram.sendMessage(userId, caption, { disable_notification: !!opts.disableNotification }); } catch (e) { console.warn('sendDailyToUser sendMessage failed', e); await recordSendStatus(false, !!quoteText); return false; }
     }
 
-    if (doc?.quote?.author) {
+    if (storedQuote?.author) {
       try {
-        if (!caption.includes(doc.quote.author)) {
-          await bot.telegram.sendMessage(userId, `— ${doc.quote.author}`.slice(0, MESSAGE_TEXT_MAX), { disable_notification: !!opts.disableNotification });
+        if (!caption.includes(storedQuote.author)) {
+          await bot.telegram.sendMessage(userId, `— ${storedQuote.author}`.slice(0, MESSAGE_TEXT_MAX), { disable_notification: !!opts.disableNotification });
         }
       } catch (e) { /* ignore */ }
     }
@@ -405,13 +370,17 @@ export async function processDailyQuoteRetry(bot) {
     const q = await fetchQuoteFromAny(2).catch(()=>null);
     if (q && q.text && !isLikelyHTML(q.text)) {
       let translations = { en: q.text, ru: null, uk: null };
+      // detect and produce sensible translations entries
+      const origLang = detectSimpleLang(q.text);
+      if (origLang === 'ru') { translations = { en: null, ru: q.text, uk: null }; }
+      else { translations = { en: q.text, ru: null, uk: null }; }
       try { const enT = await translateOrNull(q.text, 'en').catch(()=>q.text); translations.en = enT || q.text; } catch {}
       try { const ruT = await translateOrNull(q.text, 'ru').catch(()=>translations.en); translations.ru = ruT || translations.en || q.text; } catch {}
       try { const ukT = await translateOrNull(q.text, 'uk').catch(()=>translations.en); translations.uk = ukT || translations.en || q.text; } catch {}
 
       await dailyMotivationCollection.updateOne(
         { date: dateStr },
-        { $set: { 'quote.original': q.text, 'quote.author': q.author || '', 'quote.source': q.source || '', 'quote.translations': translations } },
+        { $set: { 'quote.original': q.text, 'quote.author': q.author || '', 'quote.source': q.source || '', 'quote.translations': translations, 'quote.originalLang': origLang } },
         { upsert: true }
       );
       await dailyQuoteRetryCollection.deleteOne({ date: dateStr });
