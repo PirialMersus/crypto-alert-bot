@@ -1,5 +1,7 @@
+// src/translate.js
 import { httpGetWithRetry, httpClient } from './httpClient.js';
 const LIBRE_ENDPOINTS = ['https://libretranslate.de/translate', 'https://libretranslate.com/translate'];
+
 async function translateViaGoogle(text, target) {
   if (!text) return null;
   try {
@@ -14,6 +16,7 @@ async function translateViaGoogle(text, target) {
   } catch (e) {}
   return null;
 }
+
 async function translateViaLibre(text, target) {
   if (!text) return null;
   const t = String(target).split('-')[0].toLowerCase();
@@ -24,7 +27,6 @@ async function translateViaLibre(text, target) {
       const cand = d?.translatedText || d?.result || d?.translated_text || (typeof d === 'string' ? d : null);
       if (cand && String(cand).trim()) {
         const s = String(cand).trim();
-        // reject likely HTML pages returned by endpoints
         if (/<\s*html|<!doctype|<meta|<title/i.test(s)) continue;
         return s;
       }
@@ -32,12 +34,14 @@ async function translateViaLibre(text, target) {
   }
   return null;
 }
+
 function containsScript(text, script) {
   if (!text) return false;
   if (script === 'cyrillic') return /\p{Script=Cyrillic}/u.test(text);
   if (script === 'latin') return /\p{Script=Latin}/u.test(text);
   return false;
 }
+
 function normalizePunctuation(s) {
   if (!s) return s;
   let out = s.replace(/\r\n|\r/g, '\n');
@@ -48,6 +52,7 @@ function normalizePunctuation(s) {
   out = out.trim();
   return out;
 }
+
 function humanizeForRu(s) {
   if (!s) return s;
   let out = s;
@@ -61,9 +66,11 @@ function humanizeForRu(s) {
   out = out.charAt(0).toUpperCase() + out.slice(1);
   return out;
 }
+
 function humanizeForUk(s) {
   return humanizeForRu(s);
 }
+
 function humanizeForEn(s) {
   if (!s) return s;
   let out = s;
@@ -72,6 +79,7 @@ function humanizeForEn(s) {
   out = out.charAt(0).toUpperCase() + out.slice(1);
   return out;
 }
+
 function postEditByLang(s, lang) {
   if (!s) return s;
   const t = String(lang).split('-')[0].toLowerCase();
@@ -79,6 +87,7 @@ function postEditByLang(s, lang) {
   if (t === 'uk') return humanizeForUk(s);
   return humanizeForEn(s);
 }
+
 function scoreCandidate(candidate, targetLang, original) {
   if (!candidate) return -9999;
   let score = 0;
@@ -97,11 +106,11 @@ function scoreCandidate(candidate, targetLang, original) {
   score += Math.min(10, punctuationCount);
   return score;
 }
+
 export async function translateOrNull(text, targetLang) {
   if (!text) return null;
   if (!targetLang) return null;
   const t = String(targetLang).split('-')[0].toLowerCase();
-  if (!t || t === 'en') return text;
   let candidates = [];
   try {
     const g = await translateViaGoogle(text, t).catch(()=>null);
