@@ -1,6 +1,6 @@
 // src/alerts.js
 import { ENTRIES_PER_PAGE, BG_CHECK_INTERVAL, DELETE_LABEL_TARGET_LEN } from './constants.js';
-import { alertsCollection, alertsArchiveCollection, usersCollection } from './db.js';
+import { alertsCollection, usersCollection } from './db.js';
 import { tickersCache, pricesCache, allAlertsCache, getUserAlertsCached, getAllAlertsCached, getUserLastViews, setUserLastViews, invalidateUserAlertsCache, getUserAlertsOrder } from './cache.js';
 import { getPriceLevel1 } from './prices.js';
 import { fmtNum, formatChangeWithIcons, padLabel } from './utils.js';
@@ -33,9 +33,11 @@ function t(lang, key, ...vars) {
       status_fired: '✅ Fired',
       status_deleted: '🗑️ Deleted',
       status_info: 'ℹ️ Status',
+      status_label: 'Status',
       time_label: 'Time',
       delete_reason: 'Reason of deletion',
-      fired_price: 'Price when fired'
+      fired_price: 'Price when fired',
+      old_alerts_fetch_error: 'Error fetching old alerts. Please try later.'
     },
     ru: {
       your_alerts_title: '📋 *Твои алерты:*',
@@ -62,9 +64,11 @@ function t(lang, key, ...vars) {
       status_fired: '✅ Сработал',
       status_deleted: '🗑️ Удалён',
       status_info: 'ℹ️ Статус',
+      status_label: 'Статус',
       time_label: 'Время',
       delete_reason: 'Причина удаления',
-      fired_price: 'Цена при срабатывании'
+      fired_price: 'Цена при срабатывании',
+      old_alerts_fetch_error: 'Произошла ошибка при получении старых алертов. Попробуйте позже.'
     }
   };
   const L = isEn ? dict.en : dict.ru;
@@ -86,11 +90,17 @@ export function formatAlertEntry(a, idx, cur, last, lang = 'ru') {
   }
   let changeText = '';
   if (typeof last === 'number' && last > 0 && typeof cur === 'number') {
-    changeText = `\n${t(lang, 'from_last_view')}: ${formatChangeWithIcons(((cur - last)/last)*100)}`;
+    changeText = `
+${t(lang, 'from_last_view')}: ${formatChangeWithIcons(((cur - last)/last)*100)}`;
   }
   const curStr = fmtNum(cur);
   const priceStr = fmtNum(a.price);
-  return `${title}\n${t(lang, 'type_label')}: ${typeLabel}\n${t(lang, 'condition_label')}: ${conditionStr} *${priceStr}*\n${t(lang, 'current_label')}: *${curStr}*${percent}${changeText}\n\n`;
+  return `${title}
+${t(lang, 'type_label')}: ${typeLabel}
+${t(lang, 'condition_label')}: ${conditionStr} *${priceStr}*
+${t(lang, 'current_label')}: *${curStr}*${percent}${changeText}
+
+`;
 }
 
 export function formatConditionShort(a, lang = 'ru') {
@@ -146,7 +156,9 @@ export async function renderAlertsList(userId, options = { fast: false, lang: 'r
 
   const total = entries.length;
   if (total <= ENTRIES_PER_PAGE) {
-    let text = `${t(lang, 'your_alerts_title')}\n\n`;
+    let text = `${t(lang, 'your_alerts_title')}
+
+`;
     for (const e of entries) text += e.text;
     const buttons = [];
     buttons.push([{ text: t(lang, 'delete_menu'), callback_data: `show_delete_menu_0` }]);
@@ -158,7 +170,9 @@ export async function renderAlertsList(userId, options = { fast: false, lang: 'r
 
   const pages = [];
   for (let i = 0; i < entries.length; i += ENTRIES_PER_PAGE) {
-    let text = `${t(lang, 'your_alerts_title')}\n\n`;
+    let text = `${t(lang, 'your_alerts_title')}
+
+`;
     const entryIndexes = [];
     for (let j = i; j < Math.min(i + ENTRIES_PER_PAGE, entries.length); j++) {
       text += entries[j].text;
@@ -168,7 +182,9 @@ export async function renderAlertsList(userId, options = { fast: false, lang: 'r
   }
 
   for (let p = 0; p < pages.length; p++) {
-    pages[p].text = pages[p].text + `${t(lang, 'page', p+1, pages.length)}\n\n`;
+    pages[p].text = pages[p].text + `${t(lang, 'page', p+1, pages.length)}
+
+`;
     const rows = [];
     const nav = [];
     if (p > 0) nav.push({ text: t(lang, 'prev'), callback_data: `alerts_page_${p-1}_view` });
@@ -230,9 +246,13 @@ export async function buildDeleteInlineForUser(userId, opts = { fast: false, sou
 
   for (const e of pageEntries) {
     const cond = formatConditionShort(e.alert, lang);
-    const raw = `${t(lang, 'delete_menu').replace('№ ...', `${e.index+1}`)}: ${e.symbol} — ${cond}`;
+    const arrow = e.alert.condition === '>' ? '⬆' : '⬇';
+    const priceVal = (typeof e.alert.price === 'number') ? fmtNum(e.alert.price) : cond;
+    let raw = `❌ ${e.index+1}. ${e.symbol} ${arrow} ${priceVal}`;
+    const MAX_BTN = 30;
+    if (raw.length > MAX_BTN) raw = raw.slice(0, MAX_BTN - 1) + '…';
     const pageToken = (opts.sourcePage === null) ? 'all' : String(opts.sourcePage);
-    inline.push([{ text: padLabel(raw, Math.max(DELETE_LABEL_TARGET_LEN || 30, 28)), callback_data: `del_${e.id}_p${pageToken}` }]);
+    inline.push([{ text: raw, callback_data: `del_${e.id}_p${pageToken}` }]);
   }
 
   if (typeof opts.sourcePage === 'number' && typeof opts.totalPages === 'number' && opts.totalPages > 1) {
@@ -259,66 +279,86 @@ export async function buildDeleteInlineForUser(userId, opts = { fast: false, sou
 
 export async function renderOldAlertsList(userId, opts = { days: 30, symbol: null, token: 'd30_q', lang: 'ru' }) {
   const lang = opts.lang || 'ru';
-  const days = (opts && Number.isFinite(opts.days)) ? Math.max(1, Math.floor(opts.days)) : 30;
-  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
-
-  const q = { userId, $or: [ { firedAt: { $exists: true } }, { deletedAt: { $exists: true } } ] };
-  q.$and = [{ createdAt: { $gte: since } }];
-
-  if (opts && opts.symbol) {
-    const sym = String(opts.symbol).toUpperCase();
-    q.$and.push({ $or: [{ symbol: sym }, { symbol: `${sym}-USDT` }] });
-  }
-
-  let docs = [];
   try {
-    docs = await alertsArchiveCollection.find(q, { sort: { firedAt: -1, deletedAt: -1, createdAt: -1 } }).toArray();
-  } catch (e) {
-    docs = [];
-  }
+    const days = (opts && Number.isFinite(opts.days)) ? Math.max(1, Math.floor(opts.days)) : 30;
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 
-  if (!docs || !docs.length) {
-    const text = t(lang, 'no_old_alerts', opts && opts.symbol ? String(opts.symbol).toUpperCase() : null);
-    const buttons = [[{ text: t(lang, 'back'), callback_data: 'back_to_main' }]];
-    return { pages: [{ text, buttons }], pageCount: 1 };
-  }
+    const q = { userId, $or: [ { firedAt: { $exists: true } }, { deletedAt: { $exists: true } } ] };
+    q.$and = [{ $or: [ { firedAt: { $gte: since } }, { deletedAt: { $gte: since } }, { createdAt: { $gte: since } } ] }];
 
-  const entries = docs.map((d, idx) => {
-    const status = d.firedAt ? t(lang, 'status_fired') : (d.deletedAt ? t(lang, 'status_deleted') : t(lang, 'status_info'));
-    const when = d.firedAt ? d.firedAt : (d.deletedAt ? d.deletedAt : d.createdAt);
-    const priceStr = fmtNum(d.price);
-    const symbol = d.symbol;
-    const byType = d.type === 'sl' ? t(lang, 'type_sl') : t(lang, 'type_alert');
-    const reason = d.deleteReason ? `\n${t(lang, 'delete_reason')}: ${d.deleteReason}` : '';
-    const firedInfo = d.firedPrice ? `\n${t(lang, 'fired_price')}: *${fmtNum(d.firedPrice)}*` : '';
-    const txt = `*${idx+1}. ${symbol}* — ${byType}\n${t(lang, 'condition_label')}: ${d.condition === '>' ? t(lang, 'condition_above') : t(lang, 'condition_below')} *${priceStr}*\nСтатус: ${status}\n${t(lang, 'time_label')}: ${new Date(when).toLocaleString() || ''}${firedInfo}${reason}\n\n`;
-    return { text: txt, id: d._id?.toString?.() || `arch_${idx}` };
-  });
-
-  const pages = [];
-  for (let i = 0; i < entries.length; i += ENTRIES_PER_PAGE) {
-    let text = `${t(lang, 'old_alerts_title')}\n\n`;
-    const entryIndexes = [];
-    for (let j = i; j < Math.min(i + ENTRIES_PER_PAGE, entries.length); j++) {
-      text += entries[j].text;
-      entryIndexes.push(j);
+    if (opts && opts.symbol) {
+      const sym = String(opts.symbol).toUpperCase();
+      q.$and.push({ $or: [{ symbol: sym }, { symbol: `${sym}-USDT` }] });
     }
-    pages.push({ text, entryIndexes, buttons: [] });
-  }
 
-  for (let p = 0; p < pages.length; p++) {
-    pages[p].text = pages[p].text + `${t(lang, 'page', p+1, pages.length)}\n\n`;
-    const rows = [];
-    const nav = [];
-    const token = opts && opts.token ? opts.token : `d${days}_q${opts && opts.symbol ? encodeURIComponent(String(opts.symbol)) : ''}`;
-    if (p > 0) nav.push({ text: t(lang, 'prev'), callback_data: `old_alerts_page_${p-1}_view_${token}` });
-    if (p < pages.length - 1) nav.push({ text: t(lang, 'next'), callback_data: `old_alerts_page_${p+1}_view_${token}` });
-    if (nav.length) rows.push(nav);
-    rows.push([{ text: t(lang, 'back'), callback_data: 'back_to_main' }]);
-    pages[p].buttons = rows;
-  }
+    let docs = [];
+    try {
+      const { alertsArchiveCollection } = await import('./db.js');
+      const cursor = alertsArchiveCollection.find(q).sort({ firedAt: -1, deletedAt: -1, createdAt: -1 });
+      docs = await cursor.toArray();
+    } catch (e) {
+      docs = [];
+    }
 
-  return { pages, pageCount: pages.length };
+    if (!docs || !docs.length) {
+      const text = t(lang, 'no_old_alerts', opts && opts.symbol ? String(opts.symbol).toUpperCase() : null);
+      const buttons = [[{ text: t(lang, 'back'), callback_data: 'back_to_main' }]];
+      return { pages: [{ text, buttons }], pageCount: 1 };
+    }
+
+    const entries = docs.map((d, idx) => {
+      const status = d.firedAt ? t(lang, 'status_fired') : (d.deletedAt ? t(lang, 'status_deleted') : t(lang, 'status_info'));
+      const when = d.firedAt ? d.firedAt : (d.deletedAt ? d.deletedAt : d.createdAt);
+      const priceStr = fmtNum(d.price);
+      const symbol = d.symbol;
+      const byType = d.type === 'sl' ? t(lang, 'type_sl') : t(lang, 'type_alert');
+      const reason = d.deleteReason ? `
+${t(lang, 'delete_reason')}: ${d.deleteReason}` : '';
+      const firedInfo = d.firedPrice ? `
+${t(lang, 'fired_price')}: *${fmtNum(d.firedPrice)}*` : '';
+      const timeLabel = t(lang, 'time_label');
+      const statusLabel = t(lang, 'status_label');
+      const whenStr = when ? new Date(when).toLocaleString() : '';
+      const txt = `*${idx+1}. ${symbol}* — ${byType}
+${t(lang, 'condition_label')}: ${d.condition === '>' ? t(lang, 'condition_above') : t(lang, 'condition_below')} *${priceStr}*
+${statusLabel}: ${status}
+${timeLabel}: ${whenStr}${firedInfo}${reason}
+
+`;
+      return { text: txt, id: d._id?.toString?.() || `arch_${idx}` };
+    });
+
+    const pages = [];
+    for (let i = 0; i < entries.length; i += ENTRIES_PER_PAGE) {
+      let text = `${t(lang, 'old_alerts_title')}
+
+`;
+      const entryIndexes = [];
+      for (let j = i; j < Math.min(i + ENTRIES_PER_PAGE, entries.length); j++) {
+        text += entries[j].text;
+        entryIndexes.push(j);
+      }
+      pages.push({ text, entryIndexes, buttons: [] });
+    }
+
+    for (let p = 0; p < pages.length; p++) {
+      pages[p].text = pages[p].text + `${t(lang, 'page', p+1, pages.length)}
+
+`;
+      const rows = [];
+      const nav = [];
+      const token = opts && opts.token ? opts.token : `d${days}_q${opts && opts.symbol ? encodeURIComponent(String(opts.symbol)) : ''}`;
+      if (p > 0) nav.push({ text: t(lang, 'prev'), callback_data: `old_alerts_page_${p-1}_view_${token}` });
+      if (p < pages.length - 1) nav.push({ text: t(lang, 'next'), callback_data: `old_alerts_page_${p+1}_view_${token}` });
+      if (nav.length) rows.push(nav);
+      rows.push([{ text: t(lang, 'back'), callback_data: 'back_to_main' }]);
+      pages[p].buttons = rows;
+    }
+
+    return { pages, pageCount: pages.length };
+  } catch (e) {
+    return { pages: [{ text: t(opts.lang || 'ru', 'old_alerts_fetch_error'), buttons: [[{ text: t(opts.lang || 'ru', 'back'), callback_data: 'back_to_main' }]] }], pageCount: 1 };
+  }
 }
 
 export function startAlertsChecker(bot) {
@@ -349,7 +389,10 @@ export function startAlertsChecker(bot) {
         if (!Number.isFinite(cur)) continue;
         if ((a.condition === '>' && cur > a.price) || (a.condition === '<' && cur < a.price)) {
           const isSL = a.type === 'sl';
-          const text = `${isSL ? '🛑 *Сработал стоп-лосс!*' : '🔔 *Сработал алерт!*'}\nМонета: *${a.symbol}*\nЦена сейчас: *${fmtNum(cur)}*\nУсловие: ${a.condition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${fmtNum(a.price)}*`;
+          const text = `${isSL ? '🛑 *Сработал стоп-лосс!*' : '🔔 *Сработал алерт!*'}
+Монета: *${a.symbol}*
+Цена сейчас: *${fmtNum(cur)}*
+Условие: ${a.condition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${fmtNum(a.price)}*`;
           try {
             await bot.telegram.sendMessage(a.userId, text, { parse_mode: 'Markdown' });
             try {
