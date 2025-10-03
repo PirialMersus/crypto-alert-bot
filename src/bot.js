@@ -19,8 +19,8 @@ import {
   resolveUserLang
 } from './cache.js';
 import { fmtNum } from './utils.js';
-import { sendDailyToUser, fetchAndStoreDailyMotivation } from './daily.js';
-import { CACHE_TTL, INACTIVE_DAYS, DAY_MS, IMAGE_FETCH_HOUR, PREPARE_SEND_HOUR, RETRY_INTERVAL_MS } from './constants.js';
+import { sendDailyToUser, processDailyQuoteRetry, watchForNewQuotes, fetchAndStoreDailyMotivation } from './daily.js';
+import { CACHE_TTL, INACTIVE_DAYS, DAY_MS, IMAGE_FETCH_HOUR, PREPARE_SEND_HOUR } from './constants.js';
 
 dotenv.config();
 
@@ -58,7 +58,11 @@ function getMainMenuSync(userId, lang = 'ru') {
   const motivate = isEn ? '🌅 Send motivation' : '🌅 Прислать мотивацию';
   const stats = isEn ? '👥 Active users' : '👥 Количество активных пользователей';
   const support = isEn ? 'Wishes/Support' : 'Пожелания/техподдержка';
-  const kb = [[{ text: create }, { text: my }], [{ text: settings }], [{ text: support }], [{ text: old }, { text: search }]];
+  const kb = [
+    [{ text: create }, { text: my }],
+    [{ text: old }, { text: search }],
+    [{ text: support }, { text: settings }]
+  ];
   if (CREATOR_ID && String(userId) === String(CREATOR_ID)) {
     kb.push([{ text: motivate }], [{ text: stats }]);
   }
@@ -284,6 +288,7 @@ bot.on('callback_query', async (ctx) => {
 
     const lang = await resolveUserLang(ctx.from.id);
 
+    // back to main (settings) handler
     if (data === 'back_to_main') {
       try {
         await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
@@ -430,6 +435,40 @@ bot.on('callback_query', async (ctx) => {
         const inline = await buildSettingsInlineForUser(ctx.from.id);
         try { await ctx.editMessageReplyMarkup(inline); } catch {}
       } catch (e) {}
+      await ctx.answerCbQuery();
+      return;
+    }
+
+    // confirmation for clearing all old alerts
+    if (data === 'clear_old_alerts_confirm') {
+      const isEn = String(lang).split('-')[0] === 'en';
+      const text = isEn ? 'Are you sure?' : 'Вы уверены?';
+      const inline = { inline_keyboard: [[
+          { text: isEn ? 'Yes' : 'Да', callback_data: 'clear_old_alerts_yes' },
+          { text: isEn ? 'No' : 'Нет', callback_data: 'clear_old_alerts_no' }
+        ]]};
+      try { await ctx.editMessageText(text, { reply_markup: inline }); } catch (e) { try { await ctx.reply(text, { reply_markup: inline }); } catch {} }
+      await ctx.answerCbQuery();
+      return;
+    }
+
+    if (data === 'clear_old_alerts_no') {
+      try { await ctx.editMessageReplyMarkup({ inline_keyboard: [] }); } catch (e) {}
+      await ctx.answerCbQuery();
+      return;
+    }
+
+    if (data === 'clear_old_alerts_yes') {
+      const isEn = String(lang).split('-')[0] === 'en';
+      try {
+        const alertsMod = await import('./alerts.js');
+        const res = await alertsMod.clearUserOldAlerts(ctx.from.id, { forceAll: true });
+        const deleted = res?.deletedCount || 0;
+        const msg = deleted ? (isEn ? `Deleted ${deleted} items.` : `Удалено ${deleted} записей.`) : (isEn ? 'No old alerts to delete.' : 'Нет старых алертов для удаления.');
+        try { await ctx.editMessageText(msg, { reply_markup: { inline_keyboard: [] } }); } catch (e) { try { await ctx.reply(msg); } catch {} }
+      } catch (e) {
+        try { await ctx.answerCbQuery('Error'); } catch {}
+      }
       await ctx.answerCbQuery();
       return;
     }
@@ -820,14 +859,14 @@ export async function startBot() {
   const app = createServer();
   const PORT = process.env.PORT || 3000;
   const server = app.listen(PORT, () => console.log(`HTTP server on ${PORT}`));
+  setInterval(() => processDailyQuoteRetry(bot), 60_000);
+  setInterval(() => watchForNewQuotes(bot), 30_000);
 
   const dateStrNow = new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Kyiv' });
   try { await fetchAndStoreDailyMotivation(dateStrNow).catch(()=>{}); } catch (e) {}
 
   let lastFetchDay = null;
   let lastPrepareDay = null;
-  let dailyRetryTimer = null;
-  let dailyRetryDay = null;
 
   setInterval(async () => {
     try {
@@ -836,66 +875,18 @@ export async function startBot() {
       const hour = kyivNow.getHours();
 
       if (day !== lastFetchDay && hour === IMAGE_FETCH_HOUR) {
+        try { await fetchAndStoreDailyMotivation(day, { force: true }); } catch (e) {}
         lastFetchDay = day;
-
-        try {
-          await fetchAndStoreDailyMotivation(day, { force: true });
-        } catch (e) {}
-
-        if (dailyRetryTimer) {
-          clearInterval(dailyRetryTimer);
-          dailyRetryTimer = null;
-          dailyRetryDay = null;
-        }
-
-        dailyRetryDay = day;
-        dailyRetryTimer = setInterval(async () => {
-          try {
-            const nowK = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Kyiv' }));
-            const nowHour = nowK.getHours();
-            if (nowHour >= PREPARE_SEND_HOUR) {
-              clearInterval(dailyRetryTimer);
-              dailyRetryTimer = null;
-              dailyRetryDay = null;
-              return;
-            }
-
-            try {
-              await fetchAndStoreDailyMotivation(day, { force: true }).catch(()=>{});
-            } catch (e) {}
-
-            try {
-              const { dailyMotivationCollection } = await import('./db.js');
-              const doc = await dailyMotivationCollection.findOne({ date: day }).catch(()=>null);
-              const hasQuote = !!(doc && doc.quote && (doc.quote.original || (doc.quote.translations && (doc.quote.translations.en || doc.quote.translations.ru))));
-              const hasImage = !!(doc && doc.image && doc.image.url);
-              if (hasQuote && hasImage) {
-                clearInterval(dailyRetryTimer);
-                dailyRetryTimer = null;
-                dailyRetryDay = null;
-              }
-            } catch (e) {}
-
-          } catch (e) {}
-        }, RETRY_INTERVAL_MS);
       }
 
       if (day !== lastPrepareDay && hour === PREPARE_SEND_HOUR) {
+        try { await fetchAndStoreDailyMotivation(day, { force: false }); } catch (e) {}
         lastPrepareDay = day;
 
-        if (dailyRetryTimer) {
-          clearInterval(dailyRetryTimer);
-          dailyRetryTimer = null;
-          dailyRetryDay = null;
-        }
-
         try {
-          await fetchAndStoreDailyMotivation(day, { force: false }).catch(()=>{});
-        } catch (e) {}
-
-        try {
+          const dateStr = day;
           const { usersCollection, pendingDailySendsCollection } = await import('./db.js');
-          const already = await pendingDailySendsCollection.find({ date: day, sent: true }, { projection: { userId: 1 } }).toArray();
+          const already = await pendingDailySendsCollection.find({ date: dateStr, sent: true }, { projection: { userId: 1 } }).toArray();
           const sentSet = new Set((already || []).map(r => r.userId));
           const cursor = usersCollection.find({}, { projection: { userId: 1 } });
           const BATCH = 20;
@@ -909,8 +900,8 @@ export async function startBot() {
             if (batch.length >= BATCH) {
               await Promise.all(batch.map(async (targetId) => {
                 try {
-                  const ok = await sendDailyToUser(bot, targetId, day, { disableNotification: false, forceRefresh: false }).catch(()=>false);
-                  await pendingDailySendsCollection.updateOne({ userId: targetId, date: day }, { $set: { sent: !!ok, sentAt: ok ? new Date() : null, quoteSent: !!ok, permanentFail: !ok } }, { upsert: true });
+                  const ok = await sendDailyToUser(bot, targetId, dateStr, { disableNotification: false, forceRefresh: false }).catch(()=>false);
+                  await pendingDailySendsCollection.updateOne({ userId: targetId, date: dateStr }, { $set: { sent: !!ok, sentAt: ok ? new Date() : null, quoteSent: !!ok, permanentFail: !ok } }, { upsert: true });
                 } catch (e) {}
               }));
               batch = [];
@@ -919,14 +910,13 @@ export async function startBot() {
           if (batch.length) {
             await Promise.all(batch.map(async (targetId) => {
               try {
-                const ok = await sendDailyToUser(bot, targetId, day, { disableNotification: false, forceRefresh: false }).catch(()=>false);
-                await pendingDailySendsCollection.updateOne({ userId: targetId, date: day }, { $set: { sent: !!ok, sentAt: ok ? new Date() : null, quoteSent: !!ok, permanentFail: !ok } }, { upsert: true });
+                const ok = await sendDailyToUser(bot, targetId, dateStr, { disableNotification: false, forceRefresh: false }).catch(()=>false);
+                await pendingDailySendsCollection.updateOne({ userId: targetId, date: dateStr }, { $set: { sent: !!ok, sentAt: ok ? new Date() : null, quoteSent: !!ok, permanentFail: !ok } }, { upsert: true });
               } catch (e) {}
             }));
           }
         } catch (e) {}
       }
-
     } catch (e) {}
   }, 60_000);
 

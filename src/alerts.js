@@ -4,6 +4,7 @@ import { alertsCollection, usersCollection } from './db.js';
 import { tickersCache, pricesCache, allAlertsCache, getUserAlertsCached, getAllAlertsCached, getUserLastViews, setUserLastViews, invalidateUserAlertsCache, getUserAlertsOrder } from './cache.js';
 import { getPriceLevel1 } from './prices.js';
 import { fmtNum, formatChangeWithIcons, padLabel } from './utils.js';
+import { resolveUserLang } from './cache.js';
 
 function t(lang, key, ...vars) {
   const isEn = String(lang || '').split('-')[0] === 'en';
@@ -37,7 +38,14 @@ function t(lang, key, ...vars) {
       time_label: 'Time',
       delete_reason: 'Reason of deletion',
       fired_price: 'Price when fired',
-      old_alerts_fetch_error: 'Error fetching old alerts. Please try later.'
+      old_alerts_fetch_error: 'Error fetching old alerts. Please try later.',
+      alert_fired_header: '🔔 *Alert fired!*',
+      sl_fired_header: '🛑 *Stop-loss fired!*',
+      coin_label: 'Coin',
+      price_now: 'Current price',
+      condition_above_short: 'above',
+      condition_below_short: 'below',
+      delete_all_old: '🗑️ Delete all old alerts'
     },
     ru: {
       your_alerts_title: '📋 *Твои алерты:*',
@@ -68,7 +76,14 @@ function t(lang, key, ...vars) {
       time_label: 'Время',
       delete_reason: 'Причина удаления',
       fired_price: 'Цена при срабатывании',
-      old_alerts_fetch_error: 'Произошла ошибка при получении старых алертов. Попробуйте позже.'
+      old_alerts_fetch_error: 'Произошла ошибка при получении старых алертов. Попробуйте позже.',
+      alert_fired_header: '🔔 *Сработал алерт!*',
+      sl_fired_header: '🛑 *Сработал стоп-лосс!*',
+      coin_label: 'Монета',
+      price_now: 'Цена сейчас',
+      condition_above_short: 'выше',
+      condition_below_short: 'ниже',
+      delete_all_old: '🗑️ Удалить все старые алерты'
     }
   };
   const L = isEn ? dict.en : dict.ru;
@@ -351,6 +366,8 @@ ${timeLabel}: ${whenStr}${firedInfo}${reason}
       if (p > 0) nav.push({ text: t(lang, 'prev'), callback_data: `old_alerts_page_${p-1}_view_${token}` });
       if (p < pages.length - 1) nav.push({ text: t(lang, 'next'), callback_data: `old_alerts_page_${p+1}_view_${token}` });
       if (nav.length) rows.push(nav);
+      // delete all old alerts inline button
+      rows.push([{ text: t(lang, 'delete_all_old'), callback_data: 'clear_old_alerts_confirm' }]);
       rows.push([{ text: t(lang, 'back'), callback_data: 'back_to_main' }]);
       pages[p].buttons = rows;
     }
@@ -358,6 +375,29 @@ ${timeLabel}: ${whenStr}${firedInfo}${reason}
     return { pages, pageCount: pages.length };
   } catch (e) {
     return { pages: [{ text: t(opts.lang || 'ru', 'old_alerts_fetch_error'), buttons: [[{ text: t(opts.lang || 'ru', 'back'), callback_data: 'back_to_main' }]] }], pageCount: 1 };
+  }
+}
+
+export async function clearUserOldAlerts(userId, opts = { days: 90, forceAll: false }) {
+  try {
+    const { alertsArchiveCollection } = await import('./db.js');
+    if (opts && opts.forceAll) {
+      const res = await alertsArchiveCollection.deleteMany({ userId });
+      return { deletedCount: res?.deletedCount || 0 };
+    } else {
+      const days = (opts && Number.isFinite(opts.days)) ? Math.max(1, Math.floor(opts.days)) : 90;
+      const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+      const q = { userId, $or: [
+          { firedAt: { $exists: true, $lt: cutoff } },
+          { deletedAt: { $exists: true, $lt: cutoff } },
+          { createdAt: { $exists: true, $lt: cutoff } }
+        ] };
+      const res = await alertsArchiveCollection.deleteMany(q);
+      return { deletedCount: res?.deletedCount || 0 };
+    }
+  } catch (e) {
+    console.error('clearUserOldAlerts error', e?.message || e);
+    return { deletedCount: 0, error: String(e) };
   }
 }
 
@@ -389,13 +429,19 @@ export function startAlertsChecker(bot) {
         if (!Number.isFinite(cur)) continue;
         if ((a.condition === '>' && cur > a.price) || (a.condition === '<' && cur < a.price)) {
           const isSL = a.type === 'sl';
-          const text = `${isSL ? '🛑 *Сработал стоп-лосс!*' : '🔔 *Сработал алерт!*'}
-Монета: *${a.symbol}*
-Цена сейчас: *${fmtNum(cur)}*
-Условие: ${a.condition === '>' ? '⬆️ выше' : '⬇️ ниже'} *${fmtNum(a.price)}*`;
+          const lang = await resolveUserLang(a.userId).catch(()=> 'ru');
+          const header = isSL ? t(lang, 'sl_fired_header') : t(lang, 'alert_fired_header');
+          const coinLabel = t(lang, 'coin_label');
+          const priceNow = t(lang, 'price_now');
+          const cond = a.condition === '>' ? t(lang, 'condition_above_short') : t(lang, 'condition_below_short');
+          const text = `${header}
+${coinLabel}: *${a.symbol}*
+${priceNow}: *${fmtNum(cur)}*
+${t(lang, 'condition_label')}: ${a.condition === '>' ? t(lang, 'condition_above') : t(lang, 'condition_below')} *${fmtNum(a.price)}*`;
           try {
             await bot.telegram.sendMessage(a.userId, text, { parse_mode: 'Markdown' });
             try {
+              const { alertsArchiveCollection } = await import('./db.js');
               await alertsArchiveCollection.insertOne({
                 ...a,
                 firedAt: new Date(),
@@ -412,9 +458,11 @@ export function startAlertsChecker(bot) {
               const description = err?.response?.description || String(err?.message || err);
               if (code === 403 || /bot was blocked/i.test(description)) {
                 try {
+                  const { usersCollection } = await import('./db.js');
                   await usersCollection.updateOne({ userId: a.userId }, { $set: { botBlocked: true, botBlockedAt: new Date() } }, { upsert: true });
                 } catch (e) {}
                 try {
+                  const { alertsArchiveCollection } = await import('./db.js');
                   await alertsArchiveCollection.insertOne({
                     ...a,
                     archivedAt: new Date(),
