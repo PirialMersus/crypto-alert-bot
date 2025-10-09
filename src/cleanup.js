@@ -26,6 +26,10 @@ function normalizeUserIdVariants(userId) {
 
 export async function removeInactive() {
   try {
+    if (!usersCollection || !alertsCollection) {
+      console.warn('removeInactive: mongo not connected, skipping');
+      return;
+    }
     const cutoff30 = new Date(Date.now() - INACTIVE_DAYS * DAY_MS);
     const cutoff90 = new Date(Date.now() - 90 * DAY_MS);
     const cursor = usersCollection.find({ lastActive: { $lt: cutoff30 } }, { projection: { userId: 1, lastActive: 1 } });
@@ -48,16 +52,16 @@ export async function removeInactive() {
       try {
         try {
           const docs = await alertsCollection.find({ userId: { $in: batch } }).toArray();
-          if (docs && docs.length) {
+          if (docs && docs.length && alertsArchiveCollection) {
             const archived = docs.map(d => ({ ...d, deletedAt: new Date(), deleteReason: 'user_inactive_cleanup', archivedAt: new Date() }));
             await alertsArchiveCollection.insertMany(archived).catch(()=>{});
           }
         } catch (e) { console.warn('archive during cleanup failed', e?.message || e); }
 
         await alertsCollection.deleteMany({ userId: { $in: batch } }).catch(()=>{});
-        await lastViewsCollection.deleteMany({ userId: { $in: batch } }).catch(()=>{});
-        await pendingDailySendsCollection.deleteMany({ userId: { $in: batch } }).catch(()=>{});
-        await dailyQuoteRetryCollection.deleteMany({ userId: { $in: batch } }).catch(()=>{});
+        if (lastViewsCollection) await lastViewsCollection.deleteMany({ userId: { $in: batch } }).catch(()=>{});
+        if (pendingDailySendsCollection) await pendingDailySendsCollection.deleteMany({ userId: { $in: batch } }).catch(()=>{});
+        if (dailyQuoteRetryCollection) await dailyQuoteRetryCollection.deleteMany({ userId: { $in: batch } }).catch(()=>{});
         await usersCollection.deleteMany({ userId: { $in: batch } }).catch(()=>{});
         for (const uid of batch) { try { invalidateUserAlertsCache(uid); } catch (e) {} }
       } catch (e) { console.error('removeInactive: batch deletion error', e?.message || e); }
@@ -67,6 +71,10 @@ export async function removeInactive() {
 
 export async function purgeAlertsOlderThanDays(days = 90) {
   try {
+    if (!alertsArchiveCollection) {
+      console.warn('purgeAlertsOlderThanDays: mongo not connected, skipping');
+      return { deletedFromArchive: 0, archivedAndDeletedActive: 0 };
+    }
     const cutoff = new Date(Date.now() - (Number(days) || 90) * DAY_MS);
 
     const allCandidates = await alertsArchiveCollection.find({}).project({ _id: 1, firedAt: 1, deletedAt: 1, createdAt: 1 }).toArray();
@@ -83,9 +91,10 @@ export async function purgeAlertsOlderThanDays(days = 90) {
     }
 
     const activeQ = { createdAt: { $lt: cutoff } };
+    if (!alertsCollection) return { deletedFromArchive, archivedAndDeletedActive: 0 };
     const activeDocs = await alertsCollection.find(activeQ).toArray();
     let archivedAndDeletedActive = 0;
-    if (activeDocs && activeDocs.length) {
+    if (activeDocs && activeDocs.length && alertsArchiveCollection) {
       const archived = activeDocs.map(d => ({ ...d, deletedAt: new Date(), deleteReason: 'auto_purge', archivedAt: new Date() }));
       await alertsArchiveCollection.insertMany(archived).catch(()=>{});
       const r = await alertsCollection.deleteMany(activeQ).catch(()=>({ deletedCount: 0 }));
@@ -106,10 +115,14 @@ export async function purgeAlertsOlderThanDays(days = 90) {
 
 export async function clearUserOldAlerts(userId, days = 30) {
   try {
+    if (!alertsArchiveCollection && !alertsCollection) {
+      console.warn('clearUserOldAlerts: mongo not connected, skipping');
+      return { archivedActive: 0, deletedFromArchive: 0, checkedArchiveCandidates: 0 };
+    }
     const cutoff = new Date(Date.now() - (Number(days) || 30) * DAY_MS);
     const userVariants = normalizeUserIdVariants(userId);
 
-    const archCandidates = await alertsArchiveCollection.find({ userId: { $in: userVariants } }).project({ _id: 1, firedAt: 1, deletedAt: 1, createdAt: 1, userId: 1 }).toArray();
+    const archCandidates = alertsArchiveCollection ? await alertsArchiveCollection.find({ userId: { $in: userVariants } }).project({ _id: 1, firedAt: 1, deletedAt: 1, createdAt: 1, userId: 1 }).toArray() : [];
 
     const toDeleteArchiveIds = [];
     for (const d of archCandidates) {
@@ -119,22 +132,22 @@ export async function clearUserOldAlerts(userId, days = 30) {
     }
 
     let deletedArchiveCount = 0;
-    if (toDeleteArchiveIds.length) {
+    if (toDeleteArchiveIds.length && alertsArchiveCollection) {
       const delRes = await alertsArchiveCollection.deleteMany({ _id: { $in: toDeleteArchiveIds } });
       deletedArchiveCount = delRes?.deletedCount || toDeleteArchiveIds.length;
     }
 
     const activeQ = { userId: { $in: userVariants }, createdAt: { $lt: cutoff } };
-    const activeDocs = await alertsCollection.find(activeQ).toArray();
+    const activeDocs = alertsCollection ? await alertsCollection.find(activeQ).toArray() : [];
     let archivedActiveCount = 0;
-    if (activeDocs && activeDocs.length) {
+    if (activeDocs && activeDocs.length && alertsArchiveCollection) {
       const archivedDocs = activeDocs.map(d => ({ ...d, deletedAt: new Date(), deleteReason: 'user_cleared_old', archivedAt: new Date() }));
       await alertsArchiveCollection.insertMany(archivedDocs, { ordered: false }).catch(()=>{});
       const r = await alertsCollection.deleteMany(activeQ).catch(()=>({ deletedCount: 0 }));
       archivedActiveCount = r?.deletedCount || archivedDocs.length;
     }
 
-    try { await lastViewsCollection.deleteMany({ userId: { $in: userVariants } }); } catch (e) {}
+    try { if (lastViewsCollection) await lastViewsCollection.deleteMany({ userId: { $in: userVariants } }); } catch (e) {}
     try { invalidateUserAlertsCache(userId); } catch (e) {}
 
     return { archivedActive: archivedActiveCount, deletedFromArchive: deletedArchiveCount, checkedArchiveCandidates: archCandidates.length };
@@ -146,6 +159,10 @@ export async function clearUserOldAlerts(userId, days = 30) {
 
 export async function deleteAllUserArchived(userId) {
   try {
+    if (!alertsArchiveCollection) {
+      console.warn('deleteAllUserArchived: mongo not connected, skipping');
+      return { deleted: 0 };
+    }
     const ids = new Set();
     ids.add(userId);
     try { ids.add(String(userId)); } catch (e) {}
@@ -155,7 +172,7 @@ export async function deleteAllUserArchived(userId) {
     const toDel = candidates.map(d => d._id);
     if (!toDel.length) return { deleted: 0 };
     const res = await alertsArchiveCollection.deleteMany({ _id: { $in: toDel } });
-    try { await lastViewsCollection.deleteMany({ userId: { $in: variants } }); } catch (e) {}
+    try { if (lastViewsCollection) await lastViewsCollection.deleteMany({ userId: { $in: variants } }); } catch (e) {}
     try { invalidateUserAlertsCache(userId); } catch (e) {}
     try { const cacheMod = await import('./cache.js').catch(()=>null); if (cacheMod && cacheMod.allAlertsCache) cacheMod.allAlertsCache.time = 0; } catch (e) {}
     return { deleted: res?.deletedCount || toDel.length };

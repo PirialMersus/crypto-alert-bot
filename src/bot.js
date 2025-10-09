@@ -1,7 +1,7 @@
 // src/bot.js
 import { Telegraf, session } from 'telegraf';
 import dotenv from 'dotenv';
-import { connectToMongo, ObjectId, countDocumentsWithTimeout } from './db.js';
+import { connectToMongo, ObjectId, countDocumentsWithTimeout, dbEvents, isDbConnected } from './db.js';
 import { createServer } from './server.js';
 import { startTickersRefresher, refreshAllTickers, getCachedPrice } from './prices.js';
 import { startAlertsChecker, renderAlertsList, buildDeleteInlineForUser, renderOldAlertsList } from './alerts.js';
@@ -18,10 +18,10 @@ import {
   setUserAlertLimit,
   resolveUserLang
 } from './cache.js';
-import { fmtNum } from './utils.js';
-import { sendDailyToUser, processDailyQuoteRetry, watchForNewQuotes, fetchAndStoreDailyMotivation } from './daily.js';
-import { CACHE_TTL, INACTIVE_DAYS, DAY_MS, IMAGE_FETCH_HOUR, PREPARE_SEND_HOUR } from './constants.js';
-
+import { fmtNum, safeSendTelegram } from './utils.js';
+import { sendDailyToUser, processDailyQuoteRetry, watchForNewQuotes, fetchAndStoreDailyMotivation, ensureDailyImageBuffer } from './daily.js';
+import { CACHE_TTL, INACTIVE_DAYS, DAY_MS, IMAGE_FETCH_HOUR, PREPARE_SEND_HOUR, ENTRIES_PER_PAGE } from './constants.js';
+import { setLastHeartbeat } from './monitor.js';
 dotenv.config();
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -57,7 +57,7 @@ function getMainMenuSync(userId, lang = 'ru') {
   const search = isEn ? '🔎 Search old alerts' : '🔎 Поиск старых алертов';
   const motivate = isEn ? '🌅 Send motivation' : '🌅 Прислать мотивацию';
   const stats = isEn ? '👥 Active users' : '👥 Количество активных пользователей';
-  const support = isEn ? 'Wishes/Support' : 'Пожелания/техподдержка';
+  const support = isEn ? '🛠️ Support/wishes' : '🛠️ Техподдержка/пожелания';
   const kb = [
     [{ text: create }, { text: my }],
     [{ text: old }, { text: search }],
@@ -116,7 +116,47 @@ function buildAskSlKeyboard(lang) {
   }
 }
 
-dotenv.config();
+function inlineKeyboardSafe(buttonRows) {
+  const CALLBACK_DATA_LIMIT = 64;
+  if (!Array.isArray(buttonRows)) return null;
+  for (const row of buttonRows) {
+    for (const btn of row) {
+      const cd = String(btn.callback_data || '');
+      if (cd.length > CALLBACK_DATA_LIMIT - 4) return null;
+    }
+  }
+  return buttonRows;
+}
+
+async function safeCtxReply(ctx, text, opts = {}) {
+  try {
+    return await ctx.reply(text, opts);
+  } catch (e) {
+    try {
+      const chatId = ctx.chat?.id || ctx.from?.id;
+      return await safeSendTelegram(bot, 'sendMessage', [chatId, text, opts]);
+    } catch (err) {
+      console.error('safeCtxReply failed', err?.message || err, { text, opts });
+      throw err;
+    }
+  }
+}
+
+function adminNotify(text, opts = {}) {
+  if (!CREATOR_ID) return Promise.resolve();
+  return safeSendTelegram(bot, 'sendMessage', [CREATOR_ID, text, { parse_mode: 'Markdown', ...opts }]).catch((e) => {
+    console.warn('adminNotify failed', e?.message || e);
+  });
+}
+
+function startHeartbeat(intervalMs = 60_000) {
+  try { setLastHeartbeat(new Date().toISOString()); } catch (e) {}
+  setInterval(() => {
+    try {
+      setLastHeartbeat(new Date().toISOString());
+    } catch (e) {}
+  }, intervalMs);
+}
 
 bot.start(async (ctx) => {
   ctx.session = {};
@@ -288,7 +328,6 @@ bot.on('callback_query', async (ctx) => {
 
     const lang = await resolveUserLang(ctx.from.id);
 
-    // back to main (settings) handler
     if (data === 'back_to_main') {
       try {
         await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
@@ -365,7 +404,7 @@ bot.on('callback_query', async (ctx) => {
         try {
           const alertsBefore = await getUserAlertsCached(ctx.from.id);
           const idxBefore = alertsBefore.findIndex(a => String(a._id) === String(doc._id) || a._id?.toString() === id);
-          if (idxBefore >= 0) sourcePage = Math.floor(idxBefore / 20); else sourcePage = 0;
+          if (idxBefore >= 0) sourcePage = Math.floor(idxBefore / ENTRIES_PER_PAGE); else sourcePage = 0;
         } catch (e) { sourcePage = 0; }
       }
 
@@ -384,7 +423,7 @@ bot.on('callback_query', async (ctx) => {
       invalidateUserAlertsCache(ctx.from.id);
 
       const alertsAfter = await getUserAlertsCached(ctx.from.id);
-      const computedTotalPages = Math.max(1, Math.ceil((alertsAfter?.length || 0) / 20));
+      const computedTotalPages = Math.max(1, Math.ceil((alertsAfter?.length || 0) / ENTRIES_PER_PAGE));
       if (sourcePage !== null) { sourcePage = Math.max(0, Math.min(sourcePage, computedTotalPages - 1)); }
 
       const inline = await buildDeleteInlineForUser(ctx.from.id, { fast: true, sourcePage, totalPages: (sourcePage === null ? null : computedTotalPages), lang });
@@ -439,7 +478,6 @@ bot.on('callback_query', async (ctx) => {
       return;
     }
 
-    // confirmation for clearing all old alerts
     if (data === 'clear_old_alerts_confirm') {
       const isEn = String(lang).split('-')[0] === 'en';
       const text = isEn ? 'Are you sure?' : 'Вы уверены?';
@@ -755,7 +793,6 @@ bot.command('get_alert_limit', async (ctx) => {
 bot.command('refresh_daily', async (ctx) => {
   try {
     if (!CREATOR_ID || String(ctx.from.id) !== String(CREATOR_ID)) return ctx.reply('У вас нет доступа.');
-
     const dateStr = new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Kyiv' });
     await ctx.reply(`⏳ Начинаю принудительное обновление мотивации на ${dateStr}...`);
 
@@ -828,7 +865,7 @@ bot.command('refresh_daily', async (ctx) => {
     }
 
     try {
-      const buf = await daily.ensureDailyImageBuffer(dateStr);
+      const buf = await ensureDailyImageBuffer(dateStr);
       if (buf && buf.length) {
         await ctx.reply(`Картинка загружена в память, размер ${buf.length} байт.`);
       } else {
@@ -854,11 +891,25 @@ bot.command('refresh_daily', async (ctx) => {
 export async function startBot() {
   await connectToMongo();
   startTickersRefresher();
-  startAlertsChecker(bot);
+
+  if (isDbConnected()) {
+    try { startAlertsChecker(bot); } catch (e) { console.warn('startAlertsChecker failed', e?.message || e); }
+  } else {
+    const tryStartChecker = setInterval(() => {
+      if (isDbConnected()) {
+        try { startAlertsChecker(bot); } catch (e) { console.warn('delayed startAlertsChecker failed', e?.message || e); }
+        clearInterval(tryStartChecker);
+      }
+    }, 10_000);
+  }
+
   await removeInactive();
+  startHeartbeat(60_000);
+
   const app = createServer();
   const PORT = process.env.PORT || 3000;
   const server = app.listen(PORT, () => console.log(`HTTP server on ${PORT}`));
+
   setInterval(() => processDailyQuoteRetry(bot), 60_000);
   setInterval(() => watchForNewQuotes(bot), 30_000);
 
@@ -923,9 +974,10 @@ export async function startBot() {
   setInterval(async () => {
     try {
       await removeInactive();
-    } catch (e) {}
+    } catch (e) { console.warn('removeInactive scheduled failed', e?.message || e); }
   }, 7 * DAY_MS);
 
   await bot.launch();
+  try { await adminNotify(`✅ Bot started at ${new Date().toISOString()}`); } catch (e) { console.warn('adminNotify after launch failed', e?.message || e); }
   return { server };
 }

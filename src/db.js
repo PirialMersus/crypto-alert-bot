@@ -1,45 +1,34 @@
 // src/db.js
-import { MongoClient, ObjectId } from 'mongodb';
+import { MongoClient, ObjectId as MongoObjectId } from 'mongodb';
+import EventEmitter from 'events';
 import dotenv from 'dotenv';
+import { notifyAdmin } from './adminNotify.js';
 dotenv.config();
 
 const MONGO_URI = process.env.MONGO_URI;
 if (!MONGO_URI) throw new Error('MONGO_URI не задан в окружении');
 
 export const client = new MongoClient(MONGO_URI, {
-  // короткие таймауты, чтобы быстро понять, что сеть недоступна
   serverSelectionTimeoutMS: 5000,
   connectTimeoutMS: 5000,
   socketTimeoutMS: 30000,
 });
 
-export let alertsCollection, usersCollection, lastViewsCollection, dailyMotivationCollection, dailyQuoteRetryCollection, pendingDailySendsCollection, alertsArchiveCollection;
+export const dbEvents = new EventEmitter();
+
+let _isConnected = false;
+let reconnectTimer = null;
 let currentDbName = null;
 
-async function tryConnectWithRetries(attempts = 3) {
-  let attempt = 0;
-  while (attempt < attempts) {
-    try {
-      await client.connect();
-      return;
-    } catch (e) {
-      attempt++;
-      console.warn(`Mongo connect attempt ${attempt} failed:`, e.message || e);
-      if (attempt >= attempts) throw e;
-      const delay = Math.min(1000 * Math.pow(2, attempt), 8000);
-      await new Promise(r => setTimeout(r, delay));
-    }
-  }
-}
+export let alertsCollection = null;
+export let alertsArchiveCollection = null;
+export let usersCollection = null;
+export let lastViewsCollection = null;
+export let dailyMotivationCollection = null;
+export let dailyQuoteRetryCollection = null;
+export let pendingDailySendsCollection = null;
 
-export async function connectToMongo() {
-  try {
-    await tryConnectWithRetries(3);
-  } catch (e) {
-    console.error('Failed to connect to MongoDB after retries:', e?.message || e);
-    throw e;
-  }
-
+async function initCollectionsAndIndexes() {
   const isDev = String(process.env.NODE_ENV || '').toLowerCase() === 'development';
   const devDbName = 'crypto_alert_dev';
   const db = isDev ? client.db(devDbName) : client.db();
@@ -66,19 +55,86 @@ export async function connectToMongo() {
     await dailyMotivationCollection.createIndex({ date: 1 }, { unique: true });
     await dailyQuoteRetryCollection.createIndex({ date: 1 }, { unique: true });
     await pendingDailySendsCollection.createIndex({ userId: 1, date: 1 }, { unique: true });
-  } catch (e) { console.error('ensureIndexes error', e); }
-
-  console.log('Connected to MongoDB and indexes are ready 🚀', currentDbName ? `(db: ${currentDbName})` : '');
+  } catch (e) {
+    console.error('ensureIndexes error', e?.message || e);
+  }
 }
 
-export { ObjectId };
+async function tryConnectOnce() {
+  await client.connect();
+  _isConnected = true;
+  await initCollectionsAndIndexes();
+  dbEvents.emit('connected');
+  try { await notifyAdmin(`✅ Mongo connected${currentDbName ? ` (db: ${currentDbName})` : ''}`); } catch (e) {}
+  if (reconnectTimer) {
+    clearInterval(reconnectTimer);
+    reconnectTimer = null;
+  }
+  console.log('Mongo connected' + (currentDbName ? ` (db: ${currentDbName})` : ''));
+}
 
-export async function countDocumentsWithTimeout(collectionName, filter, ms = 7000) {
-  if (!collectionName) throw new Error('collectionName required');
-  const dbToUse = currentDbName ? client.db(currentDbName) : client.db();
-  const coll = dbToUse.collection(collectionName);
-  return await Promise.race([
-    coll.countDocuments(filter),
-    new Promise((_, reject) => setTimeout(() => reject(new Error('mongo_timeout')), ms))
-  ]);
+async function tryConnectWithRetries(initialAttempts = 3) {
+  let attempt = 0;
+  while (attempt < initialAttempts) {
+    attempt++;
+    try {
+      await tryConnectOnce();
+      return true;
+    } catch (err) {
+      console.error(`Mongo connect attempt ${attempt} failed:`, err?.message || err);
+      const delay = Math.min(1000 * Math.pow(2, attempt), 8000);
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+  return false;
+}
+
+export async function connectToMongo() {
+  const ok = await tryConnectWithRetries(3);
+  if (!ok) {
+    console.error('Failed to connect to MongoDB after initial retries');
+    try { await notifyAdmin('⚠️ Failed to connect to MongoDB after initial retries. Background reconnect scheduled.'); } catch (e) {}
+    if (!reconnectTimer) {
+      reconnectTimer = setInterval(async () => {
+        console.log('Attempting background reconnect to Mongo...');
+        try {
+          await tryConnectOnce();
+          console.log('Background reconnect succeeded!');
+          try { await notifyAdmin('✅ Mongo background reconnect succeeded'); } catch (e) {}
+        } catch (err) {
+          console.error('Background reconnect failed:', err?.message || err);
+        }
+      }, 30_000);
+    }
+  }
+}
+
+export function isDbConnected() {
+  try {
+    if (client && client.topology && typeof client.topology.isConnected === 'function') {
+      return client.topology.isConnected();
+    }
+    return !!_isConnected;
+  } catch (e) {
+    return !!_isConnected;
+  }
+}
+
+export const ObjectId = MongoObjectId;
+
+export async function countDocumentsWithTimeout(collectionName, filter = {}, ms = 7000) {
+  try {
+    if (!collectionName || !client) return 0;
+    const dbHandle = currentDbName ? client.db(currentDbName) : client.db();
+    if (!dbHandle) return 0;
+    const coll = dbHandle.collection(collectionName);
+    if (!coll || typeof coll.countDocuments !== 'function') return 0;
+
+    const countPromise = coll.countDocuments(filter);
+    const timeoutPromise = new Promise((resolve) => setTimeout(() => resolve(0), ms));
+    return await Promise.race([countPromise, timeoutPromise]);
+  } catch (e) {
+    console.warn('countDocumentsWithTimeout error', e?.message || e);
+    return 0;
+  }
 }

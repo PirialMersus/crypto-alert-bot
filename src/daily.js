@@ -1,7 +1,7 @@
 // src/daily.js
 import { httpGetWithRetry, httpClient } from './httpClient.js';
 import { dailyCache } from './cache.js';
-import { dailyMotivationCollection, dailyQuoteRetryCollection, pendingDailySendsCollection } from './db.js';
+import { dailyMotivationCollection, dailyQuoteRetryCollection, pendingDailySendsCollection, client } from './db.js';
 import { RETRY_INTERVAL_MS, QUOTE_CAPTION_MAX, MESSAGE_TEXT_MAX, KYIV_TZ } from './constants.js';
 import { translateOrNull } from './translate.js';
 
@@ -178,6 +178,24 @@ export async function fetchAndStoreDailyMotivation(dateStr, opts = { force: fals
       createdAt: new Date()
     };
 
+    // If DB not available, either throw on force or return null gracefully
+    if (!dailyMotivationCollection) {
+      if (opts && opts.force) {
+        throw new Error('fetchAndStoreDailyMotivation: mongo unavailable');
+      } else {
+        console.warn('fetchAndStoreDailyMotivation: mongo not connected — skipping DB write');
+        dailyCache.date = dateStr;
+        dailyCache.doc = doc;
+        dailyCache.imageBuffer = img?.buffer || null;
+        if (!doc.quote) {
+          if (dailyQuoteRetryCollection) {
+            await dailyQuoteRetryCollection.updateOne({ date: dateStr }, { $set: { date: dateStr, attempts: 0, nextAttemptAt: new Date(Date.now() + RETRY_INTERVAL_MS) } }, { upsert: true }).catch(()=>{});
+          }
+        }
+        return doc;
+      }
+    }
+
     if (opts && opts.force) {
       if (!doc.quote && !doc.image) {
         throw new Error('fetchAndStoreDailyMotivation: force requested but unable to fetch quote or image from sources (network or sources failure).');
@@ -194,9 +212,11 @@ export async function fetchAndStoreDailyMotivation(dateStr, opts = { force: fals
     dailyCache.imageBuffer = null;
 
     if (!stored?.quote) {
-      await dailyQuoteRetryCollection.updateOne({ date: dateStr }, { $set: { date: dateStr, attempts: 0, nextAttemptAt: new Date(Date.now() + RETRY_INTERVAL_MS) } }, { upsert: true });
+      if (dailyQuoteRetryCollection) {
+        await dailyQuoteRetryCollection.updateOne({ date: dateStr }, { $set: { date: dateStr, attempts: 0, nextAttemptAt: new Date(Date.now() + RETRY_INTERVAL_MS) } }, { upsert: true });
+      }
     } else {
-      await dailyQuoteRetryCollection.deleteOne({ date: dateStr }).catch(()=>{});
+      if (dailyQuoteRetryCollection) await dailyQuoteRetryCollection.deleteOne({ date: dateStr }).catch(()=>{});
     }
 
     return stored;
@@ -208,6 +228,10 @@ export async function fetchAndStoreDailyMotivation(dateStr, opts = { force: fals
 
 export async function ensureDailyImageBuffer(dateStr) {
   if (dailyCache.date !== dateStr) {
+    if (!dailyMotivationCollection) {
+      // If no DB, rely on cache only
+      return dailyCache.imageBuffer;
+    }
     const doc = await dailyMotivationCollection.findOne({ date: dateStr }).catch(()=>null);
     if (!doc) return null;
     dailyCache.date = dateStr;
@@ -231,8 +255,12 @@ export async function ensureDailyImageBuffer(dateStr) {
   if (got && got.buffer) {
     dailyCache.imageBuffer = got.buffer;
     try {
-      if (got.url) {
+      if (got.url && dailyMotivationCollection) {
         await dailyMotivationCollection.updateOne({ date: dateStr }, { $set: { 'image.url': got.url, 'image.source': got.source } });
+        dailyCache.doc.image = { url: got.url, source: got.source };
+      } else if (got.url) {
+        // store in memory cache only
+        if (!dailyCache.doc) dailyCache.doc = {};
         dailyCache.doc.image = { url: got.url, source: got.source };
       }
     } catch (e) {}
@@ -250,16 +278,18 @@ export async function sendDailyToUser(bot, userId, dateStr, opts = { disableNoti
       } catch (e) {}
     }
 
-    let doc = dailyCache.date === dateStr ? dailyCache.doc : await dailyMotivationCollection.findOne({ date: dateStr }).catch(()=>null);
+    let doc = dailyCache.date === dateStr ? dailyCache.doc : (dailyMotivationCollection ? await dailyMotivationCollection.findOne({ date: dateStr }).catch(()=>null) : null);
     if (!doc) doc = await fetchAndStoreDailyMotivation(dateStr).catch(()=>null);
 
     const buf = await ensureDailyImageBuffer(dateStr).catch(()=>null);
-    const lang = await import('./cache.js').then(m => m.resolveUserLang(userId)).catch(()=> 'ru');
+    // resolveUserLang is in cache.js to avoid circular imports here
+    const cacheMod = await import('./cache.js').catch(()=>null);
+    const lang = cacheMod ? await cacheMod.resolveUserLang(userId).catch(()=> 'ru') : 'ru';
 
     let quoteText = null;
     const storedQuote = doc?.quote || null;
     const original = storedQuote?.original || (storedQuote?.translations && (storedQuote.translations.en || storedQuote.translations.ru)) || null;
-    const originalLang = storedQuote?.originalLang || (storedQuote?.translations && storedQuote.translations.ru ? 'ru' : 'en');
+    const originalLang = storedQuote?.originalLang || (storedQuote?.translations && storedQuote?.translations.ru ? 'ru' : 'en');
 
     if (original && isLikelyHTML(original)) {
       if (storedQuote) storedQuote.original = null;
@@ -284,9 +314,11 @@ export async function sendDailyToUser(bot, userId, dateStr, opts = { disableNoti
         if (tr && !isLikelyHTML(tr)) {
           quoteText = tr;
           try {
-            const upd = { ['quote.translations.'+lang]: tr };
-            await dailyMotivationCollection.updateOne({ date: dateStr }, { $set: upd }, { upsert: false });
-            dailyCache.doc = await dailyMotivationCollection.findOne({ date: dateStr }).catch(()=>dailyCache.doc);
+            if (dailyMotivationCollection) {
+              const upd = { ['quote.translations.'+lang]: tr };
+              await dailyMotivationCollection.updateOne({ date: dateStr }, { $set: upd }, { upsert: false });
+              dailyCache.doc = await dailyMotivationCollection.findOne({ date: dateStr }).catch(()=>dailyCache.doc);
+            }
           } catch (e) {}
         }
       } catch (e) {}
@@ -314,7 +346,7 @@ export async function sendDailyToUser(bot, userId, dateStr, opts = { disableNoti
     }
 
     if (!quoteText) {
-      const fallback = String(await import('./utils.js').then(m=>m.buildWish())).slice(0, QUOTE_CAPTION_MAX);
+      const fallback = String((await import('./utils.js').then(m=>m.buildWish()).catch(()=> 'Хорошего дня!'))).slice(0, QUOTE_CAPTION_MAX);
       if (buf) {
         try { await bot.telegram.sendPhoto(userId, { source: buf }, { caption: fallback, disable_notification: !!opts.disableNotification }); } catch (e) { console.warn('sendDailyToUser sendPhoto failed fallback', e); await recordSendStatus(false, false); return false; }
       } else {
@@ -366,6 +398,7 @@ export async function sendDailyToUser(bot, userId, dateStr, opts = { disableNoti
 
 export async function processDailyQuoteRetry(bot) {
   try {
+    if (!dailyQuoteRetryCollection) return;
     const now = new Date();
     const doc = await dailyQuoteRetryCollection.findOne({ nextAttemptAt: { $lte: now } });
     if (!doc) return;
@@ -383,38 +416,42 @@ export async function processDailyQuoteRetry(bot) {
       try { const ruT = await translateOrNull(q.text, 'ru').catch(()=>translations.en); translations.ru = ruT || translations.en || q.text; } catch {}
       try { const ukT = await translateOrNull(q.text, 'uk').catch(()=>translations.en); translations.uk = ukT || translations.en || q.text; } catch {}
 
-      await dailyMotivationCollection.updateOne(
-        { date: dateStr },
-        { $set: { 'quote.original': q.text, 'quote.author': q.author || '', 'quote.source': q.source || '', 'quote.translations': translations, 'quote.originalLang': origLang } },
-        { upsert: true }
-      );
-      await dailyQuoteRetryCollection.deleteOne({ date: dateStr });
-      const stored = await dailyMotivationCollection.findOne({ date: dateStr });
-      dailyCache.date = dateStr;
-      dailyCache.doc = stored;
-      dailyCache.imageBuffer = null;
+      if (dailyMotivationCollection) {
+        await dailyMotivationCollection.updateOne(
+          { date: dateStr },
+          { $set: { 'quote.original': q.text, 'quote.author': q.author || '', 'quote.source': q.source || '', 'quote.translations': translations, 'quote.originalLang': origLang } },
+          { upsert: true }
+        );
+        await dailyQuoteRetryCollection.deleteOne({ date: dateStr });
+        const stored = await dailyMotivationCollection.findOne({ date: dateStr });
+        dailyCache.date = dateStr;
+        dailyCache.doc = stored;
+        dailyCache.imageBuffer = null;
 
-      const cursor = pendingDailySendsCollection.find({ date: dateStr, sent: true, $and: [ { $or: [{ quoteSent: { $exists: false } }, { quoteSent: false }] }, { $or: [{ permanentFail: { $exists: false } }, { permanentFail: false }] } ] });
-      while (await cursor.hasNext()) {
-        const p = await cursor.next();
-        try {
-          const uid = p.userId;
-          const lang = await import('./cache.js').then(m => m.resolveUserLang(uid));
-          let final = stored.quote.translations && stored.quote.translations[lang] ? stored.quote.translations[lang] : stored.quote.original;
-          if (!final) final = stored.quote.original || '';
-          const out = stored.quote.author ? `${final}\n— ${stored.quote.author}` : final;
-          await bot.telegram.sendMessage(uid, String(out).slice(0, MESSAGE_TEXT_MAX));
-          await pendingDailySendsCollection.updateOne({ _id: p._id }, { $set: { quoteSent: true } });
-        } catch (e) { console.warn('processDailyQuoteRetry: failed to send', e); }
+        if (pendingDailySendsCollection) {
+          const cursor = pendingDailySendsCollection.find({ date: dateStr, sent: true, $and: [ { $or: [{ quoteSent: { $exists: false } }, { quoteSent: false }] }, { $or: [{ permanentFail: { $exists: false } }, { permanentFail: false }] } ] });
+          while (await cursor.hasNext()) {
+            const p = await cursor.next();
+            try {
+              const uid = p.userId;
+              const cacheMod = await import('./cache.js').catch(()=>null);
+              const lang = cacheMod ? await cacheMod.resolveUserLang(uid) : 'ru';
+              let final = stored.quote.translations && stored.quote.translations[lang] ? stored.quote.translations[lang] : stored.quote.original;
+              if (!final) final = stored.quote.original || '';
+              const out = stored.quote.author ? `${final}\n— ${stored.quote.author}` : final;
+              await bot.telegram.sendMessage(uid, String(out).slice(0, MESSAGE_TEXT_MAX));
+              await pendingDailySendsCollection.updateOne({ _id: p._id }, { $set: { quoteSent: true } });
+            } catch (e) { console.warn('processDailyQuoteRetry: failed to send', e); }
+          }
+        }
       }
-
       return;
     }
 
     if (attempts >= 12) {
-      await dailyQuoteRetryCollection.updateOne({ date: dateStr }, { $set: { attempts, exhausted: true } });
+      if (dailyQuoteRetryCollection) await dailyQuoteRetryCollection.updateOne({ date: dateStr }, { $set: { attempts, exhausted: true } });
     } else {
-      await dailyQuoteRetryCollection.updateOne({ date: dateStr }, { $set: { attempts, nextAttemptAt: new Date(Date.now() + RETRY_INTERVAL_MS) } });
+      if (dailyQuoteRetryCollection) await dailyQuoteRetryCollection.updateOne({ date: dateStr }, { $set: { attempts, nextAttemptAt: new Date(Date.now() + RETRY_INTERVAL_MS) } });
     }
   } catch (e) {
     console.error('processDailyQuoteRetry error', e?.message || e);
@@ -424,17 +461,23 @@ export async function processDailyQuoteRetry(bot) {
 export async function watchForNewQuotes(bot) {
   try {
     const dateStr = new Date().toLocaleDateString('sv-SE', { timeZone: KYIV_TZ || 'Europe/Kyiv' });
-    const doc = await dailyMotivationCollection.findOne({ date: dateStr });
+    const doc = (dailyMotivationCollection ? await dailyMotivationCollection.findOne({ date: dateStr }).catch(()=>null) : dailyCache.doc);
     if (!doc || !doc.quote || !doc.quote.original) return;
     if (watchForNewQuotes.lastSeen === dateStr) return;
     watchForNewQuotes.lastSeen = dateStr;
+
+    if (!pendingDailySendsCollection) {
+      console.warn('watchForNewQuotes: pendingDailySendsCollection not available, skipping');
+      return;
+    }
 
     const cursor = pendingDailySendsCollection.find({ date: dateStr, sent: true, $and: [ { $or: [{ quoteSent: { $exists: false } }, { quoteSent: false }] }, { $or: [{ permanentFail: { $exists: false } }, { permanentFail: false }] } ] });
     while (await cursor.hasNext()) {
       const p = await cursor.next();
       try {
         const uid = p.userId;
-        const lang = await import('./cache.js').then(m => m.resolveUserLang(uid));
+        const cacheMod = await import('./cache.js').then(m => m).catch(()=>null);
+        const lang = cacheMod ? await cacheMod.resolveUserLang(uid) : 'ru';
         let final = doc.quote.translations && doc.quote.translations[lang] ? doc.quote.translations[lang] : doc.quote.original;
         if (!final) final = doc.quote.original || '';
         const out = doc.quote.author ? `${final}\n— ${doc.quote.author}` : final;
@@ -442,6 +485,6 @@ export async function watchForNewQuotes(bot) {
         await pendingDailySendsCollection.updateOne({ _id: p._id }, { $set: { quoteSent: true } });
       } catch (e) { console.warn('watchForNewQuotes: failed to send', e); }
     }
-  } catch (e) { console.warn('watchForNewQuotes error', e); }
+  } catch (e) { console.warn('watchForNewQuotes error', e?.message || e); }
 }
 watchForNewQuotes.lastSeen = null;

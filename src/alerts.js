@@ -1,6 +1,6 @@
 // src/alerts.js
 import { ENTRIES_PER_PAGE, BG_CHECK_INTERVAL, DELETE_LABEL_TARGET_LEN } from './constants.js';
-import { alertsCollection, usersCollection } from './db.js';
+import { alertsCollection, usersCollection, alertsArchiveCollection } from './db.js';
 import { tickersCache, pricesCache, allAlertsCache, getUserAlertsCached, getAllAlertsCached, getUserLastViews, setUserLastViews, invalidateUserAlertsCache, getUserAlertsOrder } from './cache.js';
 import { getPriceLevel1 } from './prices.js';
 import { fmtNum, formatChangeWithIcons, padLabel } from './utils.js';
@@ -298,6 +298,12 @@ export async function renderOldAlertsList(userId, opts = { days: 30, symbol: nul
     const days = (opts && Number.isFinite(opts.days)) ? Math.max(1, Math.floor(opts.days)) : 30;
     const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 
+    if (!alertsArchiveCollection) {
+      const text = t(lang, 'old_alerts_fetch_error');
+      const buttons = [[{ text: t(lang, 'back'), callback_data: 'back_to_main' }]];
+      return { pages: [{ text, buttons }], pageCount: 1 };
+    }
+
     const q = { userId, $or: [ { firedAt: { $exists: true } }, { deletedAt: { $exists: true } } ] };
     q.$and = [{ $or: [ { firedAt: { $gte: since } }, { deletedAt: { $gte: since } }, { createdAt: { $gte: since } } ] }];
 
@@ -306,14 +312,8 @@ export async function renderOldAlertsList(userId, opts = { days: 30, symbol: nul
       q.$and.push({ $or: [{ symbol: sym }, { symbol: `${sym}-USDT` }] });
     }
 
-    let docs = [];
-    try {
-      const { alertsArchiveCollection } = await import('./db.js');
-      const cursor = alertsArchiveCollection.find(q).sort({ firedAt: -1, deletedAt: -1, createdAt: -1 });
-      docs = await cursor.toArray();
-    } catch (e) {
-      docs = [];
-    }
+    const cursor = alertsArchiveCollection.find(q).sort({ firedAt: -1, deletedAt: -1, createdAt: -1 });
+    const docs = await cursor.toArray();
 
     if (!docs || !docs.length) {
       const text = t(lang, 'no_old_alerts', opts && opts.symbol ? String(opts.symbol).toUpperCase() : null);
@@ -366,7 +366,6 @@ ${timeLabel}: ${whenStr}${firedInfo}${reason}
       if (p > 0) nav.push({ text: t(lang, 'prev'), callback_data: `old_alerts_page_${p-1}_view_${token}` });
       if (p < pages.length - 1) nav.push({ text: t(lang, 'next'), callback_data: `old_alerts_page_${p+1}_view_${token}` });
       if (nav.length) rows.push(nav);
-      // delete all old alerts inline button
       rows.push([{ text: t(lang, 'delete_all_old'), callback_data: 'clear_old_alerts_confirm' }]);
       rows.push([{ text: t(lang, 'back'), callback_data: 'back_to_main' }]);
       pages[p].buttons = rows;
@@ -374,13 +373,17 @@ ${timeLabel}: ${whenStr}${firedInfo}${reason}
 
     return { pages, pageCount: pages.length };
   } catch (e) {
+    console.error('renderOldAlertsList error', e?.message || e);
     return { pages: [{ text: t(opts.lang || 'ru', 'old_alerts_fetch_error'), buttons: [[{ text: t(opts.lang || 'ru', 'back'), callback_data: 'back_to_main' }]] }], pageCount: 1 };
   }
 }
 
 export async function clearUserOldAlerts(userId, opts = { days: 90, forceAll: false }) {
   try {
-    const { alertsArchiveCollection } = await import('./db.js');
+    if (!alertsArchiveCollection) {
+      console.warn('clearUserOldAlerts: mongo not connected, skipping');
+      return { deletedCount: 0 };
+    }
     if (opts && opts.forceAll) {
       const res = await alertsArchiveCollection.deleteMany({ userId });
       return { deletedCount: res?.deletedCount || 0 };
@@ -441,16 +444,17 @@ ${t(lang, 'condition_label')}: ${a.condition === '>' ? t(lang, 'condition_above'
           try {
             await bot.telegram.sendMessage(a.userId, text, { parse_mode: 'Markdown' });
             try {
-              const { alertsArchiveCollection } = await import('./db.js');
-              await alertsArchiveCollection.insertOne({
-                ...a,
-                firedAt: new Date(),
-                firedPrice: cur,
-                archivedReason: 'fired',
-                archivedAt: new Date()
-              });
+              if (alertsArchiveCollection) {
+                await alertsArchiveCollection.insertOne({
+                  ...a,
+                  firedAt: new Date(),
+                  firedPrice: cur,
+                  archivedReason: 'fired',
+                  archivedAt: new Date()
+                });
+              }
             } catch (e) {}
-            await alertsCollection.deleteOne({ _id: a._id });
+            if (alertsCollection) await alertsCollection.deleteOne({ _id: a._id });
             invalidateUserAlertsCache(a.userId);
           } catch (err) {
             try {
@@ -458,19 +462,21 @@ ${t(lang, 'condition_label')}: ${a.condition === '>' ? t(lang, 'condition_above'
               const description = err?.response?.description || String(err?.message || err);
               if (code === 403 || /bot was blocked/i.test(description)) {
                 try {
-                  const { usersCollection } = await import('./db.js');
-                  await usersCollection.updateOne({ userId: a.userId }, { $set: { botBlocked: true, botBlockedAt: new Date() } }, { upsert: true });
+                  if (usersCollection) {
+                    await usersCollection.updateOne({ userId: a.userId }, { $set: { botBlocked: true, botBlockedAt: new Date() } }, { upsert: true });
+                  }
                 } catch (e) {}
                 try {
-                  const { alertsArchiveCollection } = await import('./db.js');
-                  await alertsArchiveCollection.insertOne({
-                    ...a,
-                    archivedAt: new Date(),
-                    archivedReason: 'bot_blocked',
-                    sendError: description
-                  });
+                  if (alertsArchiveCollection) {
+                    await alertsArchiveCollection.insertOne({
+                      ...a,
+                      archivedAt: new Date(),
+                      archivedReason: 'bot_blocked',
+                      sendError: description
+                    });
+                  }
                 } catch (e) {}
-                await alertsCollection.deleteOne({ _id: a._id }).catch(()=>{});
+                if (alertsCollection) await alertsCollection.deleteOne({ _id: a._id }).catch(()=>{});
                 invalidateUserAlertsCache(a.userId);
               } else {
                 console.error('bg check error', err);
