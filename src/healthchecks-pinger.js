@@ -1,12 +1,13 @@
 // src/healthchecks-pinger.js
-
 import { httpClient } from './httpClient.js';
-
 const HC_PING_URL = process.env.HC_PING_URL || null;
 let lastSent = 0;
-const MIN_INTERVAL = 10000;
-
+const MIN_INTERVAL = 10_000;
+const NODE_ENV = String(process.env.NODE_ENV || '').toLowerCase();
+const HC_PING_ENABLED_ENV = String(process.env.HC_PING_ENABLED || '').toLowerCase();
+const HC_ENABLED = (NODE_ENV !== 'development') || HC_PING_ENABLED_ENV === 'true';
 export async function pingHealthchecksOnce() {
+  if (!HC_ENABLED) return false;
   if (!HC_PING_URL) return false;
   const now = Date.now();
   if (now - lastSent < MIN_INTERVAL) return true;
@@ -20,4 +21,3 @@ export async function pingHealthchecksOnce() {
     return false;
   }
 }
-

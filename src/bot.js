@@ -282,20 +282,16 @@ bot.hears('🌅 Send motivation', async (ctx) => {
   }
 });
 
-bot.hears('Пожелания/техподдержка', async (ctx) => {
-  const lang = await resolveUserLang(ctx.from.id);
-  const msg = lang && String(lang).split('-')[0] === 'en'
-    ? "The bot is completely free and has no restrictions. If you have suggestions to improve functionality, want to add something, or would like to thank me with a cup of coffee — write to me in private @pirial_mersus"
-    : "Бот полностью бесплатен и в нем нет никаких ограничений. Если у вас есть какие то предложения по улучшению функциональности. Или вам хочется чтото добавить. Или вы хотите отблагодарить меня чашечкой кофе - напишите в личку @pirial_mersus";
-  await ctx.reply(msg, getMainMenuSync(ctx.from.id, lang));
-});
-bot.hears('Wishes/Support', async (ctx) => {
-  const lang = await resolveUserLang(ctx.from.id);
-  const msg = lang && String(lang).split('-')[0] === 'en'
-    ? "The bot is completely free and has no restrictions. If you have suggestions to improve functionality, want to add something, or would like to thank me with a cup of coffee — write to me in private @pirial_mersus"
-    : "Бот полностью бесплатен и в нем нет никаких ограничений. Если у вас есть какие то предложения по улучшению функциональности. Или вам хочется чтото добавить. Или вы хотите отблагодарить меня чашечкой кофе - напишите в личку @pirial_mersus";
-  await ctx.reply(msg, getMainMenuSync(ctx.from.id, lang));
-});
+bot.hears(
+  ['🛠️ Техподдержка/пожелания', 'Пожелания/техподдержка', '🛠️ Support/wishes', 'Wishes/Support'],
+  async (ctx) => {
+    const lang = await resolveUserLang(ctx.from.id);
+    const msg = lang && String(lang).split('-')[0] === 'en'
+      ? "The bot is completely free and has no restrictions. If you have suggestions to improve functionality, want to add something, or would like to thank me with a cup of coffee — write to me in private @pirial_mersus"
+      : "Бот полностью бесплатен и в нем нет никаких ограничений. Если у вас есть какие то предложения по улучшению функциональности. Или вам хочется чтото добавить. Или вы хотите отблагодарить меня чашечкой кофе - напишите в личку @pirial_mersus";
+    await ctx.reply(msg, getMainMenuSync(ctx.from.id, lang));
+  }
+);
 
 async function handleActiveUsers(ctx) {
   try {
