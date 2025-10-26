@@ -97,7 +97,7 @@ async function fetchCoingeckoMarketChart(id,days=15) {
 
 async function fetchBinanceTicker24h(symbol) {
   try {
-    const url=`https://api.binance.com/api/v3/ticker/24hr?symbol=${encodeURIComponent(symbol)}`;
+    const url=`https://api.binance.com/api/v3/ticker/24hr?symbol=${encodeURIComponent(symbol)}&_t=${Date.now()}`;
     const res=await withTimeout(httpGetWithRetry(url,1),HARD_TIMEOUT_MS,`binance:24hr:${symbol}`);
     const d=res?.data; if(!d) return null;
     const price=Number(d.lastPrice), pct24=Number(d.priceChangePercent), volQuote=Number(d.quoteVolume);
@@ -105,86 +105,118 @@ async function fetchBinanceTicker24h(symbol) {
   }catch{return null;}
 }
 
-function seriesAllZeros(arr){
-  if(!Array.isArray(arr) || !arr.length) return false;
-  return arr.every(x => Number(x) === 0);
-}
+// utils для «почти нулей»
+const nearZero = (v) => Number.isFinite(v) && Math.abs(v) < 1e-8;
 
 // --- FUNDING ---
 async function fetchBinanceFundingSeries(symbol, limit=12) {
   try {
-    const url=`https://fapi.binance.com/fapi/v1/fundingRate?symbol=${encodeURIComponent(symbol)}&limit=${encodeURIComponent(String(limit))}`;
+    const url=`https://fapi.binance.com/fapi/v1/fundingRate?symbol=${encodeURIComponent(symbol)}&limit=${encodeURIComponent(String(limit))}&_t=${Date.now()}`;
     const res=await withTimeout(httpGetWithRetry(url,2),HARD_TIMEOUT_MS,`binance:funding:${symbol}`);
     const arr=Array.isArray(res?.data)?res.data:[];
-    const vals = arr.map(r=>Number(r.fundingRate)).filter(Number.isFinite);
-    if (seriesAllZeros(vals)) return [];
+    const vals = arr.map(r=>Number(r.fundingRate)).filter(v => Number.isFinite(v) && !nearZero(v));
+    if (!vals.length) throw new Error('empty_or_zeros');
     return vals;
   }catch{return [];}
+}
+
+// funding series fallback via www.binance.com
+async function fetchFundingSeriesViaWWW(symbol, limit=30) {
+  try{
+    const url = `https://www.binance.com/futures/data/fundingRate?symbol=${encodeURIComponent(symbol)}&limit=${encodeURIComponent(String(limit))}&_t=${Date.now()}`;
+    const res = await withTimeout(httpGetWithRetry(url,2),HARD_TIMEOUT_MS,`binance-www:funding:${symbol}`);
+    const arr = Array.isArray(res?.data) ? res.data : [];
+    const vals = arr.map(r => Number(r.fundingRate)).filter(v => Number.isFinite(v) && !nearZero(v));
+    return vals;
+  }catch{ return []; }
 }
 
 // fallback: current funding from premiumIndex
 async function fetchFundingNowFallback(symbol){
   try{
-    const url = `https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${encodeURIComponent(symbol)}`;
+    const url = `https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${encodeURIComponent(symbol)}&_t=${Date.now()}`;
     const res = await withTimeout(httpGetWithRetry(url,2),HARD_TIMEOUT_MS,`binance:premiumIndex:${symbol}`);
     const v = Number(res?.data?.lastFundingRate);
-    return Number.isFinite(v) ? v : null;
+    return (Number.isFinite(v) && !nearZero(v)) ? v : null;
   }catch{return null;}
 }
 
 // --- GOLD ---
 async function fetchGoldSpotAndDelta(){
+  // 1) metals.live (+ cache-buster)
   try {
-    const candidates = [
+    const base = [
       'https://api.metals.live/v1/spot/gold',
       'https://api.metals.live/v1/spot/XAU',
       'https://api.metals.live/v1/spot'
     ];
     let raw = null;
-    for (const url of candidates) {
+    for (const b of base) {
+      const url = `${b}?t=${Date.now()}`;
       try {
-        const r = await withTimeout(
-          httpGetWithRetry(url, 1),
-          HARD_TIMEOUT_MS,
-          `gold:${url}`
-        );
+        const r = await withTimeout(httpGetWithRetry(url, 1), HARD_TIMEOUT_MS, `gold:${url}`);
         if (Array.isArray(r?.data) && r.data.length) { raw = r.data; break; }
       } catch {}
     }
-    if (!Array.isArray(raw) || !raw.length) {
-      return { price:null, pct24:null, source:null };
-    }
-    const nums = [];
-    for (const item of raw) {
-      if (typeof item === 'number') { if (item > 0) nums.push(item); continue; }
-      if (Array.isArray(item)) { const v = Number(item[1] ?? item[0]); if (Number.isFinite(v) && v > 0) nums.push(v); continue; }
-      if (item && typeof item === 'object') {
-        const keys = ['gold','xau','price','ask','bid','close'];
-        let v = null;
-        for (const k of keys) {
-          const n = Number(item[k]);
-          if (Number.isFinite(n) && n > 0) { v = n; break; }
+    if (Array.isArray(raw) && raw.length) {
+      const nums = [];
+      for (const item of raw) {
+        if (typeof item === 'number') { if (item > 0) nums.push(item); continue; }
+        if (Array.isArray(item)) { const v = Number(item[1] ?? item[0]); if (Number.isFinite(v) && v > 0) nums.push(v); continue; }
+        if (item && typeof item === 'object') {
+          const keys = ['gold','xau','price','ask','bid','close'];
+          let v = null;
+          for (const k of keys) {
+            const n = Number(item[k]);
+            if (Number.isFinite(n) && n > 0) { v = n; break; }
+          }
+          if (v == null) {
+            const any = Number(Object.values(item).find(x => Number.isFinite(Number(x))));
+            if (Number.isFinite(any) && any > 0) v = any;
+          }
+          if (v != null) nums.push(v);
         }
-        if (v == null) {
-          const any = Number(Object.values(item).find(x => Number.isFinite(Number(x))));
-          if (Number.isFinite(any) && any > 0) v = any;
+      }
+      if (nums.length > 0) {
+        const price = nums[nums.length - 1];
+        let prev = null;
+        for (let i = nums.length - 2; i >= 0; i--) {
+          const n = nums[i];
+          if (Number.isFinite(n) && n > 0 && n !== price) { prev = n; break; }
         }
-        if (v != null) nums.push(v);
+        const pct = (Number.isFinite(prev) && prev > 0) ? ((price - prev) / prev) * 100 : null;
+        return { price, pct24: (Number.isFinite(pct) ? pct : null), source: 'XAU' };
       }
     }
-    if (nums.length < 1) return { price:null, pct24:null, source:null };
+  } catch {}
 
-    const price = nums[nums.length - 1];
-    let prev = null;
-    for (let i = nums.length - 2; i >= 0; i--) {
-      const n = nums[i];
-      if (Number.isFinite(n) && n > 0 && n !== price) { prev = n; break; }
+  // 2) goldprice.org
+  try {
+    const url = `https://data-asg.goldprice.org/dbXRates/USD?t=${Date.now()}`;
+    const r = await withTimeout(httpGetWithRetry(url,1),HARD_TIMEOUT_MS,'gold:goldprice');
+    // ожидаемый формат: { items: [ { xauPrice: number, chg24?: number|str } ] }
+    const item = Array.isArray(r?.data?.items) ? r.data.items[0] : null;
+    const price = Number(item?.xauPrice);
+    let pct = Number(item?.chg24);
+    if (!Number.isFinite(pct)) pct = null;
+    if (Number.isFinite(price) && price > 0) {
+      return { price, pct24: pct, source: 'XAU' };
     }
-    const pct = (Number.isFinite(prev) && prev > 0) ? ((price - prev) / prev) * 100 : null;
-    return { price, pct24: (Number.isFinite(pct) ? pct : null), source: 'XAU' };
-  } catch {
-    return { price:null, pct24:null, source:null };
-  }
+  } catch {}
+
+  // 3) Yahoo Finance
+  try {
+    const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=XAUUSD=X&t=${Date.now()}`;
+    const r = await withTimeout(httpGetWithRetry(url,1),HARD_TIMEOUT_MS,'gold:yahoo');
+    const q = r?.data?.quoteResponse?.result?.[0] || null;
+    const price = Number(q?.regularMarketPrice);
+    const pct = Number(q?.regularMarketChangePercent);
+    if (Number.isFinite(price) && price > 0) {
+      return { price, pct24: (Number.isFinite(pct) ? pct : null), source: 'XAU' };
+    }
+  } catch {}
+
+  return { price:null, pct24:null, source:null };
 }
 
 async function fetchFearGreedIndex() {
@@ -433,9 +465,9 @@ function deriveLsFromRatio(ratio) {
   };
 }
 
-// L/S via fapi
+// L/S via fapi (fallback через www)
 async function fetchGlobalLongShort(symbol, period, limit=30) {
-  const url = `https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}&limit=${encodeURIComponent(String(limit))}`;
+  const url = `https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}&limit=${encodeURIComponent(String(limit))}&_t=${Date.now()}`;
   try{
     const res = await withTimeout(httpGetWithRetry(url,2),HARD_TIMEOUT_MS,`binance:ls:${symbol}:${period}`);
     const arr = Array.isArray(res?.data) ? res.data : [];
@@ -456,8 +488,7 @@ async function fetchGlobalLongShort(symbol, period, limit=30) {
     if (!calc) throw new Error('invalid');
     return calc;
   }catch{
-    // fallback: same endpoint via www host
-    const alt = `https://www.binance.com/futures/data/globalLongShortAccountRatio?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}&limit=${encodeURIComponent(String(limit))}`;
+    const alt = `https://www.binance.com/futures/data/globalLongShortAccountRatio?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}&limit=${encodeURIComponent(String(limit))}&_t=${Date.now()}`;
     try{
       const res2 = await withTimeout(httpGetWithRetry(alt,2),HARD_TIMEOUT_MS,`binance-www:ls:${symbol}:${period}`);
       const arr2 = Array.isArray(res2?.data) ? res2.data : [];
@@ -470,8 +501,7 @@ async function fetchGlobalLongShort(symbol, period, limit=30) {
 }
 
 async function fetchTopLongShortAccounts(symbol, period='4h', limit=30) {
-  // try fapi first
-  const url = `https://fapi.binance.com/futures/data/topLongShortAccountRatio?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}&limit=${encodeURIComponent(String(limit))}`;
+  const url = `https://fapi.binance.com/futures/data/topLongShortAccountRatio?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}&limit=${encodeURIComponent(String(limit))}&_t=${Date.now()}`;
   try{
     const res = await withTimeout(httpGetWithRetry(url,2),HARD_TIMEOUT_MS,`binance:tlsa:${symbol}:${period}`);
     const arr = Array.isArray(res?.data) ? res.data : [];
@@ -482,7 +512,7 @@ async function fetchTopLongShortAccounts(symbol, period='4h', limit=30) {
     if (!d) throw new Error('invalid');
     return d;
   }catch{
-    const alt = `https://www.binance.com/futures/data/topLongShortAccountRatio?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}&limit=${encodeURIComponent(String(limit))}`;
+    const alt = `https://www.binance.com/futures/data/topLongShortAccountRatio?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}&limit=${encodeURIComponent(String(limit))}&_t=${Date.now()}`;
     try{
       const res2 = await withTimeout(httpGetWithRetry(alt,2),HARD_TIMEOUT_MS,`binance-www:tlsa:${symbol}:${period}`);
       const arr2 = Array.isArray(res2?.data) ? res2.data : [];
@@ -494,7 +524,7 @@ async function fetchTopLongShortAccounts(symbol, period='4h', limit=30) {
 }
 
 async function fetchTopLongShortPositions(symbol, period='4h', limit=30) {
-  const url = `https://fapi.binance.com/futures/data/topLongShortPositionRatio?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}&limit=${encodeURIComponent(String(limit))}`;
+  const url = `https://fapi.binance.com/futures/data/topLongShortPositionRatio?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}&limit=${encodeURIComponent(String(limit))}&_t=${Date.now()}`;
   try{
     const res = await withTimeout(httpGetWithRetry(url,2),HARD_TIMEOUT_MS,`binance:tlsp:${symbol}:${period}`);
     const arr = Array.isArray(res?.data) ? res.data : [];
@@ -505,7 +535,7 @@ async function fetchTopLongShortPositions(symbol, period='4h', limit=30) {
     if (!d) throw new Error('invalid');
     return d;
   }catch{
-    const alt = `https://www.binance.com/futures/data/topLongShortPositionRatio?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}&limit=${encodeURIComponent(String(limit))}`;
+    const alt = `https://www.binance.com/futures/data/topLongShortPositionRatio?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}&limit=${encodeURIComponent(String(limit))}&_t=${Date.now()}`;
     try{
       const res2 = await withTimeout(httpGetWithRetry(alt,2),HARD_TIMEOUT_MS,`binance-www:tlsp:${symbol}:${period}`);
       const arr2 = Array.isArray(res2?.data) ? res2.data : [];
@@ -628,20 +658,27 @@ export async function getMarketSnapshot(symbols=['BTC','ETH']){
       // L/S
       const ls = await fetchLongShortRatio(binanceSym).catch(()=>null);
 
-      // FUNDING
-      const series = await fetchBinanceFundingSeries(binanceSym, 12).catch(()=>[]);
+      // FUNDING series (fapi -> www -> fallback now)
+      let series = await fetchBinanceFundingSeries(binanceSym, 12).catch(()=>[]);
+      if (series.length < 3) {
+        const seriesW = await fetchFundingSeriesViaWWW(binanceSym, 30).catch(()=>[]);
+        if (seriesW.length >= 3) series = seriesW.slice(-12);
+      }
+
       let fundingNow=null, fundingPrev=null, fundingDelta=null;
       if(series.length >= 6){
         const nowArr = series.slice(-3);
         const prevArr = series.slice(-6,-3);
-        const avg = (arr)=>arr.reduce((a,b)=>a+b,0)/arr.length;
-        fundingNow = avg(nowArr);
-        fundingPrev = avg(prevArr);
-        fundingDelta = fundingNow - fundingPrev;
+        const avg = (arr)=>arr.filter(v=>Number.isFinite(v)&&!nearZero(v)).reduce((a,b)=>a+b,0)/arr.filter(v=>Number.isFinite(v)&&!nearZero(v)).length;
+        const nNow = avg(nowArr);
+        const nPrev = avg(prevArr);
+        if (Number.isFinite(nNow)) fundingNow = nNow;
+        if (Number.isFinite(nPrev)) fundingPrev = nPrev;
+        if (Number.isFinite(fundingNow) && Number.isFinite(fundingPrev)) fundingDelta = fundingNow - fundingPrev;
       } else if (series.length >= 3){
-        fundingNow = (series.slice(-3).reduce((a,b)=>a+b,0))/3;
+        const arr = series.slice(-3).filter(v=>Number.isFinite(v) && !nearZero(v));
+        if (arr.length) fundingNow = arr.reduce((a,b)=>a+b,0)/arr.length;
       }
-      // fallback if still null
       if (!Number.isFinite(fundingNow)) {
         const fn = await fetchFundingNowFallback(binanceSym).catch(()=>null);
         if (Number.isFinite(fn)) {
