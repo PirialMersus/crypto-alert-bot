@@ -2,7 +2,6 @@
 import { MongoClient, ObjectId as MongoObjectId } from 'mongodb';
 import EventEmitter from 'events';
 import dotenv from 'dotenv';
-import { notifyAdmin } from './adminNotify.js';
 dotenv.config();
 
 const MONGO_URI = process.env.MONGO_URI;
@@ -27,6 +26,7 @@ export let lastViewsCollection = null;
 export let dailyMotivationCollection = null;
 export let dailyQuoteRetryCollection = null;
 export let pendingDailySendsCollection = null;
+export let marketSnapshotsCollection = null;
 
 async function initCollectionsAndIndexes() {
   const isDev = String(process.env.NODE_ENV || '').toLowerCase() === 'development';
@@ -41,6 +41,7 @@ async function initCollectionsAndIndexes() {
   dailyMotivationCollection = db.collection('daily_motivation');
   dailyQuoteRetryCollection = db.collection('daily_quote_retry');
   pendingDailySendsCollection = db.collection('pending_daily_sends');
+  marketSnapshotsCollection = db.collection('market_snapshots');
 
   try {
     await alertsCollection.createIndex({ userId: 1 });
@@ -55,6 +56,7 @@ async function initCollectionsAndIndexes() {
     await dailyMotivationCollection.createIndex({ date: 1 }, { unique: true });
     await dailyQuoteRetryCollection.createIndex({ date: 1 }, { unique: true });
     await pendingDailySendsCollection.createIndex({ userId: 1, date: 1 }, { unique: true });
+    await marketSnapshotsCollection.createIndex({ date: 1 }, { unique: true });
   } catch (e) {
     console.error('ensureIndexes error', e?.message || e);
   }
@@ -65,12 +67,13 @@ async function tryConnectOnce() {
   _isConnected = true;
   await initCollectionsAndIndexes();
   dbEvents.emit('connected');
-  try { await notifyAdmin(`✅ Mongo connected${currentDbName ? ` (db: ${currentDbName})` : ''}`); } catch (e) {}
+
   if (reconnectTimer) {
     clearInterval(reconnectTimer);
     reconnectTimer = null;
   }
-  console.log('Mongo connected' + (currentDbName ? ` (db: ${currentDbName})` : ''));
+
+  console.log('✅ Mongo connected' + (currentDbName ? ` (db: ${currentDbName})` : ''));
 }
 
 async function tryConnectWithRetries(initialAttempts = 3) {
@@ -93,14 +96,13 @@ export async function connectToMongo() {
   const ok = await tryConnectWithRetries(3);
   if (!ok) {
     console.error('Failed to connect to MongoDB after initial retries');
-    try { await notifyAdmin('⚠️ Failed to connect to MongoDB after initial retries. Background reconnect scheduled.'); } catch (e) {}
+
     if (!reconnectTimer) {
       reconnectTimer = setInterval(async () => {
         console.log('Attempting background reconnect to Mongo...');
         try {
           await tryConnectOnce();
-          console.log('Background reconnect succeeded!');
-          try { await notifyAdmin('✅ Mongo background reconnect succeeded'); } catch (e) {}
+          console.log('✅ Background reconnect to Mongo succeeded');
         } catch (err) {
           console.error('Background reconnect failed:', err?.message || err);
         }

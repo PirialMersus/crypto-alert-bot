@@ -1,7 +1,7 @@
 // src/bot.js
 import { Telegraf, session } from 'telegraf';
 import dotenv from 'dotenv';
-import { connectToMongo, ObjectId, countDocumentsWithTimeout, dbEvents, isDbConnected } from './db.js';
+import { connectToMongo, ObjectId, countDocumentsWithTimeout, isDbConnected } from './db.js';
 import { createServer } from './server.js';
 import { startTickersRefresher, refreshAllTickers, getCachedPrice } from './prices.js';
 import { startAlertsChecker, renderAlertsList, buildDeleteInlineForUser, renderOldAlertsList } from './alerts.js';
@@ -20,8 +20,22 @@ import {
 } from './cache.js';
 import { fmtNum, safeSendTelegram } from './utils.js';
 import { sendDailyToUser, processDailyQuoteRetry, watchForNewQuotes, fetchAndStoreDailyMotivation, ensureDailyImageBuffer } from './daily.js';
-import { CACHE_TTL, INACTIVE_DAYS, DAY_MS, IMAGE_FETCH_HOUR, PREPARE_SEND_HOUR, ENTRIES_PER_PAGE } from './constants.js';
+import {
+  CACHE_TTL,
+  INACTIVE_DAYS,
+  DAY_MS,
+  IMAGE_FETCH_HOUR,
+  PREPARE_SEND_HOUR,
+  ENTRIES_PER_PAGE,
+  KYIV_TZ,
+  MARKET_SEND_HOUR,
+  MARKET_SEND_MIN,
+  MARKET_BATCH_SIZE,
+  MARKET_BATCH_PAUSE_MS
+} from './constants.js';
 import { setLastHeartbeat } from './monitor.js';
+import { startMarketMonitor, getMarketSnapshot, broadcastMarketSnapshot, sendMarketReportToUser, buildMorningReportHtml } from './marketMonitor.js';
+
 dotenv.config();
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -34,7 +48,7 @@ bot.use(session());
 bot.use((ctx, next) => { if (!ctx.session) ctx.session = {}; return next(); });
 bot.use(async (ctx, next) => {
   try {
-    if (ctx.from && ctx.from.id) {
+    if (ctx.from?.id) {
       const { usersCollection } = await import('./db.js');
       await usersCollection.updateOne(
         { userId: ctx.from.id },
@@ -42,11 +56,23 @@ bot.use(async (ctx, next) => {
         { upsert: true }
       );
     }
-  } catch (e) {
-    console.warn('update lastActive failed', e?.message || e);
-  }
+  } catch (e) {}
   return next();
 });
+
+const reportInFlight = new Map();
+
+function startTyping(ctx) {
+  try { ctx.telegram.sendChatAction(ctx.chat.id, 'typing').catch(()=>{}); } catch {}
+  const t = setInterval(() => { try { ctx.telegram.sendChatAction(ctx.chat.id, 'typing').catch(()=>{}); } catch {} }, 4000);
+  return t;
+}
+function stopTyping(t) { try { if (t) clearInterval(t); } catch {} }
+function lockReport(userId, ms = 30000) { reportInFlight.set(userId, { until: Date.now() + ms, typingTimer: null, startedMsgId: null }); }
+function unlockReport(userId) { const s = reportInFlight.get(userId); if (s?.typingTimer) stopTyping(s.typingTimer); reportInFlight.delete(userId); }
+function isLocked(userId) { const s = reportInFlight.get(userId); if (!s) return false; if (Date.now() > s.until) { unlockReport(userId); return false; } return true; }
+
+function supportText(isEn) { return isEn ? '🛠️ Support/wishes' : '🛠️ Техподдержка/пожелания'; }
 
 function getMainMenuSync(userId, lang = 'ru') {
   const isEn = String(lang).split('-')[0] === 'en';
@@ -57,105 +83,83 @@ function getMainMenuSync(userId, lang = 'ru') {
   const search = isEn ? '🔎 Search old alerts' : '🔎 Поиск старых алертов';
   const motivate = isEn ? '🌅 Send motivation' : '🌅 Прислать мотивацию';
   const stats = isEn ? '👥 Active users' : '👥 Количество активных пользователей';
-  const support = isEn ? '🛠️ Support/wishes' : '🛠️ Техподдержка/пожелания';
+  const marketBtn = isEn ? '📊 Send market snapshot' : '📊 прислать данные мониторинга';
   const kb = [
     [{ text: create }, { text: my }],
+    [{ text: marketBtn }],
     [{ text: old }, { text: search }],
-    [{ text: support }, { text: settings }]
+    [{ text: supportText(isEn) }, { text: settings }]
   ];
-  if (CREATOR_ID && String(userId) === String(CREATOR_ID)) {
-    kb.push([{ text: motivate }], [{ text: stats }]);
-  }
+  if (CREATOR_ID && String(userId) === String(CREATOR_ID)) { kb.push([{ text: motivate }], [{ text: stats }]); }
   return { reply_markup: { keyboard: kb, resize_keyboard: true } };
 }
 
-async function buildSettingsInlineForUser(userId) {
+function getMainMenuBusy(userId, lang = 'ru') {
+  const isEn = String(lang).split('-')[0] === 'en';
+  const create = isEn ? '➕ Create alert' : '➕ Создать алерт';
+  const my = isEn ? '📋 My alerts' : '📋 Мои алерты';
+  const settings = isEn ? '⚙️ Settings' : '⚙️ Настройки';
+  const old = isEn ? '📜 Old alerts' : '📜 Старые алерты';
+  const search = isEn ? '🔎 Search old alerts' : '🔎 Поиск старых алертов';
+  const busy = isEn ? '📊 ⏳ Building…' : '📊 ⏳ Формирую…';
+  const motivate = isEn ? '🌅 Send motivation' : '🌅 Прислать мотивацию';
+  const stats = isEn ? '👥 Active users' : '👥 Количество активных пользователей';
+  const kb = [
+    [{ text: create }, { text: my }],
+    [{ text: busy }],
+    [{ text: old }, { text: search }],
+    [{ text: supportText(isEn) }, { text: settings }]
+  ];
+  if (CREATOR_ID && String(userId) === String(CREATOR_ID)) { kb.push([{ text: motivate }], [{ text: stats }]); }
+  return { reply_markup: { keyboard: kb, resize_keyboard: true } };
+}
+
+async function buildSettingsInlineForUser(userId, langOverride = null) {
   const order = await getUserAlertsOrder(userId).catch(()=> 'new_bottom');
-  const lang = await resolveUserLang(userId).catch(()=> 'ru');
+  const lang = langOverride || await resolveUserLang(userId).catch(()=> 'ru');
+  const isEn = String(lang).split('-')[0] === 'en';
   const isTop = order === 'new_top';
-  const isEn = String(lang).split('-')[0] === 'en';
-  const orderLeft = isTop ? (isEn ? '✅ New on top' : '✅ Новые сверху') : (isEn ? 'New on top' : 'Новые сверху');
-  const orderRight = !isTop ? (isEn ? '✅ New on bottom' : '✅ Новые снизу') : (isEn ? 'New on bottom' : 'Новые снизу');
-  const langEn = (isEn ? '✅ English' : 'English');
-  const langRu = (!isEn ? '✅ Русский' : 'Русский');
-  return {
-    inline_keyboard: [
-      [
-        { text: orderLeft, callback_data: 'set_order_new_top' },
-        { text: orderRight, callback_data: 'set_order_new_bottom' }
-      ],
-      [
-        { text: langEn, callback_data: 'set_lang_en' },
-        { text: langRu, callback_data: 'set_lang_ru' }
-      ],
-      [{ text: isEn ? '↩️ Back' : '↩️ Назад', callback_data: 'back_to_main' }]
-    ]
-  };
+  let sendMotivation = true;
+  let sendMarketReport = true;
+  try {
+    const { usersCollection } = await import('./db.js');
+    const u = await usersCollection.findOne({ userId });
+    if (typeof u?.sendMotivation === 'boolean') sendMotivation = u.sendMotivation;
+    if (typeof u?.sendMarketReport === 'boolean') sendMarketReport = u.sendMarketReport;
+  } catch {}
+  const kb = [
+    [{ text: (isEn ? 'New: ' : 'Новые: ') + (isTop ? '↑' : '↓'), callback_data: 'toggle_order' }],
+    [{ text: '🌐 ' + (isEn ? 'Language: English' : 'Язык: Русский'), callback_data: 'toggle_lang' }],
+    [{ text: `🌅 ${isEn ? 'Motivation' : 'Мотивация'}: ${sendMotivation ? '✅' : '🚫'}`, callback_data: 'toggle_motivation' }],
+    [{ text: `📊 ${isEn ? 'Report' : 'Отчёт'}: ${sendMarketReport ? '✅' : '🚫'}`, callback_data: 'toggle_market' }],
+    [{ text: isEn ? '↩️ Back' : '↩️ Назад', callback_data: 'back_to_main' }]
+  ];
+  return { inline_keyboard: kb };
 }
 
-function buildCancelButton(lang) {
-  const isEn = String(lang).split('-')[0] === 'en';
-  return isEn ? { text: '↩️ Cancel' } : { text: '↩️ Отмена' };
-}
-
+function buildCancelButton(lang) { return String(lang).startsWith('en') ? { text: '↩️ Cancel' } : { text: '↩️ Отмена' }; }
 function buildDirectionKeyboard(lang) {
-  const isEn = String(lang).split('-')[0] === 'en';
-  if (isEn) {
-    return { keyboard: [[{ text: '⬆️ When above' }, { text: '⬇️ When below' }], [buildCancelButton(lang)]], resize_keyboard: true };
-  } else {
-    return { keyboard: [[{ text: '⬆️ Когда выше' }, { text: '⬇️ Когда ниже' }], [buildCancelButton(lang)]], resize_keyboard: true };
-  }
+  const isEn = String(lang).startsWith('en');
+  return { keyboard: [[{ text: isEn ? '⬆️ When above' : '⬆️ Когда выше' }, { text: isEn ? '⬇️ When below' : '⬇️ Когда ниже' }], [buildCancelButton(lang)]], resize_keyboard: true };
 }
-
 function buildAskSlKeyboard(lang) {
-  const isEn = String(lang).split('-')[0] === 'en';
-  if (isEn) {
-    return { keyboard: [[{ text: '🛑 Add SL' }, { text: '⏭️ Skip SL' }], [buildCancelButton(lang)]], resize_keyboard: true };
-  } else {
-    return { keyboard: [[{ text: '🛑 Добавить SL' }, { text: '⏭️ Без SL' }], [buildCancelButton(lang)]], resize_keyboard: true };
-  }
-}
-
-function inlineKeyboardSafe(buttonRows) {
-  const CALLBACK_DATA_LIMIT = 64;
-  if (!Array.isArray(buttonRows)) return null;
-  for (const row of buttonRows) {
-    for (const btn of row) {
-      const cd = String(btn.callback_data || '');
-      if (cd.length > CALLBACK_DATA_LIMIT - 4) return null;
-    }
-  }
-  return buttonRows;
+  const isEn = String(lang).startsWith('en');
+  return { keyboard: [[{ text: isEn ? '🛑 Add SL' : '🛑 Добавить SL' }, { text: isEn ? '⏭️ Skip SL' : '⏭️ Без SL' }], [buildCancelButton(lang)]], resize_keyboard: true };
 }
 
 async function safeCtxReply(ctx, text, opts = {}) {
-  try {
-    return await ctx.reply(text, opts);
-  } catch (e) {
+  try { return await ctx.reply(text, opts); }
+  catch (e) {
     try {
       const chatId = ctx.chat?.id || ctx.from?.id;
       return await safeSendTelegram(bot, 'sendMessage', [chatId, text, opts]);
-    } catch (err) {
-      console.error('safeCtxReply failed', err?.message || err, { text, opts });
-      throw err;
-    }
+    } catch (err) { throw err; }
   }
 }
 
-function adminNotify(text, opts = {}) {
-  if (!CREATOR_ID) return Promise.resolve();
-  return safeSendTelegram(bot, 'sendMessage', [CREATOR_ID, text, { parse_mode: 'Markdown', ...opts }]).catch((e) => {
-    console.warn('adminNotify failed', e?.message || e);
-  });
-}
-
 function startHeartbeat(intervalMs = 60_000) {
-  try { setLastHeartbeat(new Date().toISOString()); } catch (e) {}
-  setInterval(() => {
-    try {
-      setLastHeartbeat(new Date().toISOString());
-    } catch (e) {}
-  }, intervalMs);
+  try { setLastHeartbeat(new Date().toISOString()); } catch {}
+  setInterval(() => { try { setLastHeartbeat(new Date().toISOString()); } catch {} }, intervalMs);
 }
 
 bot.start(async (ctx) => {
@@ -166,8 +170,14 @@ bot.start(async (ctx) => {
   await ctx.reply(`${greet}\n${isEn ? '(Language: English)' : '(Язык: Русский)'}`, getMainMenuSync(ctx.from.id, lang));
 });
 
-bot.hears('⚙️ Настройки', async (ctx) => { const inline = await buildSettingsInlineForUser(ctx.from.id); await ctx.reply('Настройки отображения алертов:', { reply_markup: inline }); });
-bot.hears('⚙️ Settings', async (ctx) => { const inline = await buildSettingsInlineForUser(ctx.from.id); await ctx.reply('Display settings:', { reply_markup: inline }); });
+bot.hears('⚙️ Настройки', async (ctx) => {
+  const inline = await buildSettingsInlineForUser(ctx.from.id);
+  await ctx.reply('⚙️ Настройки\n— порядок новых алертов\n— язык сообщений\n— ежедневная мотивация\n— утренний отчёт по рынку\n\nНажимай, чтобы переключить.', { reply_markup: inline });
+});
+bot.hears('⚙️ Settings', async (ctx) => {
+  const inline = await buildSettingsInlineForUser(ctx.from.id);
+  await ctx.reply('⚙️ Settings\n— alerts order\n— language\n— daily motivation\n— morning market report\n\nTap to toggle.', { reply_markup: inline });
+});
 
 bot.hears('➕ Создать алерт', async (ctx) => {
   try {
@@ -176,13 +186,9 @@ bot.hears('➕ Создать алерт', async (ctx) => {
     const lang = await resolveUserLang(ctx.from.id);
     const recent = await getUserRecentSymbols(ctx.from.id);
     const suggest = [...new Set([...recent, ...['BTC','ETH','SOL','BNB','XRP','DOGE']])].slice(0,6).map(s=>({ text: s }));
-    const cancelBtn = buildCancelButton(lang);
-    const kb = suggest.length ? [suggest, [cancelBtn]] : [[cancelBtn]];
-    await ctx.reply(lang && String(lang).split('-')[0] === 'en' ? 'Enter symbol (e.g. BTC) or press a button:' : 'Введи символ (например BTC) или нажми кнопку:', { reply_markup: { keyboard: kb, resize_keyboard: true } });
-  } catch (e) {
-    ctx.session = {};
-    await ctx.reply('Ошибка при запуске создания алерта');
-  }
+    const kb = suggest.length ? [suggest, [buildCancelButton(lang)]] : [[buildCancelButton(lang)]];
+    await ctx.reply(String(lang).startsWith('en') ? 'Enter symbol (e.g. BTC) or press a button:' : 'Введи символ (например BTC) или нажми кнопку:', { reply_markup: { keyboard: kb, resize_keyboard: true } });
+  } catch { ctx.session = {}; await ctx.reply('Ошибка при запуске создания алерта'); }
 });
 bot.hears('➕ Create alert', async (ctx) => {
   try {
@@ -191,13 +197,9 @@ bot.hears('➕ Create alert', async (ctx) => {
     const lang = await resolveUserLang(ctx.from.id);
     const recent = await getUserRecentSymbols(ctx.from.id);
     const suggest = [...new Set([...recent, ...['BTC','ETH','SOL','BNB','XRP','DOGE']])].slice(0,6).map(s=>({ text: s }));
-    const cancelBtn = buildCancelButton(lang);
-    const kb = suggest.length ? [suggest, [cancelBtn]] : [[cancelBtn]];
-    await ctx.reply(lang && String(lang).split('-')[0] === 'en' ? 'Enter symbol (e.g. BTC) or press a button:' : 'Введи символ (например BTC) или нажми кнопку:', { reply_markup: { keyboard: kb, resize_keyboard: true } });
-  } catch (e) {
-    ctx.session = {};
-    await ctx.reply('Error starting alert creation.');
-  }
+    const kb = suggest.length ? [suggest, [buildCancelButton(lang)]] : [[buildCancelButton(lang)]];
+    await ctx.reply(String(lang).startsWith('en') ? 'Enter symbol (e.g. BTC) or press a button:' : 'Введи символ (например BTC) или нажми кнопку:', { reply_markup: { keyboard: kb, resize_keyboard: true } });
+  } catch { ctx.session = {}; await ctx.reply('Error starting alert creation.'); }
 });
 
 bot.hears('↩️ Отмена', async (ctx) => { ctx.session = {}; const lang = await resolveUserLang(ctx.from.id); await ctx.reply('Отмена ✅', getMainMenuSync(ctx.from.id, lang)); });
@@ -205,14 +207,12 @@ bot.hears('↩️ Cancel', async (ctx) => { ctx.session = {}; const lang = await
 
 bot.hears('📋 Мои алерты', async (ctx) => {
   try {
-    try { await bot.telegram.sendChatAction(ctx.chat.id, 'typing'); } catch (_){ }
+    try { await bot.telegram.sendChatAction(ctx.chat.id, 'typing'); } catch {}
     const lang = await resolveUserLang(ctx.from.id);
     const { pages } = await renderAlertsList(ctx.from.id, { fast: false, lang });
     const first = pages[0];
     await ctx.reply(first.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: first.buttons } });
-  } catch (e) {
-    await ctx.reply('Ошибка при получении алертов.');
-  }
+  } catch { await ctx.reply('Ошибка при получении алертов.'); }
 });
 bot.hears('📋 My alerts', async (ctx) => {
   try {
@@ -220,15 +220,57 @@ bot.hears('📋 My alerts', async (ctx) => {
     const { pages } = await renderAlertsList(ctx.from.id, { fast: false, lang });
     const first = pages[0];
     await ctx.reply(first.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: first.buttons } });
-  } catch (e) {
-    await ctx.reply('Error fetching alerts.');
-  }
+  } catch { await ctx.reply('Error fetching alerts.'); }
 });
+
+async function handleMarketSnapshotRequest(ctx) {
+  const pref = await resolveUserLang(ctx.from?.id, null, ctx.from?.language_code).catch(() => ctx.from?.language_code || 'ru');
+  const isEn = String(pref).toLowerCase().startsWith('en');
+  if (isLocked(ctx.from.id)) { return; }
+  lockReport(ctx.from.id, 30000);
+  try { await ctx.telegram.sendChatAction(ctx.chat.id, 'typing'); } catch {}
+  const typingTimer = startTyping(ctx);
+  const state = reportInFlight.get(ctx.from.id);
+  if (state) state.typingTimer = typingTimer;
+  try {
+    const m = await ctx.reply(isEn ? '⏳ Building your market report (takes a few seconds)…' : '⏳ Формирую ваш отчёт (несколько секунд)…', getMainMenuBusy(ctx.from.id, pref)).catch(()=>null);
+    if (state && m?.message_id) state.startedMsgId = m.message_id;
+  } catch {}
+  try {
+    const dateStr = new Date().toLocaleDateString('sv-SE', { timeZone: KYIV_TZ });
+    const res = await sendMarketReportToUser(bot, ctx.from.id, dateStr).catch(()=>null);
+    if (res?.ok) { return; }
+    const snap = await getMarketSnapshot(['BTC','ETH']).catch(()=>null);
+    if (!snap?.ok) {
+      await ctx.reply(isEn ? '⚠️ Failed to collect data.' : '⚠️ Не удалось собрать данные.');
+      return;
+    }
+    const html = await buildMorningReportHtml(snap.snapshots, pref);
+    await ctx.reply(html, { parse_mode: 'HTML' });
+  } catch {
+    await ctx.reply(isEn ? '⚠️ Error while generating the report.' : '⚠️ Ошибка при формировании отчёта.');
+  } finally {
+    try {
+      const s = reportInFlight.get(ctx.from.id);
+      if (s?.startedMsgId) { try { await ctx.deleteMessage(s.startedMsgId); } catch {} }
+    } catch {}
+    try {
+      await ctx.reply(isEn ? '✅ Ready.' : '✅ Готово.', getMainMenuSync(ctx.from.id, pref));
+    } catch {}
+    unlockReport(ctx.from.id);
+  }
+}
+
+bot.hears('📊 прислать данные мониторинга', handleMarketSnapshotRequest);
+bot.hears('📊 Send market snapshot', handleMarketSnapshotRequest);
+bot.command('market', handleMarketSnapshotRequest);
+bot.command('snapshot', handleMarketSnapshotRequest);
+bot.command('report', handleMarketSnapshotRequest);
 
 bot.hears('📜 Старые алерты', async (ctx) => {
   ctx.session = { step: 'old_alerts_select_days' };
   const lang = await resolveUserLang(ctx.from.id);
-  const isEn = String(lang).split('-')[0] === 'en';
+  const isEn = String(lang).startsWith('en');
   const kb = [[{ text: isEn ? '7 days' : '7 дней' }, { text: isEn ? '30 days' : '30 дней' }, { text: isEn ? '90 days' : '90 дней' }], [buildCancelButton(lang)]];
   await ctx.reply(isEn ? 'Choose a period to view old alerts:' : 'Выбери период для просмотра старых алертов:', { reply_markup: { keyboard: kb, resize_keyboard: true } });
 });
@@ -241,57 +283,20 @@ bot.hears('📜 Old alerts', async (ctx) => {
 bot.hears('🔎 Поиск старых алертов', async (ctx) => {
   ctx.session = { step: 'old_alerts_search' };
   const lang = await resolveUserLang(ctx.from.id);
-  await ctx.reply(lang && String(lang).split('-')[0] === 'en' ? 'Enter query in format: SYMBOL [DAYS]\nExamples: "BTC", "BTC 30". Default DAYS=30.' : 'Введи запрос в формате: SYMBOL [DAYS]\nПримеры: "BTC", "BTC 30". По умолчанию DAYS=30.', { reply_markup: { keyboard: [[buildCancelButton(lang)]], resize_keyboard: true } });
+  await ctx.reply(String(lang).startsWith('en') ? 'Enter query in format: SYMBOL [DAYS]\nExamples: "BTC", "BTC 30". Default DAYS=30.' : 'Введи запрос в формате: SYMBOL [DAYS]\nПримеры: "BTC", "BTC 30". По умолчанию DAYS=30.', { reply_markup: { keyboard: [[buildCancelButton(lang)]], resize_keyboard: true } });
 });
 bot.hears('🔎 Search old alerts', async (ctx) => {
   ctx.session = { step: 'old_alerts_search' };
   await ctx.reply('Enter query in format: SYMBOL [DAYS]\nExamples: "BTC", "BTC 30". Default DAYS=30.', { reply_markup: { keyboard: [[buildCancelButton('en')]], resize_keyboard: true } });
 });
 
-bot.hears('🌅 Прислать мотивацию', async (ctx) => {
-  try {
-    if (!CREATOR_ID || String(ctx.from.id) !== String(CREATOR_ID)) return ctx.reply('У вас нет доступа к этой команде.');
-    const dateStr = new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Kyiv' });
-    const ok = await sendDailyToUser(bot, ctx.from.id, dateStr, { disableNotification: false });
-    if (ok) {
-      const { pendingDailySendsCollection } = await import('./db.js');
-      await pendingDailySendsCollection.updateOne({ userId: ctx.from.id, date: dateStr }, { $set: { sent: true, sentAt: new Date(), quoteSent: true, permanentFail: false } }, { upsert: true });
-    } else {
-      const { pendingDailySendsCollection } = await import('./db.js');
-      await pendingDailySendsCollection.updateOne({ userId: ctx.from.id, date: dateStr }, { $set: { sent: false, createdAt: new Date(), permanentFail: true } }, { upsert: true });
-    }
-  } catch (e) {
-    await ctx.reply('Ошибка при отправке мотивации');
-  }
+bot.hears(['🛠️ Техподдержка/пожелания', 'Пожелания/техподдержка', '🛠️ Support/wishes', 'Wishes/Support'], async (ctx) => {
+  const lang = await resolveUserLang(ctx.from.id);
+  const msg = String(lang).startsWith('en')
+    ? "The bot is completely free and has no restrictions. If you have suggestions to improve functionality, want to add something, or would like to thank me with a cup of coffee — write to me in private @pirial_mersus"
+    : "Бот полностью бесплатен и в нем нет никаких ограничений. Если у вас есть какие то предложения по улучшению функциональности. Или вам хочется чтото добавить. Или вы хотите отблагодарить меня чашечкой кофе - напишите в личку @pirial_mersus";
+  await ctx.reply(msg, getMainMenuSync(ctx.from.id, lang));
 });
-bot.hears('🌅 Send motivation', async (ctx) => {
-  try {
-    if (!CREATOR_ID || String(ctx.from.id) !== String(CREATOR_ID)) return ctx.reply("You don't have access to this command.");
-    const dateStr = new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Kyiv' });
-    const ok = await sendDailyToUser(bot, ctx.from.id, dateStr, { disableNotification: false });
-    if (ok) {
-      const { pendingDailySendsCollection } = await import('./db.js');
-      await pendingDailySendsCollection.updateOne({ userId: ctx.from.id, date: dateStr }, { $set: { sent: true, sentAt: new Date(), quoteSent: true, permanentFail: false } }, { upsert: true });
-    } else {
-      const { pendingDailySendsCollection } = await import('./db.js');
-      await pendingDailySendsCollection.updateOne({ userId: ctx.from.id, date: dateStr }, { $set: { sent: false, createdAt: new Date(), permanentFail: true } }, { upsert: true });
-      await ctx.reply('Failed to send motivation (check logs).');
-    }
-  } catch (e) {
-    await ctx.reply('Error sending motivation.');
-  }
-});
-
-bot.hears(
-  ['🛠️ Техподдержка/пожелания', 'Пожелания/техподдержка', '🛠️ Support/wishes', 'Wishes/Support'],
-  async (ctx) => {
-    const lang = await resolveUserLang(ctx.from.id);
-    const msg = lang && String(lang).split('-')[0] === 'en'
-      ? "The bot is completely free and has no restrictions. If you have suggestions to improve functionality, want to add something, or would like to thank me with a cup of coffee — write to me in private @pirial_mersus"
-      : "Бот полностью бесплатен и в нем нет никаких ограничений. Если у вас есть какие то предложения по улучшению функциональности. Или вам хочется чтото добавить. Или вы хотите отблагодарить меня чашечкой кофе - напишите в личку @pirial_mersus";
-    await ctx.reply(msg, getMainMenuSync(ctx.from.id, lang));
-  }
-);
 
 async function handleActiveUsers(ctx) {
   try {
@@ -302,16 +307,11 @@ async function handleActiveUsers(ctx) {
     let activeCount;
     try {
       activeCount = await countDocumentsWithTimeout('users', { lastActive: { $gte: cutoff }, $or: [{ botBlocked: { $exists: false } }, { botBlocked: false }] }, 7000);
-    }
-    catch (err) {
-      return ctx.reply('Ошибка получения статистики (таймаут или проблема с БД). Попробуйте позже.');
-    }
+    } catch { return ctx.reply('Ошибка получения статистики (таймаут или проблема с БД). Попробуйте позже.'); }
     statsCache.count = activeCount;
     statsCache.time = now;
     await ctx.reply(`👥 Активных пользователей за последние ${INACTIVE_DAYS} дней: ${activeCount}`);
-  } catch (e) {
-    await ctx.reply('Ошибка получения статистики.');
-  }
+  } catch { await ctx.reply('Ошибка получения статистики.'); }
 }
 
 bot.hears('👥 Количество активных пользователей', async (ctx) => { await handleActiveUsers(ctx); });
@@ -325,10 +325,64 @@ bot.on('callback_query', async (ctx) => {
     const lang = await resolveUserLang(ctx.from.id);
 
     if (data === 'back_to_main') {
+      try { await ctx.editMessageReplyMarkup({ inline_keyboard: [] }); } catch {}
+      try { await ctx.reply(String(lang).startsWith('en') ? 'Back to main' : 'Назад в меню', getMainMenuSync(ctx.from.id, lang)); } catch {}
+      await ctx.answerCbQuery();
+      return;
+    }
+
+    if (data === 'toggle_order') {
+      const cur = await getUserAlertsOrder(ctx.from.id).catch(()=> 'new_bottom');
+      const next = cur === 'new_top' ? 'new_bottom' : 'new_top';
+      await setUserAlertsOrder(ctx.from.id, next).catch(()=>{});
+      const inline = await buildSettingsInlineForUser(ctx.from.id, lang);
+      try { await ctx.editMessageReplyMarkup(inline); } catch {}
+      await ctx.answerCbQuery();
+      return;
+    }
+
+    if (data === 'toggle_lang') {
+      const cur = await resolveUserLang(ctx.from.id).catch(()=> 'ru');
+      const next = String(cur).startsWith('en') ? 'ru' : 'en';
       try {
-        await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
-      } catch (e) {}
-      try { await ctx.reply(lang && String(lang).split('-')[0] === 'en' ? 'Back to main' : 'Назад в меню', getMainMenuSync(ctx.from.id, lang)); } catch {}
+        const { usersCollection } = await import('./db.js');
+        await usersCollection.updateOne({ userId: ctx.from.id }, { $set: { preferredLang: next } }, { upsert: true });
+      } catch {}
+      try { await ctx.reply(next === 'en' ? 'Language switched to English.' : 'Я переключился на русский.', getMainMenuSync(ctx.from.id, next)); } catch {}
+      const inline = await buildSettingsInlineForUser(ctx.from.id, next);
+      try {
+        const header = next === 'en'
+          ? '⚙️ Settings\n— alerts order\n— language\n— daily motivation\n— morning market report\n\nTap to toggle.'
+          : '⚙️ Настройки\n— порядок новых алертов\n— язык сообщений\n— ежедневная мотивация\n— утренний отчёт по рынку\n\nНажимай, чтобы переключить.';
+        try { await ctx.editMessageText(header, { reply_markup: inline }); }
+        catch { await ctx.editMessageReplyMarkup(inline); }
+      } catch {}
+      await ctx.answerCbQuery();
+      return;
+    }
+
+    if (data === 'toggle_motivation') {
+      try {
+        const { usersCollection } = await import('./db.js');
+        const u = await usersCollection.findOne({ userId: ctx.from.id }) || {};
+        const next = !(u.sendMotivation !== false);
+        await usersCollection.updateOne({ userId: ctx.from.id }, { $set: { sendMotivation: next } }, { upsert: true });
+      } catch {}
+      const inline = await buildSettingsInlineForUser(ctx.from.id, lang);
+      try { await ctx.editMessageReplyMarkup(inline); } catch {}
+      await ctx.answerCbQuery();
+      return;
+    }
+
+    if (data === 'toggle_market') {
+      try {
+        const { usersCollection } = await import('./db.js');
+        const u = await usersCollection.findOne({ userId: ctx.from.id }) || {};
+        const next = !(u.sendMarketReport !== false);
+        await usersCollection.updateOne({ userId: ctx.from.id }, { $set: { sendMarketReport: next } }, { upsert: true });
+      } catch {}
+      const inline = await buildSettingsInlineForUser(ctx.from.id, lang);
+      try { await ctx.editMessageReplyMarkup(inline); } catch {}
       await ctx.answerCbQuery();
       return;
     }
@@ -338,9 +392,8 @@ bot.on('callback_query', async (ctx) => {
       const pageIdx = parseInt(mPage[1], 10);
       const { pages } = await renderAlertsList(ctx.from.id, { fast: true, lang });
       const page = pages[Math.max(0, Math.min(pageIdx, pages.length - 1))] || pages[0];
-      try {
-        await ctx.editMessageText(page.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: page.buttons } });
-      } catch (e) { try { await ctx.reply(page.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: page.buttons } }); } catch {} }
+      try { await ctx.editMessageText(page.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: page.buttons } }); }
+      catch { try { await ctx.reply(page.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: page.buttons } }); } catch {} }
       await ctx.answerCbQuery();
       return;
     }
@@ -354,7 +407,7 @@ bot.on('callback_query', async (ctx) => {
       if (token !== 'all') sourcePage = Math.max(0, Math.min(parseInt(token, 10), totalPages - 1));
       const inline = await buildDeleteInlineForUser(ctx.from.id, { fast: true, sourcePage, totalPages: (sourcePage === null ? null : totalPages), lang });
       try { await ctx.editMessageReplyMarkup({ inline_keyboard: inline }); }
-      catch (err) {
+      catch {
         try { const originalText = ctx.update.callback_query.message?.text || 'Your alerts'; await ctx.reply(originalText, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: inline } }); } catch {}
       }
       await ctx.answerCbQuery();
@@ -367,7 +420,7 @@ bot.on('callback_query', async (ctx) => {
       const { pages } = await renderAlertsList(ctx.from.id, { fast: true, lang });
       const page = pages[Math.max(0, Math.min(p, pages.length - 1))] || pages[0];
       try { await ctx.editMessageText(page.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: page.buttons } }); }
-      catch (e) { try { await ctx.reply(page.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: page.buttons } }); } catch {} }
+      catch { try { await ctx.reply(page.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: page.buttons } }); } catch {} }
       await ctx.answerCbQuery();
       return;
     }
@@ -376,11 +429,10 @@ bot.on('callback_query', async (ctx) => {
     if (mSet) {
       const order = mSet[1];
       await setUserAlertsOrder(ctx.from.id, order).catch(()=>{});
-      const inline = await buildSettingsInlineForUser(ctx.from.id);
-      try {
-        await ctx.editMessageReplyMarkup(inline);
-      } catch (e) { try { await ctx.reply(lang && String(lang).split('-')[0] === 'en' ? 'Order set' : 'Порядок установлен', { reply_markup: inline }); } catch {} }
-      await ctx.answerCbQuery(lang && String(lang).split('-')[0] === 'en' ? 'Order set' : 'Порядок установлен');
+      const inline = await buildSettingsInlineForUser(ctx.from.id, lang);
+      try { await ctx.editMessageReplyMarkup(inline); }
+      catch { try { await ctx.reply(String(lang).startsWith('en') ? 'Order set' : 'Порядок установлен', { reply_markup: inline }); } catch {} }
+      await ctx.answerCbQuery(String(lang).startsWith('en') ? 'Order set' : 'Порядок установлен');
       return;
     }
 
@@ -401,18 +453,13 @@ bot.on('callback_query', async (ctx) => {
           const alertsBefore = await getUserAlertsCached(ctx.from.id);
           const idxBefore = alertsBefore.findIndex(a => String(a._id) === String(doc._id) || a._id?.toString() === id);
           if (idxBefore >= 0) sourcePage = Math.floor(idxBefore / ENTRIES_PER_PAGE); else sourcePage = 0;
-        } catch (e) { sourcePage = 0; }
+        } catch { sourcePage = 0; }
       }
 
       try {
         const { alertsArchiveCollection } = await import('./db.js');
-        await alertsArchiveCollection.insertOne({
-          ...doc,
-          deletedAt: new Date(),
-          deleteReason: 'user_deleted',
-          archivedAt: new Date()
-        });
-      } catch (e) {}
+        await alertsArchiveCollection.insertOne({ ...doc, deletedAt: new Date(), deleteReason: 'user_deleted', archivedAt: new Date() });
+      } catch {}
 
       const { alertsCollection: ac } = await import('./db.js');
       await ac.deleteOne({ _id: new ObjectId(id) });
@@ -422,22 +469,23 @@ bot.on('callback_query', async (ctx) => {
       const computedTotalPages = Math.max(1, Math.ceil((alertsAfter?.length || 0) / ENTRIES_PER_PAGE));
       if (sourcePage !== null) { sourcePage = Math.max(0, Math.min(sourcePage, computedTotalPages - 1)); }
 
-      const inline = await buildDeleteInlineForUser(ctx.from.id, { fast: true, sourcePage, totalPages: (sourcePage === null ? null : computedTotalPages), lang });
+      const inline2 = await buildDeleteInlineForUser(ctx.from.id, { fast: true, sourcePage, totalPages: (sourcePage === null ? null : computedTotalPages), lang });
 
-      if (!inline || inline.length === 0) {
-        try { await ctx.editMessageText(lang && String(lang).split('-')[0] === 'en' ? 'You have no active alerts.' : 'У тебя больше нет активных алертов.', { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [] } }); } catch {}
-        await ctx.answerCbQuery(lang && String(lang).split('-')[0] === 'en' ? 'Alert deleted' : 'Алерт удалён');
+      if (!inline2 || inline2.length === 0) {
+        try { await ctx.editMessageText(String(lang).startsWith('en') ? 'You have no active alerts.' : 'У тебя больше нет активных алертов.', { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [] } }); } catch {}
+        await ctx.answerCbQuery(String(lang).startsWith('en') ? 'Alert deleted' : 'Алерт удалён');
         return;
       }
 
-      try { await ctx.editMessageReplyMarkup({ inline_keyboard: inline }); } catch (err) {
+      try { await ctx.editMessageReplyMarkup({ inline_keyboard: inline2 }); }
+      catch {
         try {
-          const originalText = ctx.update.callback_query.message?.text || (lang && String(lang).split('-')[0] === 'en' ? 'Your alerts' : 'Твои алерты');
-          await ctx.reply(originalText, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: inline } });
-        } catch (e) {}
+          const originalText = ctx.update.callback_query.message?.text || (String(lang).startsWith('en') ? 'Your alerts' : 'Твои алерты');
+          await ctx.reply(originalText, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: inline2 } });
+        } catch {}
       }
 
-      await ctx.answerCbQuery(lang && String(lang).split('-')[0] === 'en' ? 'Alert deleted' : 'Алерт удалён');
+      await ctx.answerCbQuery(String(lang).startsWith('en') ? 'Alert deleted' : 'Алерт удалён');
       return;
     }
 
@@ -451,11 +499,8 @@ bot.on('callback_query', async (ctx) => {
       const opts = { days, symbol: q || null, token, lang };
       const { pages } = await renderOldAlertsList(ctx.from.id, opts);
       const page = pages[Math.max(0, Math.min(pageIdx, pages.length - 1))] || pages[0];
-      try {
-        await ctx.editMessageText(page.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: page.buttons } });
-      } catch (e) {
-        try { await ctx.reply(page.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: page.buttons } }); } catch {}
-      }
+      try { await ctx.editMessageText(page.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: page.buttons } }); }
+      catch { try { await ctx.reply(page.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: page.buttons } }); } catch {} }
       await ctx.answerCbQuery();
       return;
     }
@@ -467,9 +512,9 @@ bot.on('callback_query', async (ctx) => {
         const { usersCollection } = await import('./db.js');
         await usersCollection.updateOne({ userId: ctx.from.id }, { $set: { preferredLang: newLang } }, { upsert: true });
         await ctx.reply(newLang === 'en' ? 'Language switched to English.' : 'Я переключился на русский.', getMainMenuSync(ctx.from.id, newLang));
-        const inline = await buildSettingsInlineForUser(ctx.from.id);
+        const inline = await buildSettingsInlineForUser(ctx.from.id, newLang);
         try { await ctx.editMessageReplyMarkup(inline); } catch {}
-      } catch (e) {}
+      } catch {}
       await ctx.answerCbQuery();
       return;
     }
@@ -477,17 +522,14 @@ bot.on('callback_query', async (ctx) => {
     if (data === 'clear_old_alerts_confirm') {
       const isEn = String(lang).split('-')[0] === 'en';
       const text = isEn ? 'Are you sure?' : 'Вы уверены?';
-      const inline = { inline_keyboard: [[
-          { text: isEn ? 'Yes' : 'Да', callback_data: 'clear_old_alerts_yes' },
-          { text: isEn ? 'No' : 'Нет', callback_data: 'clear_old_alerts_no' }
-        ]]};
-      try { await ctx.editMessageText(text, { reply_markup: inline }); } catch (e) { try { await ctx.reply(text, { reply_markup: inline }); } catch {} }
+      const inline = { inline_keyboard: [[{ text: isEn ? 'Yes' : 'Да', callback_data: 'clear_old_alerts_yes' }, { text: isEn ? 'No' : 'Нет', callback_data: 'clear_old_alerts_no' }]] };
+      try { await ctx.editMessageText(text, { reply_markup: inline }); } catch { try { await ctx.reply(text, { reply_markup: inline }); } catch {} }
       await ctx.answerCbQuery();
       return;
     }
 
     if (data === 'clear_old_alerts_no') {
-      try { await ctx.editMessageReplyMarkup({ inline_keyboard: [] }); } catch (e) {}
+      try { await ctx.editMessageReplyMarkup({ inline_keyboard: [] }); } catch {}
       await ctx.answerCbQuery();
       return;
     }
@@ -499,8 +541,8 @@ bot.on('callback_query', async (ctx) => {
         const res = await alertsMod.clearUserOldAlerts(ctx.from.id, { forceAll: true });
         const deleted = res?.deletedCount || 0;
         const msg = deleted ? (isEn ? `Deleted ${deleted} items.` : `Удалено ${deleted} записей.`) : (isEn ? 'No old alerts to delete.' : 'Нет старых алертов для удаления.');
-        try { await ctx.editMessageText(msg, { reply_markup: { inline_keyboard: [] } }); } catch (e) { try { await ctx.reply(msg); } catch {} }
-      } catch (e) {
+        try { await ctx.editMessageText(msg, { reply_markup: { inline_keyboard: [] } }); } catch { try { await ctx.reply(msg); } catch {} }
+      } catch {
         try { await ctx.answerCbQuery('Error'); } catch {}
       }
       await ctx.answerCbQuery();
@@ -508,7 +550,7 @@ bot.on('callback_query', async (ctx) => {
     }
 
     await ctx.answerCbQuery();
-  } catch (e) {
+  } catch {
     try { await ctx.answerCbQuery('Ошибка'); } catch {}
   }
 });
@@ -519,26 +561,20 @@ bot.on('text', async (ctx) => {
     const textRaw = (ctx.message.text || '').trim();
     const text = textRaw;
 
-    const daysMap = {
-      '7 дней': 7, '30 дней': 30, '90 дней': 90,
-      '7 days': 7, '30 days': 30, '90 days': 90
-    };
+    const daysMap = { '7 дней': 7, '30 дней': 30, '90 дней': 90, '7 days': 7, '30 days': 30, '90 days': 90 };
     const numeric = parseInt(text.replace(/\D/g, ''), 10);
     const isNumericDay = Number.isFinite(numeric) && [7, 30, 90].includes(numeric);
     const normalized = text.toLowerCase();
     const isDaysPhrase = daysMap[text] || daysMap[normalized] || isNumericDay || /^\d+\s*дн/i.test(text) || /^\d+\s*day/i.test(text);
-    if (( !step || step === 'old_alerts_select_days' ) && isDaysPhrase) {
+    if ((!step || step === 'old_alerts_select_days') && isDaysPhrase) {
       const days = daysMap[text] || daysMap[normalized] || (isNumericDay ? numeric : 30);
       const token = `d${days}_q`;
       const lang = await resolveUserLang(ctx.from.id);
       const { pages } = await renderOldAlertsList(ctx.from.id, { days, symbol: null, token, lang });
       const first = pages[0];
       ctx.session = {};
-      if (first.buttons && first.buttons.length) {
-        await ctx.reply(first.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: first.buttons } });
-      } else {
-        await ctx.reply(first.text, getMainMenuSync(ctx.from.id, lang));
-      }
+      if (first.buttons && first.buttons.length) { await ctx.reply(first.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: first.buttons } }); }
+      else { await ctx.reply(first.text, getMainMenuSync(ctx.from.id, lang)); }
       return;
     }
 
@@ -550,14 +586,11 @@ bot.on('text', async (ctx) => {
       const symbol = `${base}-USDT`;
       const price = await getCachedPrice(symbol);
       if (Number.isFinite(price)) {
-        try { await pushRecentSymbol(ctx.from.id, base); } catch (e) {}
+        try { await pushRecentSymbol(ctx.from.id, base); } catch {}
         ctx.session.symbol = symbol;
         ctx.session.step = 'alert_condition';
         const lang = await resolveUserLang(ctx.from.id);
-        await ctx.reply(lang && String(lang).split('-')[0] === 'en' ? `✅ Coin: *${symbol}* Current price: *${fmtNum(price)}* Choose direction:` : `✅ Монета: *${symbol}* Текущая цена: *${fmtNum(price)}* Выбери направление:`, {
-          parse_mode: 'Markdown',
-          reply_markup: buildDirectionKeyboard(lang)
-        });
+        await ctx.reply(String(lang).startsWith('en') ? `✅ Coin: *${symbol}* Current price: *${fmtNum(price)}* Choose direction:` : `✅ Монета: *${symbol}* Текущая цена: *${fmtNum(price)}* Выбери направление:`, { parse_mode: 'Markdown', reply_markup: buildDirectionKeyboard(lang) });
       } else {
         await ctx.reply('Пара не найдена на KuCoin. Попробуй другой символ.');
         ctx.session = {};
@@ -569,9 +602,9 @@ bot.on('text', async (ctx) => {
       const lang = await resolveUserLang(ctx.from.id);
       if (text === '⬆️ Когда выше' || text === '⬆️ When above') ctx.session.alertCondition = '>';
       else if (text === '⬇️ Когда ниже' || text === '⬇️ When below') ctx.session.alertCondition = '<';
-      else { await ctx.reply(lang && String(lang).split('-')[0] === 'en' ? 'Choose ⬆️ or ⬇️' : 'Выбери ⬆️ или ⬇️'); return; }
+      else { await ctx.reply(String(lang).startsWith('en') ? 'Choose ⬆️ or ⬇️' : 'Выбери ⬆️ или ⬇️'); return; }
       ctx.session.step = 'alert_price';
-      await ctx.reply(lang && String(lang).split('-')[0] === 'en' ? 'Enter alert price:' : 'Введи цену уведомления:', { reply_markup: { keyboard: [[buildCancelButton(lang)]], resize_keyboard:true } });
+      await ctx.reply(String(lang).startsWith('en') ? 'Enter alert price:' : 'Введи цену уведомления:', { reply_markup: { keyboard: [[buildCancelButton(lang)]], resize_keyboard:true } });
       return;
     }
 
@@ -581,8 +614,8 @@ bot.on('text', async (ctx) => {
       ctx.session.alertPrice = v;
       ctx.session.step = 'ask_sl';
       const lang = await resolveUserLang(ctx.from.id);
-      const hint = ctx.session.alertCondition === '>' ? (lang && String(lang).split('-')[0] === 'en' ? 'SL will be higher (for short — reverse)' : 'SL будет выше (для шорта — логика обратная)') : (lang && String(lang).split('-')[0] === 'en' ? 'SL will be lower' : 'SL будет ниже');
-      await ctx.reply((lang && String(lang).split('-')[0] === 'en' ? 'Add stop-loss?' : 'Добавить стоп-лосс?') + ` ${hint}`, { reply_markup: buildAskSlKeyboard(lang) });
+      const hint = ctx.session.alertCondition === '>' ? (String(lang).startsWith('en') ? 'SL will be higher (for short — reverse)' : 'SL будет выше (для шорта — логика обратная)') : (String(lang).startsWith('en') ? 'SL will be lower' : 'SL будет ниже');
+      await ctx.reply((String(lang).startsWith('en') ? 'Add stop-loss?' : 'Добавить стоп-лосс?') + ` ${hint}`, { reply_markup: buildAskSlKeyboard(lang) });
       return;
     }
 
@@ -590,27 +623,23 @@ bot.on('text', async (ctx) => {
       const { alertsCollection } = await import('./db.js');
       const limit = await getUserAlertLimit(ctx.from.id).catch(()=>1000000000);
       let currentCount = 0;
-      try {
-        currentCount = await alertsCollection.countDocuments({ userId: ctx.from.id });
-      } catch (e) {
-        const currentAlerts = await getUserAlertsCached(ctx.from.id).catch(()=>[]);
-        currentCount = (currentAlerts?.length || 0);
-      }
+      try { currentCount = await alertsCollection.countDocuments({ userId: ctx.from.id }); }
+      catch { const currentAlerts = await getUserAlertsCached(ctx.from.id).catch(()=>[]); currentCount = (currentAlerts?.length || 0); }
 
       if (currentCount >= limit) {
         const lang = await resolveUserLang(ctx.from.id);
-        await ctx.reply(lang && String(lang).split('-')[0] === 'en' ? `You already have ${currentCount} alerts — limit ${limit}. Contact @pirial_gena to increase.` : `У тебя уже ${currentCount} алертов — достигнут лимит ${limit}. Если нужно увеличить лимит, напиши мне: @pirial_gena`, getMainMenuSync(ctx.from.id, lang));
+        await ctx.reply(String(lang).startsWith('en') ? `You already have ${currentCount} alerts — limit ${limit}. Contact @pirial_gena to increase.` : `У тебя уже ${currentCount} алертов — достигнут лимит ${limit}. Если нужно увеличить лимит, напиши мне: @pirial_genа`, getMainMenuSync(ctx.from.id, lang));
         ctx.session = {};
         return;
       }
 
       const lang = await resolveUserLang(ctx.from.id);
-      if (text === (lang && String(lang).split('-')[0] === 'en' ? '⏭️ Skip SL' : '⏭️ Без SL')) {
+      if (text === (String(lang).startsWith('en') ? '⏭️ Skip SL' : '⏭️ Без SL')) {
         try {
           const { alertsCollection: ac } = await import('./db.js');
           const beforeInsertCount = await ac.countDocuments({ userId: ctx.from.id }).catch(()=>currentCount);
           if (beforeInsertCount >= limit) {
-            await ctx.reply(lang && String(lang).split('-')[0] === 'en' ? `You already have ${beforeInsertCount} alerts — limit ${limit}.` : `У тебя уже ${beforeInsertCount} алертов — достигнут лимит ${limit}. Если нужно увеличить лимит, напиши мне: @pirial_gena`, getMainMenuSync(ctx.from.id, lang));
+            await ctx.reply(String(lang).startsWith('en') ? `You already have ${beforeInsertCount} alerts — limit ${limit}.` : `У тебя уже ${beforeInsertCount} алертов — достигнут лимит ${limit}. Если нужно увеличить лимит, напиши мне: @pirial_gena`, getMainMenuSync(ctx.from.id, lang));
             ctx.session = {};
             return;
           }
@@ -618,23 +647,23 @@ bot.on('text', async (ctx) => {
           await ac.insertOne({ userId: ctx.from.id, symbol: ctx.session.symbol, condition: ctx.session.alertCondition, price: ctx.session.alertPrice, type: 'alert', createdAt: new Date() });
           invalidateUserAlertsCache(ctx.from.id);
           const cp = await getCachedPrice(ctx.session.symbol);
-          const isEn = String(lang).split('-')[0] === 'en';
+          const isEn = String(lang).startsWith('en');
           const currentBold = `*${fmtNum(cp) ?? '—'}*`;
           const conditionLine = ctx.session.alertCondition === '>' ? (isEn ? '⬆️ when above' : '⬆️ выше') : (isEn ? '⬇️ when below' : '⬇️ ниже');
           const msg = isEn
             ? `✅ Alert created:\n🔔 ${ctx.session.symbol}\n${conditionLine} ${fmtNum(ctx.session.alertPrice)}\nCurrent: ${currentBold}`
             : `✅ Алерт создан:\n🔔 ${ctx.session.symbol}\n${conditionLine} ${fmtNum(ctx.session.alertPrice)}\nТекущая: ${currentBold}`;
           await ctx.reply(msg, { parse_mode: 'Markdown', ...getMainMenuSync(ctx.from.id, lang) });
-        } catch (e) { await ctx.reply('Ошибка при создании алерта'); }
+        } catch { await ctx.reply('Ошибка при создании алерта'); }
         ctx.session = {};
         return;
       }
-      if (text === (lang && String(lang).split('-')[0] === 'en' ? '🛑 Add SL' : '🛑 Добавить SL')) {
+      if (text === (String(lang).startsWith('en') ? '🛑 Add SL' : '🛑 Добавить SL')) {
         ctx.session.step = 'sl_price';
-        await ctx.reply(lang && String(lang).split('-')[0] === 'en' ? 'Enter stop-loss price:' : 'Введи цену стоп-лосса:', { reply_markup: { keyboard: [[buildCancelButton(lang)]], resize_keyboard:true } });
+        await ctx.reply(String(lang).startsWith('en') ? 'Enter stop-loss price:' : 'Введи цену стоп-лосса:', { reply_markup: { keyboard: [[buildCancelButton(lang)]], resize_keyboard:true } });
         return;
       }
-      await ctx.reply(lang && String(lang).split('-')[0] === 'en' ? 'Choose: 🛑 Add SL / ⏭️ Skip SL' : 'Выбери опцию: 🛑 Добавить SL / ⏭️ Без SL');
+      await ctx.reply(String(lang).startsWith('en') ? 'Choose: 🛑 Add SL / ⏭️ Skip SL' : 'Выбери опцию: 🛑 Добавить SL / ⏭️ Без SL');
       return;
     }
 
@@ -645,16 +674,12 @@ bot.on('text', async (ctx) => {
       const { alertsCollection } = await import('./db.js');
       const limit = await getUserAlertLimit(ctx.from.id).catch(()=>1000000000);
       let currentCount = 0;
-      try {
-        currentCount = await alertsCollection.countDocuments({ userId: ctx.from.id });
-      } catch (e) {
-        const currentAlerts = await getUserAlertsCached(ctx.from.id).catch(()=>[]);
-        currentCount = (currentAlerts?.length || 0);
-      }
+      try { currentCount = await alertsCollection.countDocuments({ userId: ctx.from.id }); }
+      catch { const currentAlerts = await getUserAlertsCached(ctx.from.id).catch(()=>[]); currentCount = (currentAlerts?.length || 0); }
 
       if (currentCount + 2 > limit) {
         const lang = await resolveUserLang(ctx.from.id);
-        await ctx.reply(lang && String(lang).split('-')[0] === 'en' ? `Can't create pair (alert + SL). You have ${currentCount} alerts, limit ${limit}.` : `Нельзя создать связку (уведомление + SL). У тебя сейчас ${currentCount} алертов, лимит ${limit}. Чтобы увеличить лимит напиши: @pirial_gena`, getMainMenuSync(ctx.from.id, lang));
+        await ctx.reply(String(lang).startsWith('en') ? `Can't create pair (alert + SL). You have ${currentCount} alerts, limit ${limit}.` : `Нельзя создать связку (уведомление + SL). У тебя сейчас ${currentCount} алертов, лимит ${limit}. Чтобы увеличить лимит напиши: @pirial_genа`, getMainMenuSync(ctx.from.id, lang));
         ctx.session = {};
         return;
       }
@@ -664,7 +689,7 @@ bot.on('text', async (ctx) => {
         const beforeInsertCount = await alertsCollection.countDocuments({ userId: ctx.from.id }).catch(()=>currentCount);
         if (beforeInsertCount + 2 > limit) {
           const lang = await resolveUserLang(ctx.from.id);
-          await ctx.reply(lang && String(lang).split('-')[0] === 'en' ? `Can't create pair (alert + SL). You have ${beforeInsertCount} alerts, limit ${limit}.` : `Нельзя создать связку (уведомление + SL). У тебя сейчас ${beforeInsertCount} алертов, лимит ${limit}. Чтобы увеличить лимит напиши: @pirial_gena`, getMainMenuSync(ctx.from.id, lang));
+          await ctx.reply(String(lang).startsWith('en') ? `Can't create pair (alert + SL). You have ${beforeInsertCount} alerts, limit ${limit}.` : `Нельзя создать связку (уведомление + SL). У тебя сейчас ${beforeInsertCount} алертов, лимит ${limit}. Чтобы увеличить лимит напиши: @pirial_genа`, getMainMenuSync(ctx.from.id, lang));
           ctx.session = {};
           return;
         }
@@ -678,15 +703,15 @@ bot.on('text', async (ctx) => {
         invalidateUserAlertsCache(ctx.from.id);
         const cp = await getCachedPrice(ctx.session.symbol);
         const lang = await resolveUserLang(ctx.from.id);
-        const isEn = String(lang).split('-')[0] === 'en';
+        const isEn = String(lang).startsWith('en');
         const currentBold = `*${fmtNum(cp) ?? '—'}*`;
         const conditionLine = ctx.session.alertCondition === '>' ? (isEn ? '⬆️ when above' : '⬆️ выше') : (isEn ? '⬇️ when below' : '⬇️ ниже');
-        const slLine = isEn ? `🛑 SL (${slDir}) ${fmtNum(sl)}` : `🛑 SL (${slDir}) ${fmtNum(sl)}`;
+        const slLine = `🛑 SL (${slDir}) ${fmtNum(sl)}`;
         const msg = isEn
-          ? `✅ Pair created:\n🔔 ${ctx.session.symbol}\n${conditionLine} ${fmtNum(ctx.session.alertPrice)}\n🛑 SL (${slDir}) ${fmtNum(sl)}\nCurrent: ${currentBold}`
-          : `✅ Создана связка:\n🔔 ${ctx.session.symbol}\n${conditionLine} ${fmtNum(ctx.session.alertPrice)}\n🛑 SL (${slDir}) ${fmtNum(sl)}\nТекущая: ${currentBold}`;
+          ? `✅ Pair created:\n🔔 ${ctx.session.symbol}\n${conditionLine} ${fmtNum(ctx.session.alertPrice)}\n${slLine}\nCurrent: ${currentBold}`
+          : `✅ Создана связка:\n🔔 ${ctx.session.symbol}\n${conditionLine} ${fmtNum(ctx.session.alertPrice)}\n${slLine}\nТекущая: ${currentBold}`;
         await ctx.reply(msg, { parse_mode: 'Markdown', ...getMainMenuSync(ctx.from.id, lang) });
-      } catch (e) { await ctx.reply('Ошибка при создании связки'); }
+      } catch { await ctx.reply('Ошибка при создании связки'); }
       ctx.session = {};
       return;
     }
@@ -700,11 +725,8 @@ bot.on('text', async (ctx) => {
       const { pages } = await renderOldAlertsList(ctx.from.id, { days, symbol: null, token, lang });
       const first = pages[0];
       ctx.session = {};
-      if (first.buttons && first.buttons.length) {
-        await ctx.reply(first.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: first.buttons } });
-      } else {
-        await ctx.reply(first.text, getMainMenuSync(ctx.from.id, lang));
-      }
+      if (first.buttons && first.buttons.length) { await ctx.reply(first.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: first.buttons } }); }
+      else { await ctx.reply(first.text, getMainMenuSync(ctx.from.id, lang)); }
       return;
     }
 
@@ -718,15 +740,12 @@ bot.on('text', async (ctx) => {
       const { pages } = await renderOldAlertsList(ctx.from.id, { days, symbol, token, lang });
       const first = pages[0];
       ctx.session = {};
-      if (first.buttons && first.buttons.length) {
-        await ctx.reply(first.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: first.buttons } });
-      } else {
-        await ctx.reply(first.text, getMainMenuSync(ctx.from.id, lang));
-      }
+      if (first.buttons && first.buttons.length) { await ctx.reply(first.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: first.buttons } }); }
+      else { await ctx.reply(first.text, getMainMenuSync(ctx.from.id, lang)); }
       return;
     }
 
-  } catch (e) {
+  } catch {
     await ctx.reply('Произошла ошибка, попробуй ещё раз.');
     ctx.session = {};
   }
@@ -748,7 +767,7 @@ bot.command('set_alert_limit', async (ctx) => {
       try {
         const chat = await bot.telegram.getChat(name);
         targetId = chat.id;
-      } catch (e) {
+      } catch {
         return ctx.reply('Не удалось найти пользователя по идентификатору/имени.');
       }
     }
@@ -757,9 +776,7 @@ bot.command('set_alert_limit', async (ctx) => {
     if (newLim === null) return ctx.reply('Ошибка при установке лимита.');
     await ctx.reply(`Лимит для пользователя ${targetId} установлен: ${newLim}`);
     try { await bot.telegram.sendMessage(targetId, `Тебе установлен лимит алертов: ${newLim} (вручную от администратора)`); } catch {}
-  } catch (e) {
-    await ctx.reply('Ошибка при выполнении команды');
-  }
+  } catch { await ctx.reply('Ошибка при выполнении команды'); }
 });
 
 bot.command('get_alert_limit', async (ctx) => {
@@ -775,21 +792,19 @@ bot.command('get_alert_limit', async (ctx) => {
       try {
         const chat = await bot.telegram.getChat(name);
         targetId = chat.id;
-      } catch (e) {
+      } catch {
         return ctx.reply('Не удалось найти пользователя по идентификатору/имени.');
       }
     }
     const lim = await getUserAlertLimit(targetId);
     await ctx.reply(`Лимит для пользователя ${targetId}: ${lim}`);
-  } catch (e) {
-    await ctx.reply('Ошибка при выполнении команды');
-  }
+  } catch { await ctx.reply('Ошибка при выполнении команды'); }
 });
 
 bot.command('refresh_daily', async (ctx) => {
   try {
     if (!CREATOR_ID || String(ctx.from.id) !== String(CREATOR_ID)) return ctx.reply('У вас нет доступа.');
-    const dateStr = new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Kyiv' });
+    const dateStr = new Date().toLocaleDateString('sv-SE', { timeZone: KYIV_TZ });
     await ctx.reply(`⏳ Начинаю принудительное обновление мотивации на ${dateStr}...`);
 
     try {
@@ -800,134 +815,100 @@ bot.command('refresh_daily', async (ctx) => {
         cacheMod.dailyCache.imageBuffer = null;
         await ctx.reply('Кэш dailyCache очищен.');
       }
-    } catch (e) {
-      await ctx.reply('⚠️ Не удалось очистить кэш в памяти (см логи). Продолжаю.');
-    }
+    } catch { await ctx.reply('⚠️ Не удалось очистить кэш в памяти (см логи). Продолжаю.'); }
 
     const daily = await import('./daily.js');
     const { dailyMotivationCollection } = await import('./db.js');
 
-    let previewQuote = null;
     try {
-      previewQuote = await daily.fetchQuoteFromAny();
-      if (previewQuote && previewQuote.text) {
-        await ctx.reply(`Превью цитаты:\n${previewQuote.text}${previewQuote.author ? `\n— ${previewQuote.author}` : ''}`);
-      } else {
-        await ctx.reply('Превью цитаты: не удалось загрузить новую цитату (источники вернули пусто).');
-      }
-    } catch (e) {
-      await ctx.reply(`Ошибка при получении превью цитаты: ${String(e?.message || e)}`);
-    }
+      const previewQuote = await daily.fetchQuoteFromAny();
+      if (previewQuote && previewQuote.text) { await ctx.reply(`Превью цитаты:\n${previewQuote.text}${previewQuote.author ? `\n— ${previewQuote.author}` : ''}`); }
+      else { await ctx.reply('Превью цитаты: не удалось загрузить новую цитату (источники вернули пусто).'); }
+    } catch (e) { await ctx.reply(`Ошибка при получении превью цитаты: ${String(e?.message || e)}`); }
 
-    let previewImgInfo = null;
     try {
       if (typeof daily.fetchRandomImage === 'function') {
         const img = await daily.fetchRandomImage();
-        if (img && img.url) {
-          previewImgInfo = img;
-          await ctx.reply(`Превью картинки: ${img.url} (${img.source || 'unknown'})`);
-        } else {
-          await ctx.reply('Превью картинки: не удалось получить картинку из источников.');
-        }
-      } else {
-        await ctx.reply('Превью картинки: функция fetchRandomImage недоступна.');
-      }
-    } catch (e) {
-      await ctx.reply(`Ошибка при получении превью картинки: ${String(e?.message || e)}`);
-    }
+        if (img?.url) { await ctx.reply(`Превью картинки: ${img.url} (${img.source || 'unknown'})`); }
+        else { await ctx.reply('Превью картинки: не удалось получить картинку из источников.'); }
+      } else { await ctx.reply('Превью картинки: функция fetchRandomImage недоступна.'); }
+    } catch (e) { await ctx.reply(`Ошибка при получении превью картинки: ${String(e?.message || e)}`); }
 
-    let stored = null;
     try {
-      stored = await daily.fetchAndStoreDailyMotivation(dateStr, { force: true });
-      if (stored) {
-        await ctx.reply('✅ Цитата и метаданные сохранены в БД (force).');
-      } else {
-        await ctx.reply('⚠️ fetchAndStoreDailyMotivation вернул null/undefined (в БД мог остаться старый документ).');
-      }
-    } catch (e) {
-      await ctx.reply(`Ошибка при сохранении мотивации: ${String(e?.message || e)}`);
-    }
+      const stored = await daily.fetchAndStoreDailyMotivation(dateStr, { force: true });
+      await ctx.reply(stored ? '✅ Цитата и метаданные сохранены в БД (force).' : '⚠️ fetchAndStoreDailyMotivation вернул null/undefined.');
+    } catch (e) { await ctx.reply(`Ошибка при сохранении мотивации: ${String(e?.message || e)}`); }
 
     try {
       const doc = await dailyMotivationCollection.findOne({ date: dateStr });
       if (doc) {
-        const q = doc.quote?.original || (doc.quote?.translations && doc.quote.translations.ru) || null;
+        const q = doc.quote?.original || doc.quote?.translations?.ru || null;
         await ctx.reply(`Текущий документ в БД:\nЦитата: ${q ? q : '—'}\nАвтор: ${doc.quote?.author || '—'}\nImage URL: ${doc.image?.url || '—'}`);
-      } else {
-        await ctx.reply('В БД нет документа для сегодняшней даты после сохранения.');
-      }
-    } catch (e) {
-      await ctx.reply(`Ошибка при чтении doc из БД: ${String(e?.message || e)}`);
-    }
+      } else { await ctx.reply('В БД нет документа для сегодняшней даты после сохранения.'); }
+    } catch (e) { await ctx.reply(`Ошибка при чтении doc из БД: ${String(e?.message || e)}`); }
 
     try {
       const buf = await ensureDailyImageBuffer(dateStr);
-      if (buf && buf.length) {
-        await ctx.reply(`Картинка загружена в память, размер ${buf.length} байт.`);
-      } else {
-        await ctx.reply('Картинка не загружена (будет отправлён текст без изображения).');
-      }
-    } catch (e) {
-      await ctx.reply(`Ошибка при загрузке изображения: ${String(e?.message || e)}`);
-    }
+      await ctx.reply(buf?.length ? `Картинка загружена в память, размер ${buf.length} байт.` : 'Картинка не загружена (будет отправлён текст без изображения).');
+    } catch (e) { await ctx.reply(`Ошибка при загрузке изображения: ${String(e?.message || e)}`); }
 
     try {
       const ok = await daily.sendDailyToUser(bot, ctx.from.id, dateStr, { disableNotification: false, forceRefresh: true });
-      if (ok) await ctx.reply('Готово — мотивация обновлена и отправлена тебе.');
-      else await ctx.reply('Мотивация сохранена, но отправка не удалась (см логи).');
-    } catch (e) {
-      await ctx.reply(`Ошибка при отправке мотивации: ${String(e?.message || e)}`);
-    }
+      await ctx.reply(ok ? 'Готово — мотивация обновлена и отправлена тебе.' : 'Мотивация сохранена, но отправка не удалась (см логи).');
+    } catch (e) { await ctx.reply(`Ошибка при отправке мотивации: ${String(e?.message || e)}`); }
 
-  } catch (e) {
-    await ctx.reply('Внутренняя ошибка: ' + String(e?.message || e));
-  }
+  } catch (e) { await ctx.reply('Внутренняя ошибка: ' + String(e?.message || e)); }
+});
+
+bot.command('broadcast_market_now', async (ctx) => {
+  if (!CREATOR_ID || String(ctx.from.id) !== String(CREATOR_ID)) return ctx.reply('У вас нет доступа.');
+  await ctx.reply('Запускаю рассылку мониторинга (тест)...');
+  try {
+    const res = await broadcastMarketSnapshot(bot, { batchSize: MARKET_BATCH_SIZE, pauseMs: MARKET_BATCH_PAUSE_MS });
+    await ctx.reply('Done: ' + JSON.stringify(res));
+  } catch (e) { await ctx.reply('Ошибка при рассылке: ' + String(e?.message || e)); }
 });
 
 export async function startBot() {
   await connectToMongo();
   startTickersRefresher();
 
-  if (isDbConnected()) {
-    try { startAlertsChecker(bot); } catch (e) { console.warn('startAlertsChecker failed', e?.message || e); }
-  } else {
+  if (isDbConnected()) { try { startAlertsChecker(bot); } catch {} }
+  else {
     const tryStartChecker = setInterval(() => {
-      if (isDbConnected()) {
-        try { startAlertsChecker(bot); } catch (e) { console.warn('delayed startAlertsChecker failed', e?.message || e); }
-        clearInterval(tryStartChecker);
-      }
-    }, 10_000);
+      if (isDbConnected()) { try { startAlertsChecker(bot); } catch {} clearInterval(tryStartChecker); }
+    }, 10000);
   }
 
+  try { if (typeof startMarketMonitor === 'function') startMarketMonitor(bot); } catch {}
+
   await removeInactive();
-  startHeartbeat(60_000);
+  startHeartbeat(60000);
 
   const app = createServer();
   const PORT = process.env.PORT || 3000;
   const server = app.listen(PORT, () => console.log(`HTTP server on ${PORT}`));
 
-  setInterval(() => processDailyQuoteRetry(bot), 60_000);
-  setInterval(() => watchForNewQuotes(bot), 30_000);
+  setInterval(() => processDailyQuoteRetry(bot), 60000);
+  setInterval(() => watchForNewQuotes(bot), 30000);
 
-  const dateStrNow = new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Kyiv' });
-  try { await fetchAndStoreDailyMotivation(dateStrNow).catch(()=>{}); } catch (e) {}
+  const dateStrNow = new Date().toLocaleDateString('sv-SE', { timeZone: KYIV_TZ });
+  try { await fetchAndStoreDailyMotivation(dateStrNow).catch(()=>{}); } catch {}
 
   let lastFetchDay = null;
   let lastPrepareDay = null;
+  let lastMarketSendDay = null;
 
   setInterval(async () => {
     try {
-      const kyivNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Kyiv' }));
+      const kyivNow = new Date(new Date().toLocaleString('en-US', { timeZone: KYIV_TZ }));
       const day = kyivNow.toLocaleDateString('sv-SE');
       const hour = kyivNow.getHours();
 
-      if (day !== lastFetchDay && hour === IMAGE_FETCH_HOUR) {
-        try { await fetchAndStoreDailyMotivation(day, { force: true }); } catch (e) {}
-        lastFetchDay = day;
-      }
+      if (day !== lastFetchDay && hour === IMAGE_FETCH_HOUR) { try { await fetchAndStoreDailyMotivation(day, { force: true }); } catch {} lastFetchDay = day; }
 
       if (day !== lastPrepareDay && hour === PREPARE_SEND_HOUR) {
-        try { await fetchAndStoreDailyMotivation(day, { force: false }); } catch (e) {}
+        try { await fetchAndStoreDailyMotivation(day, { force: false }); } catch {}
         lastPrepareDay = day;
 
         try {
@@ -935,7 +916,10 @@ export async function startBot() {
           const { usersCollection, pendingDailySendsCollection } = await import('./db.js');
           const already = await pendingDailySendsCollection.find({ date: dateStr, sent: true }, { projection: { userId: 1 } }).toArray();
           const sentSet = new Set((already || []).map(r => r.userId));
-          const cursor = usersCollection.find({}, { projection: { userId: 1 } });
+          const cursor = usersCollection.find(
+            { $or: [{ botBlocked: { $exists: false } }, { botBlocked: false }], sendMotivation: { $ne: false } },
+            { projection: { userId: 1 } }
+          );
           const BATCH = 20;
           let batch = [];
           while (await cursor.hasNext()) {
@@ -949,7 +933,7 @@ export async function startBot() {
                 try {
                   const ok = await sendDailyToUser(bot, targetId, dateStr, { disableNotification: false, forceRefresh: false }).catch(()=>false);
                   await pendingDailySendsCollection.updateOne({ userId: targetId, date: dateStr }, { $set: { sent: !!ok, sentAt: ok ? new Date() : null, quoteSent: !!ok, permanentFail: !ok } }, { upsert: true });
-                } catch (e) {}
+                } catch {}
               }));
               batch = [];
             }
@@ -959,21 +943,25 @@ export async function startBot() {
               try {
                 const ok = await sendDailyToUser(bot, targetId, dateStr, { disableNotification: false, forceRefresh: false }).catch(()=>false);
                 await pendingDailySendsCollection.updateOne({ userId: targetId, date: dateStr }, { $set: { sent: !!ok, sentAt: ok ? new Date() : null, quoteSent: !!ok, permanentFail: !ok } }, { upsert: true });
-              } catch (e) {}
+              } catch {}
             }));
           }
-        } catch (e) {}
+        } catch {}
       }
-    } catch (e) {}
-  }, 60_000);
 
-  setInterval(async () => {
-    try {
-      await removeInactive();
-    } catch (e) { console.warn('removeInactive scheduled failed', e?.message || e); }
-  }, 7 * DAY_MS);
+      if (day !== lastMarketSendDay && hour === (MARKET_SEND_HOUR ?? 7) && kyivNow.getMinutes() === (MARKET_SEND_MIN ?? 30)) {
+        try {
+          if (typeof broadcastMarketSnapshot === 'function') {
+            await broadcastMarketSnapshot(bot, { batchSize: MARKET_BATCH_SIZE, pauseMs: MARKET_BATCH_PAUSE_MS }).catch(()=>{});
+            lastMarketSendDay = day;
+          }
+        } catch {}
+      }
+    } catch {}
+  }, 60000);
+
+  setInterval(async () => { try { await removeInactive(); } catch {} }, 7 * DAY_MS);
 
   await bot.launch();
-  try { await adminNotify(`✅ Bot started at ${new Date().toISOString()}`); } catch (e) { console.warn('adminNotify after launch failed', e?.message || e); }
   return { server };
 }

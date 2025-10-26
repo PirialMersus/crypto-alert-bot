@@ -1,32 +1,19 @@
 // src/index.js
-import { startBot } from './bot.js';
-import { connectToMongo } from './db.js';
-import { notifyAdmin } from './adminNotify.js';
+import dotenv from 'dotenv';
+dotenv.config();
 
-process.on('uncaughtException', async (err) => {
-  try { console.error('uncaughtException', err); } catch (e) {}
-  try { await notifyAdmin(`🚨 Uncaught exception: ${String(err?.stack || err?.message || err)}`); } catch (e) {}
-});
+try {
+  const mod = await import('./bot.js');
 
-process.on('unhandledRejection', async (reason) => {
-  try { console.error('unhandledRejection', reason); } catch (e) {}
-  try { await notifyAdmin(`🚨 Unhandled rejection: ${String(reason)}`); } catch (e) {}
-});
-
-async function main() {
-  try {
-    await connectToMongo();
-  } catch (e) {
-    try { console.warn('Initial connectToMongo caught error (continuing):', e?.message || e); } catch (ee) {}
+  if (mod && typeof mod.startBot === 'function') {
+    await mod.startBot();
+  } else if (mod && mod.default && typeof mod.default.startBot === 'function') {
+    await mod.default.startBot();
+  } else {
+    console.error("❌ './bot.js' does not export a function named 'startBot'. Make sure you have:\n\nexport async function startBot() { /* ... */ }\n");
+    process.exit(1);
   }
-
-  try {
-    await startBot();
-    console.log('Bot started.');
-  } catch (err) {
-    try { console.error('startup error', err); } catch (e) {}
-    try { await notifyAdmin(`❌ Bot startup failed: ${String(err?.message || err)}`); } catch (e) {}
-  }
+} catch (e) {
+  console.error('❌ Failed to load ./bot.js:', e?.message || e);
+  process.exit(1);
 }
-
-main();
