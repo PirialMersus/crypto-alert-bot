@@ -3,8 +3,9 @@ import axios from 'axios'
 import dotenv from 'dotenv'
 dotenv.config()
 
-const AXIOS_TIMEOUT = process.env.AXIOS_TIMEOUT_MS ? parseInt(process.env.AXIOS_TIMEOUT_MS, 10) : 7000
+const AXIOS_TIMEOUT = process.env.AXIOS_TIMEOUT_MS ? parseInt(process.env.AXIOS_TIMEOUT_MS, 10) : 10000
 
+// Хосты, которые всегда гоняем через воркер (если PROXY_FETCH задан)
 const NEED_PROXY = [
   'api.binance.com',
   'fapi.binance.com',
@@ -13,7 +14,8 @@ const NEED_PROXY = [
   'api.coingecko.com',
   'query1.finance.yahoo.com',
   'data-asg.goldprice.org',
-  'api.metals.live'
+  'api.metals.live',
+  'stooq.pl'
 ]
 
 function proxiedUrl(u) {

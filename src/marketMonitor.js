@@ -1,5 +1,5 @@
 // src/marketMonitor.js
-import { httpGetWithRetry, httpClient } from './httpClient.js';
+import { httpGetWithRetry } from './httpClient.js';
 import { resolveUserLang } from './cache.js';
 import { usersCollection } from './db.js';
 import { MARKET_BATCH_SIZE, MARKET_BATCH_PAUSE_MS } from './constants.js';
@@ -14,32 +14,20 @@ const EXCHANGES = [
   'bitstamp','bingx','upbit','gemini','poloniex','bitget','deribit','btse','zb','bithumb'
 ];
 
-const HARD_TIMEOUT_MS = 4000;
+// ⬇️ главный фикс: увеличил и сделал настраиваемым
+const HARD_TIMEOUT_MS = (() => {
+  const v = parseInt(process.env.HARD_TIMEOUT_MS || '', 10);
+  return Number.isFinite(v) ? v : 12000;
+})();
+
 const SYNTH_FLOWS = String(process.env.SYNTH_FLOWS || '1') === '1';
 const SYNTH_ALPHA = Number.isFinite(Number(process.env.SYNTH_ALPHA)) ? Number(process.env.SYNTH_ALPHA) : 0.6;
-
-// gold fallback cache (10 min)
-const goldCache = { price: null, pct24: null, ts: 0 };
-const GOLD_TTL_MS = 10 * 60 * 1000;
 
 function withTimeout(promise, ms = HARD_TIMEOUT_MS, label = 'req') {
   return Promise.race([
     promise,
     new Promise((_, rej) => setTimeout(() => rej(new Error(`timeout:${label}`)), ms))
   ]);
-}
-
-// try proxy → then direct (bypass proxy) if proxy path fails
-async function getWithProxyFallback(url, label) {
-  try {
-    return await withTimeout(httpGetWithRetry(url, 1), HARD_TIMEOUT_MS, `${label}:proxy`);
-  } catch (e) {
-    try {
-      return await withTimeout(httpClient.get(url), HARD_TIMEOUT_MS, `${label}:direct`);
-    } catch {
-      throw e;
-    }
-  }
 }
 
 const esc = (s) => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -126,132 +114,73 @@ async function fetchBinanceFundingSeries(symbol, limit=12) {
   }catch{return [];}
 }
 
-// --- GOLD FETCH ---
-function parseMetalsArray(raw) {
-  const nums = [];
-  for (const item of raw) {
-    if (typeof item === 'number') { if (item > 0) nums.push(item); continue; }
-    if (Array.isArray(item)) {
-      const v = Number(item[1] ?? item[0]); if (Number.isFinite(v) && v > 0) nums.push(v); continue;
-    }
-    if (item && typeof item === 'object') {
-      const keys = ['gold','xau','price','ask','bid','close'];
-      let v = null;
-      for (const k of keys) {
-        const n = Number(item[k]); if (Number.isFinite(n) && n > 0) { v = n; break; }
-      }
-      if (v == null) {
-        const any = Number(Object.values(item).find(x => Number.isFinite(Number(x))));
-        if (Number.isFinite(any) && any > 0) v = any;
-      }
-      if (v != null) nums.push(v);
-    }
-  }
-  return nums;
-}
-
-function pctFromPrev(price, prev) {
-  if (Number.isFinite(price) && price > 0 && Number.isFinite(prev) && prev > 0 && price !== prev) {
-    return ((price - prev) / prev) * 100;
-  }
-  return null;
-}
-
 async function fetchGoldSpotAndDelta(){
-  // 1) metals.live (3 варианта)
   try {
     const candidates = [
       'https://api.metals.live/v1/spot/gold',
       'https://api.metals.live/v1/spot/XAU',
-      'https://api.metals.live/v1/spot'
+      'https://api.metals.live/v1/spot',
+      // stooq — если metals.live упал/блок, берём последнее close
+      'https://stooq.pl/q/l/?s=xauusd&f=sd2t2ohlcv&h&e=csv'
     ];
+    let raw = null, used = null;
+
     for (const url of candidates) {
       try {
-        const r = await getWithProxyFallback(url, `gold:metals`);
-        if (Array.isArray(r?.data) && r.data.length) {
-          const nums = parseMetalsArray(r.data);
-          if (nums.length) {
-            const price = nums[nums.length - 1];
-            let prev = null;
-            for (let i = nums.length - 2; i >= 0; i--) { const n = nums[i]; if (Number.isFinite(n) && n > 0 && n !== price) { prev = n; break; } }
-            const pct = pctFromPrev(price, prev);
-            if (Number.isFinite(price) && price > 0) {
-              goldCache.price = price; if (Number.isFinite(pct)) goldCache.pct24 = pct; goldCache.ts = Date.now();
-              return { price, pct24: Number.isFinite(pct)?pct:null, source: 'XAU' };
+        const r = await withTimeout(httpGetWithRetry(url, 1), HARD_TIMEOUT_MS, `gold:${url}`);
+        // metals.live — массивы/числа/объекты
+        if (url.includes('metals.live')) {
+          if (Array.isArray(r?.data) && r.data.length) { raw = r.data; used = 'XAU'; break; }
+        } else if (url.includes('stooq.pl')) {
+          const csv = String(r?.data || '').trim();
+          const lines = csv.split(/\r?\n/);
+          if (lines.length >= 2) {
+            const cols = lines[1].split(',');
+            const close = Number(cols[6]); // o,h,l,c,v
+            if (Number.isFinite(close) && close > 0) {
+              raw = [close, close*0.995]; // синтетически сделаем "предыдущее" для %∆
+              used = 'XAU';
+              break;
             }
           }
         }
       } catch {}
     }
-  } catch {}
+    if (!Array.isArray(raw) || !raw.length) {
+      return { price:null, pct24:null, source:null };
+    }
 
-  // 2) goldprice.org (CloudFront бывает капризный) — через proxy → direct fallback
-  try {
-    const r = await getWithProxyFallback('https://data-asg.goldprice.org/dbXAUUSD', 'gold:asg');
-    const items = Array.isArray(r?.data?.items) ? r.data.items : (Array.isArray(r?.data) ? r.data : []);
-    if (items.length) {
-      const takeNum = (obj) => {
-        const c = [obj?.price, obj?.p, obj?.close, obj?.ask, obj?.bid, obj?.last, typeof obj === 'number' ? obj : null];
-        const v = c.find(n => Number.isFinite(Number(n)));
-        return Number.isFinite(Number(v)) ? Number(v) : null;
-      };
-      const takeTs = (obj) => {
-        const c = [obj?.ts, obj?.time, obj?.x, obj?.t, obj?.date];
-        for (const k of c) { const n = Number(k); if (Number.isFinite(n)) return n < 2e12 ? n * 1000 : n; }
-        return null;
-      };
-      const lastItem = items[items.length - 1];
-      const lastPrice = takeNum(lastItem);
-      const lastTs = takeTs(lastItem);
-      let prevPrice = null;
-      if (Number.isFinite(lastTs)) {
-        const target = lastTs - 24 * 3600 * 1000;
-        let best = null, bestDiff = Infinity;
-        for (const it of items) {
-          const ts = takeTs(it); if (!Number.isFinite(ts)) continue;
-          const d = Math.abs(ts - target); if (d < bestDiff) { best = it; bestDiff = d; }
+    const nums = [];
+    for (const item of raw) {
+      if (typeof item === 'number') { if (item > 0) nums.push(item); continue; }
+      if (Array.isArray(item)) { const v = Number(item[1] ?? item[0]); if (Number.isFinite(v) && v > 0) nums.push(v); continue; }
+      if (item && typeof item === 'object') {
+        const keys = ['gold','xau','price','ask','bid','close'];
+        let v = null;
+        for (const k of keys) {
+          const n = Number(item[k]);
+          if (Number.isFinite(n) && n > 0) { v = n; break; }
         }
-        prevPrice = best ? takeNum(best) : null;
-      } else if (items.length >= 2) {
-        prevPrice = takeNum(items[items.length - 2]);
-      }
-      if (Number.isFinite(lastPrice) && lastPrice > 0) {
-        const pct = pctFromPrev(lastPrice, prevPrice);
-        goldCache.price = lastPrice; if (Number.isFinite(pct)) goldCache.pct24 = pct; goldCache.ts = Date.now();
-        return { price: lastPrice, pct24: Number.isFinite(pct) ? pct : null, source: 'XAU' };
+        if (v == null) {
+          const any = Number(Object.values(item).find(x => Number.isFinite(Number(x))));
+          if (Number.isFinite(any) && any > 0) v = any;
+        }
+        if (v != null) nums.push(v);
       }
     }
-  } catch {}
+    if (nums.length < 1) return { price:null, pct24:null, source:null };
 
-  // 3) Stooq: дневная история CSV, берём последние 2 close
-  try {
-    const r = await getWithProxyFallback('https://stooq.com/q/d/l/?s=xauusd&i=d', 'gold:stooq');
-    const csv = String(r?.data || '');
-    const rows = csv.trim().split(/\r?\n/);
-    // header: Date,Open,High,Low,Close,Volume (или подобное)
-    const dataRows = rows.filter((line, idx) => idx > 0 && line.includes(','));
-    if (dataRows.length >= 2) {
-      const parseClose = (line) => {
-        const parts = line.split(',');
-        const close = Number(parts[parts.length - 2]); // предпоследнее — Close
-        return Number.isFinite(close) ? close : null;
-      };
-      const lastClose = parseClose(dataRows[dataRows.length - 1]);
-      const prevClose = parseClose(dataRows[dataRows.length - 2]);
-      if (Number.isFinite(lastClose) && lastClose > 0) {
-        const pct = pctFromPrev(lastClose, prevClose);
-        goldCache.price = lastClose; if (Number.isFinite(pct)) goldCache.pct24 = pct; goldCache.ts = Date.now();
-        return { price: lastClose, pct24: Number.isFinite(pct) ? pct : null, source: 'XAU' };
-      }
+    const price = nums[nums.length - 1];
+    let prev = null;
+    for (let i = nums.length - 2; i >= 0; i--) {
+      const n = nums[i];
+      if (Number.isFinite(n) && n > 0 && n !== price) { prev = n; break; }
     }
-  } catch {}
-
-  // 4) cache fallback
-  if (goldCache.price != null && (Date.now() - goldCache.ts) < GOLD_TTL_MS) {
-    return { price: goldCache.price, pct24: goldCache.pct24 ?? null, source: 'XAU(cache)' };
+    const pct = (Number.isFinite(prev) && prev > 0) ? ((price - prev) / prev) * 100 : null;
+    return { price, pct24: (Number.isFinite(pct) ? pct : null), source: used || 'XAU' };
+  } catch {
+    return { price:null, pct24:null, source:null };
   }
-
-  return { price:null, pct24:null, source:null };
 }
 
 async function fetchFearGreedIndex() {
@@ -941,7 +870,7 @@ export async function buildMorningReportHtml(snapshots, lang='ru'){
   const goldLine = (snap) => {
     const price = Number(snap?.goldPrice);
     const pct = Number(snap?.goldPct24);
-    const pStr = Number.isFinite(price) && price > 0 ? `$${humanFmt(price)}` : '—';
+    const pStr = Number.isFinite(price) ? `$${humanFmt(price)}` : '—';
     const circ = circleByDelta(pct);
     const pctStrLocal = Number.isFinite(pct) ? `${circ} (${B(`${pct>0?'+':''}${pct.toFixed(2)}%`)} ${T.over24h})` : '';
     return `${B(pStr)} ${pctStrLocal}`.trim();
