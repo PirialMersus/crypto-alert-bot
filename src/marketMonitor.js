@@ -502,7 +502,8 @@ function riskBar(score){
   return '🟥'.repeat(n)+'⬜'.repeat(10-n);
 }
 
-const SNAPSHOT_TTL_MS = 30 * 60 * 1000;
+// const SNAPSHOT_TTL_MS = 30 * 60 * 1000;
+const SNAPSHOT_TTL_MS = 60 * 1000;
 const snapshotCache = new Map();
 
 function keyForSymbols(symbols){ return String(symbols).toUpperCase(); }
