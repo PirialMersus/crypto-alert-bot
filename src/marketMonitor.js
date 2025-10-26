@@ -14,11 +14,11 @@ const EXCHANGES = [
   'bitstamp','bingx','upbit','gemini','poloniex','bitget','deribit','btse','zb','bithumb'
 ];
 
-// ⬇⬇⬇ ИЗМЕНЕНО: читаем таймаут из ENV, дефолт 8000 вместо 4000
+// timeouts / cache
 const HARD_TIMEOUT_MS = Number.isFinite(Number(process.env.HARD_TIMEOUT_MS))
-  ? Number(process.env.HARD_TIMEOUT_MS)
-  : 8000;
-// ⬆⬆⬆
+  ? Number(process.env.HARD_TIMEOUT_MS) : 8000;
+const SNAPSHOT_TTL_MS = Number.isFinite(Number(process.env.SNAPSHOT_TTL_MS))
+  ? Number(process.env.SNAPSHOT_TTL_MS) : (30 * 60 * 1000);
 
 const SYNTH_FLOWS = String(process.env.SYNTH_FLOWS || '1') === '1';
 const SYNTH_ALPHA = Number.isFinite(Number(process.env.SYNTH_ALPHA)) ? Number(process.env.SYNTH_ALPHA) : 0.6;
@@ -105,17 +105,34 @@ async function fetchBinanceTicker24h(symbol) {
   }catch{return null;}
 }
 
-// ⬇⬇⬇ ИЗМЕНЕНО: увеличены ретраи (2) для фьючерсного funding
+function seriesAllZeros(arr){
+  if(!Array.isArray(arr) || !arr.length) return false;
+  return arr.every(x => Number(x) === 0);
+}
+
+// --- FUNDING ---
 async function fetchBinanceFundingSeries(symbol, limit=12) {
   try {
     const url=`https://fapi.binance.com/fapi/v1/fundingRate?symbol=${encodeURIComponent(symbol)}&limit=${encodeURIComponent(String(limit))}`;
     const res=await withTimeout(httpGetWithRetry(url,2),HARD_TIMEOUT_MS,`binance:funding:${symbol}`);
     const arr=Array.isArray(res?.data)?res.data:[];
-    return arr.map(r=>Number(r.fundingRate)).filter(Number.isFinite);
+    const vals = arr.map(r=>Number(r.fundingRate)).filter(Number.isFinite);
+    if (seriesAllZeros(vals)) return [];
+    return vals;
   }catch{return [];}
 }
-// ⬆⬆⬆
 
+// fallback: current funding from premiumIndex
+async function fetchFundingNowFallback(symbol){
+  try{
+    const url = `https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${encodeURIComponent(symbol)}`;
+    const res = await withTimeout(httpGetWithRetry(url,2),HARD_TIMEOUT_MS,`binance:premiumIndex:${symbol}`);
+    const v = Number(res?.data?.lastFundingRate);
+    return Number.isFinite(v) ? v : null;
+  }catch{return null;}
+}
+
+// --- GOLD ---
 async function fetchGoldSpotAndDelta(){
   try {
     const candidates = [
@@ -416,47 +433,88 @@ function deriveLsFromRatio(ratio) {
   };
 }
 
-// ⬇⬇⬇ ИЗМЕНЕНО: увеличены ретраи (2) для всех L/S источников
+// L/S via fapi
 async function fetchGlobalLongShort(symbol, period, limit=30) {
   const url = `https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}&limit=${encodeURIComponent(String(limit))}`;
-  const res = await withTimeout(httpGetWithRetry(url,2),HARD_TIMEOUT_MS,`binance:ls:${symbol}:${period}`);
-  const arr = Array.isArray(res?.data) ? res.data : [];
-  if (!arr.length) return null;
-  const last = arr[arr.length-1];
-  const ratio = Number(last?.longShortRatio);
-  const longAccount = Number(last?.longAccount);
-  const shortAccount = Number(last?.shortAccount);
-  if (Number.isFinite(longAccount) && Number.isFinite(shortAccount) && (longAccount + shortAccount) > 0) {
-    const sum = longAccount + shortAccount;
-    return {
-      longPct: Number(((longAccount / sum) * 100).toFixed(2)),
-      shortPct: Number(((shortAccount / sum) * 100).toFixed(2)),
-      ls: Number((ratio && Number.isFinite(ratio) ? ratio : (longAccount/shortAccount)).toFixed(2))
-    };
+  try{
+    const res = await withTimeout(httpGetWithRetry(url,2),HARD_TIMEOUT_MS,`binance:ls:${symbol}:${period}`);
+    const arr = Array.isArray(res?.data) ? res.data : [];
+    if (!arr.length) throw new Error('empty');
+    const last = arr[arr.length-1];
+    const ratio = Number(last?.longShortRatio);
+    const longAccount = Number(last?.longAccount);
+    const shortAccount = Number(last?.shortAccount);
+    if (Number.isFinite(longAccount) && Number.isFinite(shortAccount) && (longAccount + shortAccount) > 0) {
+      const sum = longAccount + shortAccount;
+      return {
+        longPct: Number(((longAccount / sum) * 100).toFixed(2)),
+        shortPct: Number(((shortAccount / sum) * 100).toFixed(2)),
+        ls: Number((ratio && Number.isFinite(ratio) ? ratio : (longAccount/shortAccount)).toFixed(2))
+      };
+    }
+    const calc = deriveLsFromRatio(ratio);
+    if (!calc) throw new Error('invalid');
+    return calc;
+  }catch{
+    // fallback: same endpoint via www host
+    const alt = `https://www.binance.com/futures/data/globalLongShortAccountRatio?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}&limit=${encodeURIComponent(String(limit))}`;
+    try{
+      const res2 = await withTimeout(httpGetWithRetry(alt,2),HARD_TIMEOUT_MS,`binance-www:ls:${symbol}:${period}`);
+      const arr2 = Array.isArray(res2?.data) ? res2.data : [];
+      if (!arr2.length) return null;
+      const last2 = arr2[arr2.length-1];
+      const ratio2 = Number(last2?.longShortRatio);
+      return deriveLsFromRatio(ratio2);
+    }catch{return null;}
   }
-  return deriveLsFromRatio(ratio);
 }
 
 async function fetchTopLongShortAccounts(symbol, period='4h', limit=30) {
+  // try fapi first
   const url = `https://fapi.binance.com/futures/data/topLongShortAccountRatio?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}&limit=${encodeURIComponent(String(limit))}`;
-  const res = await withTimeout(httpGetWithRetry(url,2),HARD_TIMEOUT_MS,`binance:tlsa:${symbol}:${period}`);
-  const arr = Array.isArray(res?.data) ? res.data : [];
-  if (!arr.length) return null;
-  const last = arr[arr.length-1];
-  const ratio = Number(last?.longShortRatio);
-  return deriveLsFromRatio(ratio);
+  try{
+    const res = await withTimeout(httpGetWithRetry(url,2),HARD_TIMEOUT_MS,`binance:tlsa:${symbol}:${period}`);
+    const arr = Array.isArray(res?.data) ? res.data : [];
+    if (!arr.length) throw new Error('empty');
+    const last = arr[arr.length-1];
+    const ratio = Number(last?.longShortRatio);
+    const d = deriveLsFromRatio(ratio);
+    if (!d) throw new Error('invalid');
+    return d;
+  }catch{
+    const alt = `https://www.binance.com/futures/data/topLongShortAccountRatio?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}&limit=${encodeURIComponent(String(limit))}`;
+    try{
+      const res2 = await withTimeout(httpGetWithRetry(alt,2),HARD_TIMEOUT_MS,`binance-www:tlsa:${symbol}:${period}`);
+      const arr2 = Array.isArray(res2?.data) ? res2.data : [];
+      if (!arr2.length) return null;
+      const last2 = arr2[arr2.length-1];
+      return deriveLsFromRatio(Number(last2?.longShortRatio));
+    }catch{return null;}
+  }
 }
 
 async function fetchTopLongShortPositions(symbol, period='4h', limit=30) {
   const url = `https://fapi.binance.com/futures/data/topLongShortPositionRatio?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}&limit=${encodeURIComponent(String(limit))}`;
-  const res = await withTimeout(httpGetWithRetry(url,2),HARD_TIMEOUT_MS,`binance:tlsp:${symbol}:${period}`);
-  const arr = Array.isArray(res?.data) ? res.data : [];
-  if (!arr.length) return null;
-  const last = arr[arr.length-1];
-  const ratio = Number(last?.longShortRatio);
-  return deriveLsFromRatio(ratio);
+  try{
+    const res = await withTimeout(httpGetWithRetry(url,2),HARD_TIMEOUT_MS,`binance:tlsp:${symbol}:${period}`);
+    const arr = Array.isArray(res?.data) ? res.data : [];
+    if (!arr.length) throw new Error('empty');
+    const last = arr[arr.length-1];
+    const ratio = Number(last?.longShortRatio);
+    const d = deriveLsFromRatio(ratio);
+    if (!d) throw new Error('invalid');
+    return d;
+  }catch{
+    const alt = `https://www.binance.com/futures/data/topLongShortPositionRatio?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}&limit=${encodeURIComponent(String(limit))}`;
+    try{
+      const res2 = await withTimeout(httpGetWithRetry(alt,2),HARD_TIMEOUT_MS,`binance-www:tlsp:${symbol}:${period}`);
+      const arr2 = Array.isArray(res2?.data) ? res2.data : [];
+      if (!arr2.length) return null;
+      const last2 = arr2[arr2.length-1];
+      return deriveLsFromRatio(Number(last2?.longShortRatio));
+    }catch{return null;}
+  }
 }
-// ⬆⬆⬆
 
 async function fetchLongShortRatio(symbol){
   const cached = readLsCache(symbol);
@@ -493,7 +551,6 @@ function riskBar(score){
   return '🟥'.repeat(n)+'⬜'.repeat(10-n);
 }
 
-const SNAPSHOT_TTL_MS = 30 * 60 * 1000;
 const snapshotCache = new Map();
 
 function keyForSymbols(symbols){ return String(symbols).toUpperCase(); }
@@ -565,22 +622,36 @@ export async function getMarketSnapshot(symbols=['BTC','ETH']){
         }
       }catch{}
 
+      // FLOWS
       const flows = await fetchProxyNetFlowsUSDWithPrev(s, price, pct24, vol24, pctPrev, volPrev).catch(()=>({nowUSD:null,prevUSD:null,diffUSD:null}));
+
+      // L/S
       const ls = await fetchLongShortRatio(binanceSym).catch(()=>null);
 
-      const priceRisk=Number.isFinite(pct24)?priceChangeRisk(pct24):0;
-      const fundingSeries = await fetchBinanceFundingSeries(binanceSym, 12).catch(()=>[]);
+      // FUNDING
+      const series = await fetchBinanceFundingSeries(binanceSym, 12).catch(()=>[]);
       let fundingNow=null, fundingPrev=null, fundingDelta=null;
-      if(fundingSeries.length >= 6){
-        const nowArr = fundingSeries.slice(-3);
-        const prevArr = fundingSeries.slice(-6,-3);
+      if(series.length >= 6){
+        const nowArr = series.slice(-3);
+        const prevArr = series.slice(-6,-3);
         const avg = (arr)=>arr.reduce((a,b)=>a+b,0)/arr.length;
         fundingNow = avg(nowArr);
         fundingPrev = avg(prevArr);
         fundingDelta = fundingNow - fundingPrev;
-      } else if (fundingSeries.length >= 3){
-        fundingNow = (fundingSeries.slice(-3).reduce((a,b)=>a+b,0))/3;
+      } else if (series.length >= 3){
+        fundingNow = (series.slice(-3).reduce((a,b)=>a+b,0))/3;
       }
+      // fallback if still null
+      if (!Number.isFinite(fundingNow)) {
+        const fn = await fetchFundingNowFallback(binanceSym).catch(()=>null);
+        if (Number.isFinite(fn)) {
+          fundingNow = fn;
+          fundingPrev = null;
+          fundingDelta = null;
+        }
+      }
+
+      const priceRisk=Number.isFinite(pct24)?priceChangeRisk(pct24):0;
       const fundingRisk = Number.isFinite(fundingNow) ? Math.min(1, Math.abs(fundingNow)*10_000/50) : 0;
       const sentimentRisk = Number.isFinite(ls?.longPct) ? Math.max(0, (ls.longPct-60)/40) : 0;
       const score=aggregateScore({ priceRisk, fundingRisk, sentimentRisk });
@@ -924,9 +995,7 @@ export async function buildMorningReportHtml(snapshots, lang='ru'){
   const priceNow = isEn
     ? `Now: BTC — ${guidePriceOne(((snapshots.BTC)||{}).pct24,true)}; ETH — ${guidePriceOne(((snapshots.ETH)||{}).pct24,true)}.`
     : `Сейчас: BTC — ${guidePriceOne(((snapshots.BTC)||{}).pct24,false)}; ETH — ${guidePriceOne(((snapshots.ETH)||{}).pct24,false)}.`;
-  const fgiNow = isEn
-    ? `${T.introFGI}`
-    : `${T.introFGI}`;
+  const fgiNow = isEn ? `${T.introFGI}` : `${T.introFGI}`;
   const volNow = isEn
     ? `Now: BTC — ${guideVolOne(((snapshots.BTC)||{}).volDeltaPct,true)}; ETH — ${guideVolOne(((snapshots.ETH)||{}).volDeltaPct,true)}.`
     : `Сейчас: BTC — ${guideVolOne(((snapshots.BTC)||{}).volDeltaPct,false)}; ETH — ${guideVolOne(((snapshots.ETH)||{}).volDeltaPct,false)}.`;
