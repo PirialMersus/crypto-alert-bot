@@ -32,7 +32,10 @@ function proxiedUrl(u) {
 
 export const httpClient = axios.create({
   timeout: AXIOS_TIMEOUT,
-  headers: { 'User-Agent': 'crypto-alert-bot/1.0' }
+  headers: {
+    'User-Agent': 'crypto-alert-bot/1.0',
+    'Accept': 'application/json'
+  }
 })
 
 export async function httpGetWithRetry(url, retries = 2, opts = {}) {
