@@ -1,12 +1,37 @@
+// src/marketMonitor.js
 import { httpGetWithRetry } from './httpClient.js';
 import { resolveUserLang } from './cache.js';
 import { usersCollection } from './db.js';
 import { MARKET_BATCH_SIZE, MARKET_BATCH_PAUSE_MS } from './constants.js';
 
+// === ВАЖНО: никаких новых ENV. Флаги — константы ниже ===
+const DISABLE_LLAMA = true;               // не дёргать десятки /cex/… (они тормозят/404)
+const MAX_NET_CONCURRENCY = 4;            // ограничить параллельные сетевые вызовы
+const COINGECKO_PAUSE_MS = 250;           // лёгкий троттлинг графиков для 429
+
+function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
+async function mapWithLimit(items, limit, worker) {
+  const out = new Array(items.length);
+  let i = 0, active = 0;
+  await new Promise((resolve) => {
+    const next = () => {
+      if (i === items.length && active === 0) return resolve();
+      while (active < limit && i < items.length) {
+        const idx = i++; active++;
+        Promise.resolve(worker(items[idx], idx))
+          .then((val) => { out[idx] = val; active--; next(); })
+          .catch(() => { out[idx] = undefined; active--; next(); });
+      }
+    };
+    next();
+  });
+  return out;
+}
+
 const symbolsCfg = {
   BTC: { binance: 'BTCUSDT', coingecko: 'bitcoin' },
   ETH: { binance: 'ETHUSDT', coingecko: 'ethereum' },
-  PAXG: { binance: null, coingecko: 'pax-gold' }
+  PAXG: { binance: null,    coingecko: 'pax-gold' }
 };
 
 const EXCHANGES = [
@@ -38,9 +63,8 @@ const U = (s) => `<u>${esc(s)}</u>`;
 function humanFmt(n) {
   if (!Number.isFinite(n)) return '—';
   try {
-    if (Math.abs(n) >= 1_000_000) return Intl.NumberFormat('en-US',{maximumFractionDigits:0}).format(Math.round(n));
-    if (Math.abs(n) >= 1000)      return Intl.NumberFormat('en-US',{maximumFractionDigits:0}).format(Math.round(n));
-    if (Math.abs(n) >= 1)         return Intl.NumberFormat('en-US',{maximumFractionDigits:2}).format(Number(n.toFixed(2)));
+    if (Math.abs(n) >= 1000) return Intl.NumberFormat('en-US',{maximumFractionDigits:0}).format(Math.round(n));
+    if (Math.abs(n) >= 1)   return Intl.NumberFormat('en-US',{maximumFractionDigits:2}).format(Number(n.toFixed(2)));
     return Number(n).toPrecision(6).replace(/(?:\.0+|(?<=\.[0-9]*?)0+)$/,'');
   } catch { return String(n); }
 }
@@ -84,50 +108,49 @@ function logSrc(section, src, ok, extra='') {
 function hostOf(url){ try{ return new URL(url).host.toLowerCase(); }catch{ return ''; } }
 function buildProxied(url) { if (!PROXY_FETCH) return null; return `${PROXY_FETCH}?url=${encodeURIComponent(url)}`; }
 
-// НОВАЯ устойчивая версия: пробуем direct/proxy и делаем прокси-фоллбек даже для NO_PROXY_HOSTS
 async function getUrlSmart(url, label, useUa = true, tryProxyToo = true) {
   const headers = useUa ? UA : undefined;
   const host = hostOf(url);
   const mustDirect = NO_PROXY_HOSTS.includes(host);
   const directFirst = !ALWAYS_PROXY || mustDirect;
-  // всегда готовим вариант через прокси как fallback
-  const proxiedUrlStr = buildProxied(url);
+  const proxied = mustDirect ? null : buildProxied(url);
 
-  try {
-    if (directFirst) {
-      // 1) прямой
+  if (directFirst) {
+    try {
+      const r = await withTimeout(httpGetWithRetry(url,1,headers), HARD_TIMEOUT_MS, `${label}:direct`);
+      return { data: r?.data ?? null, via: 'direct' };
+    } catch (e1) {
+      logSrc(label, 'direct', false, String(e1?.message||e1));
+      if (tryProxyToo && proxied) {
+        try {
+          const r2 = await withTimeout(httpGetWithRetry(proxied,1,headers), HARD_TIMEOUT_MS+2000, `${label}:proxy`);
+          return { data: r2?.data ?? null, via: 'proxy' };
+        } catch (e2) {
+          logSrc(label, 'proxy', false, String(e2?.message||e2));
+          throw e2;
+        }
+      }
+      throw e1;
+    }
+  } else {
+    if (proxied) {
+      try {
+        const r = await withTimeout(httpGetWithRetry(proxied,1,headers), HARD_TIMEOUT_MS+2000, `${label}:proxy`);
+        return { data: r?.data ?? null, via: 'proxy' };
+      } catch (e1) {
+        logSrc(label, 'proxy', false, String(e1?.message||e1));
+        try {
+          const r2 = await withTimeout(httpGetWithRetry(url,1,headers), HARD_TIMEOUT_MS, `${label}:direct`);
+          return { data: r2?.data ?? null, via: 'direct' };
+        } catch (e2) {
+          logSrc(label, 'direct', false, String(e2?.message||e2));
+          throw e2;
+        }
+      }
+    } else {
       const r = await withTimeout(httpGetWithRetry(url,1,headers), HARD_TIMEOUT_MS, `${label}:direct`);
       return { data: r?.data ?? null, via: 'direct' };
     }
-    // 2) сперва прокси, если не обязателен direct
-    if (proxiedUrlStr) {
-      const r = await withTimeout(httpGetWithRetry(proxiedUrlStr,1,headers), HARD_TIMEOUT_MS+2000, `${label}:proxy`);
-      return { data: r?.data ?? null, via: 'proxy' };
-    }
-    // 3) прокси нет — прямой
-    const r = await withTimeout(httpGetWithRetry(url,1,headers), HARD_TIMEOUT_MS, `${label}:direct`);
-    return { data: r?.data ?? null, via: 'direct' };
-  } catch (e1) {
-    logSrc(label, directFirst ? 'direct' : 'proxy', false, String(e1?.message||e1));
-    // Fallback: даже для NO_PROXY_HOSTS пробуем через прокси, если он доступен
-    if (tryProxyToo && proxiedUrlStr) {
-      try {
-        const r2 = await withTimeout(httpGetWithRetry(proxiedUrlStr,1,headers), HARD_TIMEOUT_MS+2000, `${label}:proxy_fallback`);
-        return { data: r2?.data ?? null, via: 'proxy' };
-      } catch (e2) {
-        logSrc(label, 'proxy_fallback', false, String(e2?.message||e2));
-      }
-    }
-    // Последняя попытка — прямой, если изначально шли через прокси
-    if (!directFirst) {
-      try {
-        const r3 = await withTimeout(httpGetWithRetry(url,1,headers), HARD_TIMEOUT_MS, `${label}:direct_fallback`);
-        return { data: r3?.data ?? null, via: 'direct' };
-      } catch (e3) {
-        logSrc(label, 'direct_fallback', false, String(e3?.message||e3));
-      }
-    }
-    throw e1;
   }
 }
 
@@ -140,6 +163,8 @@ async function fetchCoingeckoMarkets(ids=['bitcoin','ethereum']) {
 }
 async function fetchCoingeckoMarketChart(id,days=15) {
   try {
+    // троттлинг, чтобы меньше ловить 429
+    await sleep(COINGECKO_PAUSE_MS);
     const url=`https://api.coingecko.com/api/v3/coins/${encodeURIComponent(id)}/market_chart?vs_currency=usd&days=${encodeURIComponent(String(days))}&interval=daily&_t=${Date.now()}`;
     const { data } = await getUrlSmart(url,`coingecko:chart:${id}`);
     return data || null;
@@ -349,6 +374,7 @@ function readSeriesForSymbol(data, symbol){
     .sort((a,b)=>a.ts-b.ts);
 }
 async function loadExchangeDatasetStable(slug){
+  if (DISABLE_LLAMA) return null;
   try{
     const url=`https://api.llama.fi/cex/reserves/${encodeURIComponent(slug)}?_t=${Date.now()}`;
     const { data } = await getUrlSmart(url,`llama:stable:${slug}`);
@@ -357,6 +383,7 @@ async function loadExchangeDatasetStable(slug){
   return null;
 }
 async function loadExchangeDatasetPreview(slug){
+  if (DISABLE_LLAMA) return null;
   try{
     const url=`https://preview.dl.llama.fi/cex/${encodeURIComponent(slug)}?_t=${Date.now()}`;
     const { data } = await getUrlSmart(url,`llama:preview:${slug}`);
@@ -365,9 +392,11 @@ async function loadExchangeDatasetPreview(slug){
   return null;
 }
 async function loadExchangeDataset(slug){
+  if (DISABLE_LLAMA) return null;
   return (await loadExchangeDatasetStable(slug))||(await loadExchangeDatasetPreview(slug));
 }
 async function fetchCexDeltasTwoWindows(slug, symbol){
+  if (DISABLE_LLAMA) return { nowUSD:null, prevUSD:null };
   const data=await loadExchangeDataset(slug);
   if(!data) return { nowUSD:null, prevUSD:null };
   const series=readSeriesForSymbol(data, symbol);
@@ -385,6 +414,7 @@ async function fetchCexDeltasTwoWindows(slug, symbol){
   return { nowUSD:usdNow, prevUSD:usdPrev, last, p1, p2 };
 }
 async function loadGlobalAssetSeries(symbol){
+  if (DISABLE_LLAMA) return null;
   const candidates=[
     `https://api.llama.fi/cex/asset/${encodeURIComponent(symbol)}?_t=${Date.now()}`,
     `https://api.llama.fi/cex/assets/${encodeURIComponent(symbol)}?_t=${Date.now()}`,
@@ -454,8 +484,21 @@ async function fetchProxyNetFlowsUSDWithPrev(assetKey, spotUSD, pctNow, volNow, 
   const cached=readNetflowsCache(sym);
   if(cached) return cached;
 
+  // Быстрый путь без llama: берём синтетические флоу
+  if (DISABLE_LLAMA) {
+    const synthNow = synthNetFlowsUSD(pctNow,  volNow);
+    const synthPrv = synthNetFlowsUSD(pctPrev, volPrev);
+    const payload = {
+      nowUSD:  Number.isFinite(synthNow)?synthNow:null,
+      prevUSD: Number.isFinite(synthPrv)?synthPrv:null,
+      diffUSD: (Number.isFinite(synthNow)&&Number.isFinite(synthPrv)) ? (synthNow - synthPrv) : null
+    };
+    writeNetflowsCache(sym,payload);
+    return payload;
+  }
+
   let sumNow=0, sumPrev=0, seenNow=0, seenPrev=0;
-  const tasks=EXCHANGES.map(async (slug)=>{
+  await mapWithLimit(EXCHANGES, MAX_NET_CONCURRENCY, async (slug) => {
     try{
       const r=await withTimeout(fetchCexDeltasTwoWindows(slug,sym),HARD_TIMEOUT_MS,`llama:${slug}:${sym}`);
       const { nowUSD, prevUSD }=r||{};
@@ -463,7 +506,6 @@ async function fetchProxyNetFlowsUSDWithPrev(assetKey, spotUSD, pctNow, volNow, 
       if(Number.isFinite(prevUSD)){ sumPrev+=prevUSD; seenPrev++; }
     }catch{}
   });
-  await Promise.allSettled(tasks);
 
   if(seenNow>0 || seenPrev>0){
     const payload = {
@@ -993,7 +1035,7 @@ export async function buildMorningReportHtml(snapshots, lang='ru'){
     : `Сейчас: BTC — ${guideVolOne(((snapshots.BTC)||{}).volDeltaPct,false)}; ETH — ${guideVolOne(((snapshots.ETH)||{}).volDeltaPct,false)}.`;
   const rsiNow = isEn
     ? `Now: BTC — ${guideRSIOne(((snapshots.BTC)||{}).rsi14,true)}; ETH — ${guideRSIOne(((snapshots.ETH)||{}).rsi14,true)}.`
-    : `Сейчас: BTC — ${guideRSIOne(((snapshots.ETH)||{}).rsi14,false)}; ETH — ${guideRSIOne(((snapshots.ETH)||{}).rsi14,false)}.`;
+    : `Сейчас: BTC — ${guideRSIOne(((snapshots.BTC)||{}).rsi14,false)}; ETH — ${guideRSIOne(((snapshots.ETH)||{}).rsi14,false)}.`;
   const flowsNow = isEn
     ? `Now: BTC — ${guideFlowsOne(((snapshots.BTC)||{}).netFlowsUSDNow,true)}; ETH — ${guideFlowsOne(((snapshots.ETH)||{}).netFlowsUSDNow,true)}.`
     : `Сейчас: BTC — ${guideFlowsOne(((snapshots.BTC)||{}).netFlowsUSDNow,false)}; ETH — ${guideFlowsOne(((snapshots.ETH)||{}).netFlowsUSDNow,false)}.`;

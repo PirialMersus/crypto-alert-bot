@@ -5,6 +5,13 @@ import { fetchQuoteFromAny } from './daily.js';
 import { dailyMotivationCollection, client } from './db.js';
 import { getLastHeartbeat } from './monitor.js';
 
+function timeout(promise, ms = 2000) {
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error('mongo_ping_timeout')), ms))
+  ]);
+}
+
 export function createServer() {
   const app = express();
 
@@ -29,23 +36,26 @@ export function createServer() {
     }
   });
 
+  // ВАЖНО: healthcheck не должен валиться из-за Mongo.
+  // Возвращаем 200 мгновенно; mongoConnected — просто поле наблюдения.
   app.get('/health', async (_req, res) => {
     const now = Date.now();
     const heartbeat = getLastHeartbeat();
     let mongoConnected = false;
     try {
       if (client && typeof client.db === 'function') {
-        await client.db().command({ ping: 1 });
+        // ограничим ping по времени, чтобы health не висел
+        await timeout(client.db().command({ ping: 1 }), 1500);
         mongoConnected = true;
       }
-    } catch (e) {
+    } catch {
       mongoConnected = false;
     }
     res.json({
-      ok: mongoConnected,
+      ok: true,                // <- всегда true: сервис жив
       time: now,
       lastHeartbeat: heartbeat,
-      mongoConnected
+      mongoConnected           // <- для наблюдения, но не критично для статуса
     });
   });
 

@@ -2,6 +2,14 @@
 import dotenv from 'dotenv';
 dotenv.config();
 
+// Глобальные ловушки, чтобы процесс на Render не падал
+process.on('uncaughtException', (e) => {
+  console.error('❌ uncaughtException:', e?.stack || e?.message || e);
+});
+process.on('unhandledRejection', (e) => {
+  console.error('❌ unhandledRejection:', e?.stack || e?.message || e);
+});
+
 try {
   const mod = await import('./bot.js');
 
