@@ -2,26 +2,28 @@
 import dotenv from 'dotenv';
 dotenv.config();
 
-// Глобальные ловушки, чтобы процесс на Render не падал
-process.on('uncaughtException', (e) => {
-  console.error('❌ uncaughtException:', e?.stack || e?.message || e);
-});
-process.on('unhandledRejection', (e) => {
-  console.error('❌ unhandledRejection:', e?.stack || e?.message || e);
-});
+import { startBot, bot } from './bot.js';
 
-try {
-  const mod = await import('./bot.js');
+let serverRef = null;
 
-  if (mod && typeof mod.startBot === 'function') {
-    await mod.startBot();
-  } else if (mod && mod.default && typeof mod.default.startBot === 'function') {
-    await mod.default.startBot();
-  } else {
-    console.error("❌ './bot.js' does not export a function named 'startBot'. Make sure you have:\n\nexport async function startBot() { /* ... */ }\n");
+async function main() {
+  try {
+    const res = await startBot();
+    serverRef = res?.server || null;
+    process.on('unhandledRejection', (err) => { try { console.error('[unhandledRejection]', err?.stack || String(err)); } catch {} });
+    process.on('uncaughtException',  (err) => { try { console.error('[uncaughtException]', err?.stack || String(err)); } catch {} });
+    const graceful = async (sig) => {
+      try { console.log(`signal ${sig}`); } catch {}
+      try { await bot?.stop?.(sig); } catch {}
+      try { if (serverRef) { await new Promise(r => serverRef.close(() => r())); } } catch {}
+      process.exit(0);
+    };
+    process.on('SIGINT',  () => graceful('SIGINT'));
+    process.on('SIGTERM', () => graceful('SIGTERM'));
+  } catch (e) {
+    try { console.error('fatal start error', e?.stack || String(e)); } catch {}
     process.exit(1);
   }
-} catch (e) {
-  console.error('❌ Failed to load ./bot.js:', e?.stack || e?.message || e);
-  process.exit(1);
 }
+
+main();

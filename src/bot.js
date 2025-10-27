@@ -6,33 +6,10 @@ import { createServer } from './server.js';
 import { startTickersRefresher, refreshAllTickers, getCachedPrice } from './prices.js';
 import { startAlertsChecker, renderAlertsList, buildDeleteInlineForUser, renderOldAlertsList } from './alerts.js';
 import { removeInactive } from './cleanup.js';
-import {
-  getUserRecentSymbols,
-  pushRecentSymbol,
-  getUserAlertsOrder,
-  setUserAlertsOrder,
-  getUserAlertsCached,
-  invalidateUserAlertsCache,
-  statsCache,
-  getUserAlertLimit,
-  setUserAlertLimit,
-  resolveUserLang
-} from './cache.js';
+import { getUserRecentSymbols, pushRecentSymbol, getUserAlertsOrder, setUserAlertsOrder, getUserAlertsCached, invalidateUserAlertsCache, statsCache, getUserAlertLimit, setUserAlertLimit, resolveUserLang } from './cache.js';
 import { fmtNum, safeSendTelegram } from './utils.js';
 import { sendDailyToUser, processDailyQuoteRetry, watchForNewQuotes, fetchAndStoreDailyMotivation, ensureDailyImageBuffer } from './daily.js';
-import {
-  CACHE_TTL,
-  INACTIVE_DAYS,
-  DAY_MS,
-  IMAGE_FETCH_HOUR,
-  PREPARE_SEND_HOUR,
-  ENTRIES_PER_PAGE,
-  KYIV_TZ,
-  MARKET_SEND_HOUR,
-  MARKET_SEND_MIN,
-  MARKET_BATCH_SIZE,
-  MARKET_BATCH_PAUSE_MS
-} from './constants.js';
+import { CACHE_TTL, INACTIVE_DAYS, DAY_MS, IMAGE_FETCH_HOUR, PREPARE_SEND_HOUR, ENTRIES_PER_PAGE, KYIV_TZ, MARKET_SEND_HOUR, MARKET_SEND_MIN, MARKET_BATCH_SIZE, MARKET_BATCH_PAUSE_MS } from './constants.js';
 import { setLastHeartbeat } from './monitor.js';
 import { startMarketMonitor, getMarketSnapshot, broadcastMarketSnapshot, sendMarketReportToUser, buildMorningReportHtml } from './marketMonitor.js';
 
@@ -43,6 +20,11 @@ const CREATOR_ID = process.env.CREATOR_ID ? parseInt(process.env.CREATOR_ID, 10)
 if (!BOT_TOKEN) throw new Error('BOT_TOKEN не задан в окружении');
 
 export const bot = new Telegraf(BOT_TOKEN);
+
+bot.catch(async (err, ctx) => {
+  try { console.error('[telegraf.catch]', err?.stack || String(err)); } catch {}
+  try { await ctx?.reply?.('⚠️ Внутренняя ошибка, попробуй ещё раз.'); } catch {}
+});
 
 bot.use(session());
 bot.use((ctx, next) => { if (!ctx.session) ctx.session = {}; return next(); });
@@ -170,7 +152,6 @@ bot.start(async (ctx) => {
   await ctx.reply(`${greet}\n${isEn ? '(Language: English)' : '(Язык: Русский)'}`, getMainMenuSync(ctx.from.id, lang));
 });
 
-// быстрый возврат главного меню в любой момент
 bot.command('menu', async (ctx) => {
   const lang = await resolveUserLang(ctx.from?.id, null, ctx.from?.language_code);
   await ctx.reply(String(lang).startsWith('en') ? 'Main menu' : 'Главное меню', getMainMenuSync(ctx.from.id, lang));
@@ -230,46 +211,49 @@ bot.hears('📋 My alerts', async (ctx) => {
 });
 
 async function handleMarketSnapshotRequest(ctx) {
-  const pref = await resolveUserLang(ctx.from?.id, null, ctx.from?.language_code).catch(() => ctx.from?.language_code || 'ru');
-  const isEn = String(pref).toLowerCase().startsWith('en');
-  if (isLocked(ctx.from.id)) { return; }
-  lockReport(ctx.from.id, 30000);
-  try { await ctx.telegram.sendChatAction(ctx.chat.id, 'typing'); } catch {}
-  const typingTimer = startTyping(ctx);
-  const state = reportInFlight.get(ctx.from.id);
-  if (state) state.typingTimer = typingTimer;
   try {
-    const m = await ctx.reply(isEn ? '⏳ Building your market report (takes a few seconds)…' : '⏳ Формирую ваш отчёт (несколько секунд)…', getMainMenuBusy(ctx.from.id, pref)).catch(()=>null);
-    if (state && m?.message_id) state.startedMsgId = m.message_id;
-  } catch {}
-  try {
-    const dateStr = new Date().toLocaleDateString('sv-SE', { timeZone: KYIV_TZ });
-    const res = await sendMarketReportToUser(bot, ctx.from.id, dateStr).catch(()=>null);
-    if (res?.ok) { return; }
-    const snap = await getMarketSnapshot(['BTC','ETH']).catch(()=>null);
-    if (!snap?.ok) {
-      await ctx.reply(isEn ? '⚠️ Failed to collect data.' : '⚠️ Не удалось собрать данные.');
-      return;
+    const pref = await resolveUserLang(ctx.from?.id, null, ctx.from?.language_code).catch(() => ctx.from?.language_code || 'ru');
+    const isEn = String(pref).toLowerCase().startsWith('en');
+    if (isLocked(ctx.from.id)) { try { await ctx.reply(isEn ? '⏳ Уже формирую отчёт…' : '⏳ Уже формирую отчёт…', getMainMenuBusy(ctx.from.id, pref)); } catch {} return; }
+    lockReport(ctx.from.id, 60000);
+    try { await ctx.telegram.sendChatAction(ctx.chat.id, 'typing'); } catch {}
+    const typingTimer = startTyping(ctx);
+    const state = reportInFlight.get(ctx.from.id);
+    if (state) state.typingTimer = typingTimer;
+    let startedMsgId = null;
+    try {
+      const m = await ctx.reply(isEn ? '⏳ Формирую отчёт…' : '⏳ Формирую отчёт…', getMainMenuBusy(ctx.from.id, pref)).catch(()=>null);
+      if (m?.message_id) startedMsgId = m.message_id;
+      if (state) state.startedMsgId = startedMsgId;
+    } catch {}
+    try {
+      const dateStr = new Date().toLocaleDateString('sv-SE', { timeZone: KYIV_TZ });
+      const res = await sendMarketReportToUser(bot, ctx.from.id, dateStr).catch(()=>null);
+      if (res?.ok) { return; }
+      const snap = await getMarketSnapshot(['BTC','ETH']).catch(()=>null);
+      if (!snap?.ok) {
+        await ctx.reply(isEn ? '⚠️ Не удалось собрать данные.' : '⚠️ Не удалось собрать данные.');
+        return;
+      }
+      const html = await buildMorningReportHtml(snap.snapshots, pref);
+      await ctx.reply(html, { parse_mode: 'HTML' });
+    } catch (e) {
+      try { console.error('[handleMarketSnapshotRequest]', e?.stack || String(e)); } catch {}
+      try { await ctx.reply(isEn ? '⚠️ Ошибка при формировании отчёта.' : '⚠️ Ошибка при формировании отчёта.'); } catch {}
+    } finally {
+      try { if (startedMsgId) { await ctx.deleteMessage(startedMsgId).catch(()=>{}); } } catch {}
+      try { await ctx.reply(isEn ? '✅ Готово.' : '✅ Готово.', getMainMenuSync(ctx.from.id, pref)); } catch {}
+      unlockReport(ctx.from.id);
     }
-    const html = await buildMorningReportHtml(snap.snapshots, pref);
-    await ctx.reply(html, { parse_mode: 'HTML' });
-  } catch {
-    await ctx.reply(isEn ? '⚠️ Error while generating the report.' : '⚠️ Ошибка при формировании отчёта.');
-  } finally {
-    try {
-      const s = reportInFlight.get(ctx.from.id);
-      if (s?.startedMsgId) { try { await ctx.deleteMessage(s.startedMsgId); } catch {} }
-    } catch {}
-    try {
-      await ctx.reply(isEn ? '✅ Ready.' : '✅ Готово.', getMainMenuSync(ctx.from.id, pref));
-    } catch {}
+  } catch (e) {
+    try { console.error('[handleMarketSnapshotRequest:outer]', e?.stack || String(e)); } catch {}
+    try { await ctx.reply('⚠️ Внутренняя ошибка.'); } catch {}
     unlockReport(ctx.from.id);
   }
 }
 
 bot.hears('📊 прислать данные мониторинга', handleMarketSnapshotRequest);
 bot.hears('📊 Send market snapshot', handleMarketSnapshotRequest);
-// обработчики «занятой» кнопки — повторный запуск и нормализация меню
 bot.hears('📊 ⏳ Формирую…', handleMarketSnapshotRequest);
 bot.hears('📊 ⏳ Building…', handleMarketSnapshotRequest);
 
