@@ -20,8 +20,11 @@ const SNAPSHOT_TTL_MS = Number.isFinite(Number(process.env.SNAPSHOT_TTL_MS)) ? N
 const BUST_CACHE = String(process.env.BUST_CACHE || '0') === '1';
 const ALWAYS_PROXY = String(process.env.ALWAYS_PROXY || '0') === '1';
 const PROXY_FETCH = process.env.PROXY_FETCH || '';
-const NO_PROXY_HOSTS = (process.env.NO_PROXY_HOSTS || 'api.coingecko.com,api.llama.fi,preview.dl.llama.fi,api.alternative.me')
-  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+const NO_PROXY_HOSTS = (process.env.NO_PROXY_HOSTS || 'api.coingecko.com,api.llama.fi,preview.dl.llama.fi,api.alternative.me,api.binance.com,fapi.binance.com,www.binance.com,api.bybit.com,www.okx.com')
+  .split(',')
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
+
 
 const UA = { headers: { 'User-Agent': 'Mozilla/5.0 Chrome/120' } };
 
