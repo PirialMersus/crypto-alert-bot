@@ -420,126 +420,117 @@ async function fetchProxyNetFlowsUSDWithPrev(assetKey, spotUSD, pctNow, volNow, 
 
 async function fetchGoldSpotAndDelta(){
   try {
-    // 1) Пытаемся получить spot с metals.live (как и раньше)
+    function pickClosest(xs, xtarget) {
+      let best = null, bestDiff = Infinity;
+      for (let i = 0; i < xs.length; i++) {
+        const t = Number(xs[i]);
+        if (!Number.isFinite(t)) continue;
+        const d = Math.abs(t - xtarget);
+        if (d < bestDiff) { bestDiff = d; best = { idx: i, ts: t }; }
+      }
+      return best;
+    }
+
+    async function yahooSeries(ticker) {
+      try {
+        const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=2d&interval=1h&_t=${Date.now()}`;
+        const r = await withTimeout(httpGetWithRetry(url, 1, UA), HARD_TIMEOUT_MS, `gold:yahoo:${ticker}`);
+        const res = r?.data?.chart?.result?.[0];
+        const ts  = Array.isArray(res?.timestamp) ? res.timestamp.map((s)=>Number(s)*1000) : [];
+        const cl  = Array.isArray(res?.indicators?.quote?.[0]?.close) ? res.indicators.quote[0].close.map(Number) : [];
+        if (!(ts.length && cl.length && ts.length === cl.length)) {
+          console.warn('[gold] yahooSeries: bad series structure', { ticker, ts: ts.length, cl: cl.length });
+          return null;
+        }
+        return { ts, cl };
+      } catch (e) {
+        console.warn('[gold] yahooSeries failed', ticker, e?.message || e);
+        return null;
+      }
+    }
+
+    let series = await yahooSeries('XAUUSD=X');
+    if (!series) series = await yahooSeries('GC=F');
+
+    if (series) {
+      const ts = series.ts;
+      const cl = series.cl;
+      const lastIdx = ts.length - 1;
+      const lastTs  = ts[lastIdx];
+      const lastPx  = Number(cl[lastIdx]);
+
+      const target = lastTs - 24*3600*1000;
+      const prevPt = pickClosest(ts, target);
+      const prevPx = prevPt ? Number(cl[prevPt.idx]) : null;
+
+      if (!Number.isFinite(lastPx) || lastPx <= 0) {
+        console.warn('[gold] invalid last price', { lastPx });
+      }
+      if (!Number.isFinite(prevPx) || prevPx <= 0) {
+        console.warn('[gold] prev 24h price not found', { prevIdx: prevPt?.idx, prevTs: prevPt?.ts });
+      }
+
+      if (Number.isFinite(lastPx) && lastPx > 0 && Number.isFinite(prevPx) && prevPx > 0) {
+        const pct = ((lastPx - prevPx) / prevPx) * 100;
+        return { price: lastPx, pct24: pct, source: 'XAU' };
+      }
+      if (Number.isFinite(lastPx) && lastPx > 0) {
+        return { price: lastPx, pct24: null, source: 'XAU' };
+      }
+    } else {
+      console.warn('[gold] no yahoo series for both XAUUSD=X and GC=F');
+    }
+
     const candidates = [
       `https://api.metals.live/v1/spot/gold?_t=${Date.now()}`,
       `https://api.metals.live/v1/spot/XAU?_t=${Date.now()}`,
       `https://api.metals.live/v1/spot?_t=${Date.now()}`
     ];
-    let spot = null;
-
-    const normalizeList = (raw) => {
-      const nums = [];
-      if (!Array.isArray(raw)) return nums;
-      for (const item of raw) {
-        if (typeof item === 'number') { if (item > 0) nums.push(item); continue; }
-        if (Array.isArray(item)) {
-          const v = Number(item[1] ?? item[0]);
-          if (Number.isFinite(v) && v > 0) nums.push(v);
-          continue;
-        }
-        if (item && typeof item === 'object') {
-          const keys = ['gold','xau','price','ask','bid','close'];
-          let v = null;
-          for (const k of keys) {
-            const n = Number(item[k]);
-            if (Number.isFinite(n) && n > 0) { v = n; break; }
-          }
-          if (v == null) {
-            const any = Number(Object.values(item).find(x => Number.isFinite(Number(x))));
-            if (Number.isFinite(any) && any > 0) v = any;
-          }
-          if (v != null) nums.push(v);
-        }
-      }
-      return nums;
-    };
-
     for (const url of candidates) {
       try {
         const r = await withTimeout(httpGetWithRetry(url, 1, UA), HARD_TIMEOUT_MS, `gold:${url}`);
-        const nums = normalizeList(r?.data);
+        const raw = r?.data;
+        if (!Array.isArray(raw)) continue;
+        const nums = [];
+        for (const item of raw) {
+          if (typeof item === 'number' && item > 0) { nums.push(item); continue; }
+          if (Array.isArray(item)) {
+            const v = Number(item[1] ?? item[0]);
+            if (Number.isFinite(v) && v > 0) nums.push(v);
+            continue;
+          }
+          if (item && typeof item === 'object') {
+            const keys = ['gold','xau','price','ask','bid','close'];
+            let v = null;
+            for (const k of keys) { const n = Number(item[k]); if (Number.isFinite(n) && n > 0) { v = n; break; } }
+            if (v == null) {
+              const any = Number(Object.values(item).find(x => Number.isFinite(Number(x))));
+              if (Number.isFinite(any) && any > 0) v = any;
+            }
+            if (v != null) nums.push(v);
+          }
+        }
         if (nums.length) {
-          spot = nums[nums.length - 1];
-          break;
+          const price = nums[nums.length - 1];
+          if (Number.isFinite(price) && price > 0) {
+            console.warn('[gold] using metals.live fallback (no pct)');
+            return { price, pct24: null, source: 'XAU' };
+          }
         }
-      } catch {}
-    }
-
-    // 2) Готовим помощник для Yahoo ежедневного close
-    async function yahooPrevClose(ticker) {
-      try {
-        const y = await withTimeout(
-          httpGetWithRetry(
-            `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=2d&interval=1d&_t=${Date.now()}`,
-            1,
-            UA
-          ),
-          HARD_TIMEOUT_MS,
-          `gold:yahoo:${ticker}`
-        );
-        const res = y?.data?.chart?.result?.[0];
-        const closes = res?.indicators?.quote?.[0]?.close;
-        if (Array.isArray(closes) && closes.length >= 2) {
-          // closes[0] — prev close, closes[1] — текущее дневное close
-          return { prev: Number(closes[0]), lastClose: Number(closes[1]) };
-        }
-      } catch {}
-      return { prev: null, lastClose: null };
-    }
-
-    // 3) Если spot не удалось, попытаемся взять спот с Yahoo
-    if (!Number.isFinite(spot) || spot <= 0) {
-      // сначала XAUUSD=X (спот), потом GC=F (фьючи)
-      const xau = await yahooPrevClose('XAUUSD=X');
-      if (Number.isFinite(xau.lastClose) && xau.lastClose > 0) spot = xau.lastClose;
-      else {
-        const gc = await yahooPrevClose('GC=F');
-        if (Number.isFinite(gc.lastClose) && gc.lastClose > 0) spot = gc.lastClose;
+      } catch (e) {
+        console.warn('[gold] metals.live candidate failed', url, e?.message || e);
       }
     }
 
-    // 4) Всегда берём prevClose из Yahoo (сначала XAUUSD=X, затем GC=F)
-    let prevClose = null;
-    let prevPack = await yahooPrevClose('XAUUSD=X');
-    if (Number.isFinite(prevPack.prev) && prevPack.prev > 0) {
-      prevClose = prevPack.prev;
-    } else {
-      prevPack = await yahooPrevClose('GC=F');
-      if (Number.isFinite(prevPack.prev) && prevPack.prev > 0) prevClose = prevPack.prev;
-    }
-
-    // 5) Если и spot, и prevClose есть — считаем % строго к prevClose
-    if (Number.isFinite(spot) && spot > 0 && Number.isFinite(prevClose) && prevClose > 0) {
-      const pct = ((spot - prevClose) / prevClose) * 100;
-      return { price: spot, pct24: Number.isFinite(pct) ? pct : null, source: 'XAU' };
-    }
-
-    // Фолбэк: если есть только spot — вернём цену без процента
-    if (Number.isFinite(spot) && spot > 0) {
-      return { price: spot, pct24: null, source: 'XAU' };
-    }
-
-    // Совсем жёсткий фолбэк — как раньше по GC=F
-    try {
-      const y = await withTimeout(
-        httpGetWithRetry(`https://query1.finance.yahoo.com/v8/finance/chart/GC=F?range=2d&interval=1d&_t=${Date.now()}`, 1, UA),
-        HARD_TIMEOUT_MS,
-        'gold:yahoo:final'
-      );
-      const res = y?.data?.chart?.result?.[0];
-      const c = Number(res?.meta?.regularMarketPrice);
-      const prev = Array.isArray(res?.indicators?.quote?.[0]?.close) ? Number(res.indicators.quote[0].close?.[0]) : null;
-      if (Number.isFinite(c) && c > 0) {
-        const pct = (Number.isFinite(prev) && prev > 0) ? ((c - prev) / prev) * 100 : null;
-        return { price: c, pct24: Number.isFinite(pct) ? pct : null, source: 'XAU' };
-      }
-    } catch {}
+    console.warn('[gold] all sources failed');
     return { price: null, pct24: null, source: null };
-  } catch {
+  } catch (e) {
+    console.warn('[gold] fetchGoldSpotAndDelta fatal', e?.message || e);
     return { price: null, pct24: null, source: null };
   }
 }
+
+
 
 
 // ---------- FGI ----------
@@ -721,6 +712,16 @@ export async function getMarketSnapshot(symbols=['BTC','ETH']){
       snapshots[s].fgiClass = fgi.classification;
       snapshots[s].fgiTs = fgi.ts;
     }
+
+    try {
+      const miss = [];
+      if (!Number.isFinite(snapshots.BTC?.fundingNow)) miss.push('BTC_funding');
+      if (!Number.isFinite(snapshots.ETH?.fundingNow)) miss.push('ETH_funding');
+      if (!snapshots.BTC?.longShort) miss.push('BTC_ls');
+      if (!snapshots.ETH?.longShort) miss.push('ETH_ls');
+      if (!Number.isFinite(snapshots.BTC?.goldPct24)) miss.push('gold_pct');
+      if (miss.length) console.warn('[marketMonitor] missing fields:', miss.join(', '));
+    } catch {}
 
     const payload = { ok:true, snapshots, fetchedAt:Date.now() };
     writeSnapshotCache(symbols, payload);

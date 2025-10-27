@@ -16,19 +16,20 @@ const NEED_PROXY = [
   'data-asg.goldprice.org',
   'api.metals.live',
   'stooq.pl'
-]
+];
 
-const ALWAYS_PROXY = String(process.env.ALWAYS_PROXY || '0') === '1'
+const ALWAYS_PROXY = String(process.env.ALWAYS_PROXY || '0') === '1';
 
 function proxiedUrl(u) {
   try {
-    const url = new URL(u)
-    const p = process.env.PROXY_FETCH
-    if (!p) return u
-    if (!ALWAYS_PROXY && !NEED_PROXY.includes(url.hostname)) return u
-    return p + '?url=' + encodeURIComponent(u)
+    const url = new URL(u);
+    const p = process.env.PROXY_FETCH;
+    if (!p) return u;
+    if (ALWAYS_PROXY) return p + '?url=' + encodeURIComponent(u);
+    if (!NEED_PROXY.includes(url.hostname)) return u;
+    return p + '?url=' + encodeURIComponent(u);
   } catch {
-    return u
+    return u;
   }
 }
 
