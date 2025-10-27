@@ -20,7 +20,7 @@ const SNAPSHOT_TTL_MS = Number.isFinite(Number(process.env.SNAPSHOT_TTL_MS)) ? N
 const BUST_CACHE = String(process.env.BUST_CACHE || '0') === '1';
 const ALWAYS_PROXY = String(process.env.ALWAYS_PROXY || '0') === '1';
 const PROXY_FETCH = process.env.PROXY_FETCH || '';
-const NO_PROXY_HOSTS = (process.env.NO_PROXY_HOSTS || 'api.coingecko.com,api.llama.fi,preview.dl.llama.fi,api.alternative.me,api.binance.com,fapi.binance.com,www.binance.com,api.bybit.com,www.okx.com')
+const NO_PROXY_HOSTS = (process.env.NO_PROXY_HOSTS || 'api.coingecko.com,api.llama.fi,preview.dl.llama.fi,api.alternative.me,api.bybit.com,www.okx.com')
   .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 
 const UA = { headers: { 'User-Agent': 'Mozilla/5.0 Chrome/120' } };
@@ -214,7 +214,13 @@ async function fetchFundingOkx(instId){
 
 const lsMem = new Map();
 function setLsCache(sym, val) { if (val==null) return; lsMem.set(sym, { v: val, t: Date.now() }); }
-function getLsCache(sym, ttlMs = 12 * 60 * 1000) { const e = lsMem.get(sym); if (!e) return null; if (Date.now() - e.t > ttlMs) return null; return e.v; }
+function getLsCache(sym, freshTtlMs = 30 * 60 * 1000, staleTtlMs = 3 * 60 * 60 * 1000) {
+  const e = lsMem.get(sym); if (!e) return null;
+  const age = Date.now() - e.t;
+  if (age <= freshTtlMs) return e.v;
+  if (age <= staleTtlMs) return e.v;
+  return null;
+}
 function deriveLsFromRatio(ratio) {
   if (!Number.isFinite(ratio) || ratio <= 0) return null;
   const longPct = (ratio / (1 + ratio)) * 100;
@@ -262,14 +268,20 @@ async function fetchLsBybit(symbol){
   } catch { return null; }
 }
 async function fetchLongShortRatio(symbol){
-  const cached = getLsCache(symbol);
+  const cachedFresh = getLsCache(symbol, 30*60*1000, 3*60*60*1000);
+  if (cachedFresh) return cachedFresh;
+
   const binanceSym = `${symbol}USDT`;
   let r = await fetchLsBinanceOnce(binanceSym);
   if (!r) r = await fetchLsBinanceViaProxy(binanceSym);
   if (!r) r = await fetchLsBybit(binanceSym);
-  if (!r && cached) return cached;
-  if (r) setLsCache(symbol, r);
-  return r || null;
+
+  if (r) { setLsCache(symbol, r); return r; }
+
+  const stale = getLsCache(symbol, 0, 3*60*60*1000);
+  if (stale) return stale;
+
+  return null;
 }
 
 function pickNum(...vals){
