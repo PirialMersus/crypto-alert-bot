@@ -47,7 +47,8 @@ function humanFmt(n) {
 }
 const nearZero = (v) => Number.isFinite(v) && Math.abs(v) < 1e-8;
 
-function fmtFunding(v) { if(!Number.isFinite(v)) return '—'; return Number(v).toFixed(8).replace(/\.0+$|0+$/,''); }
+function fmtFunding(v){ if(!Number.isFinite(v)) return '—'; return Number(v).toFixed(6).replace(/\.0+$|0+$/,''); }
+function toBps(v){ if(!Number.isFinite(v)) return null; return v*10000; }
 function circleByDelta(x) { if(!Number.isFinite(x) || x===0) return '⚪'; return x>0?'🟢':'🔴'; }
 function pctStr(v) { return `${v>0?'+':''}${v.toFixed(2)}%`; }
 
@@ -188,16 +189,17 @@ async function fetchFundingNowFallback(symbol){
   }catch{ logSrc('funding','binance_snapshot',false); return null; }
 }
 
-async function fetchFundingBybitSeries(symbol){
+async function fetchFundingBybit(symbol){
   try{
     const url = `https://api.bybit.com/v5/market/funding/history?category=linear&symbol=${encodeURIComponent(symbol)}&limit=16&_t=${Date.now()}`;
     const { data } = await getUrlSmart(url,`bybit:funding:${symbol}`);
     const arr = Array.isArray(data?.result?.list) ? data.result.list : [];
     const vals = arr.map(x => Number(x?.fundingRate)).filter(v => Number.isFinite(v) && !nearZero(v));
-    logSrc('funding','bybit_series',vals.length>0);
+    logSrc('funding','bybit',vals.length>0);
     return vals;
-  } catch { logSrc('funding','bybit_series',false); return []; }
+  } catch { logSrc('funding','bybit',false); return []; }
 }
+
 async function fetchFundingOkx(instId){
   try{
     const url = `https://www.okx.com/api/v5/public/funding-rate?instId=${encodeURIComponent(instId)}&_t=${Date.now()}`;
@@ -208,16 +210,6 @@ async function fetchFundingOkx(instId){
     logSrc('funding','okx',ok!==null);
     return ok;
   } catch { logSrc('funding','okx',false); return null; }
-}
-async function fetchFundingDeribitEthSeries(limit=16){
-  try{
-    const url = `https://www.deribit.com/api/v2/public/get_funding_rate_history?instrument_name=ETH-PERPETUAL&count=${encodeURIComponent(String(limit))}&_t=${Date.now()}`;
-    const { data } = await getUrlSmart(url,`deribit:funding:ETH`);
-    const arr = Array.isArray(data?.result?.data) ? data.result.data : [];
-    const vals = arr.map(x => Number(x?.interest_8h ?? x?.funding_8h ?? x?.funding)).filter(v => Number.isFinite(v) && !nearZero(v));
-    logSrc('funding','deribit_eth',vals.length>0);
-    return vals;
-  } catch { logSrc('funding','deribit_eth',false); return []; }
 }
 
 const lsCache = new Map();
@@ -306,6 +298,28 @@ async function fetchLsBybit(symbol){
     logSrc('ls','bybit',!!r);
     return r;
   } catch (e) { logSrc('ls','bybit',false,String(e?.message||e)); return null; }
+}
+async function fetchLongShortRatio(symbol){
+  const cached = readLsCache(symbol);
+  if (cached) return cached;
+  const periods = ['4h','1h','30m'];
+  for (const p of periods) {
+    const r = await fetchGlobalLongShort(symbol, p).catch(()=>null);
+    if (r && Number.isFinite(r.longPct) && Number.isFinite(r.shortPct) && Number.isFinite(r.ls)) { writeLsCache(symbol, r); return r; }
+  }
+  {
+    const r = await fetchTopLongShortAccounts(symbol, '4h').catch(()=>null);
+    if (r) { writeLsCache(symbol, r); return r; }
+  }
+  {
+    const r = await fetchTopLongShortPositions(symbol, '4h').catch(()=>null);
+    if (r) { writeLsCache(symbol, r); return r; }
+  }
+  {
+    const r = await fetchLsBybit(symbol).catch(()=>null);
+    if (r) { writeLsCache(symbol, r); return r; }
+  }
+  return null;
 }
 
 function pickNum(...vals){
@@ -543,35 +557,6 @@ function writeSnapshotCache(symbols, payload){
 }
 export function invalidateMarketSnapshotCache(){ snapshotCache.clear(); }
 
-const fundingCache = new Map();
-const lsLastCache = new Map();
-const FUNDING_LAST_TTL_MS = 12 * 60 * 60 * 1000;
-const LS_LAST_TTL_MS = 12 * 60 * 60 * 1000;
-function readFundingLast(sym){ const r=fundingCache.get(sym); if(!r) return null; if(Date.now()-r.ts>FUNDING_LAST_TTL_MS) return null; return r.data; }
-function writeFundingLast(sym,data){ if(!Number.isFinite(data?.now)) return; fundingCache.set(sym,{ ts:Date.now(), data }); }
-function readLsLast(sym){ const r=lsLastCache.get(sym); if(!r) return null; if(Date.now()-r.ts>LS_LAST_TTL_MS) return null; return r.data; }
-function writeLsLast(sym,data){ if(!data || !Number.isFinite(data.longPct)) return; lsLastCache.set(sym,{ ts:Date.now(), data }); }
-
-function synthFundingFromPctVol(pct24, vol24){
-  if(!Number.isFinite(pct24)) return null;
-  const volScale = Number.isFinite(vol24) ? Math.min(1, vol24/10_000_000_000) : 0.3;
-  const base = 0.0002;
-  const extra = 0.0008 * volScale;
-  const mag = Math.min(0.003, base + extra);
-  if (pct24>0) return +mag;
-  if (pct24<0) return -mag;
-  return 0;
-}
-function synthLsFromFundingPct(funding, pct24){
-  let base = 50;
-  if (Number.isFinite(funding)) { if (funding>0) base += 4; else if (funding<0) base -= 4; }
-  if (Number.isFinite(pct24)) { const p = Math.max(-5, Math.min(5, pct24)); base += p*1.0; }
-  const longPct = Math.max(35, Math.min(65, base));
-  const shortPct = 100 - longPct;
-  const ratio = longPct/(100-longPct);
-  return { longPct: Number(longPct.toFixed(2)), shortPct: Number(shortPct.toFixed(2)), ls: Number(ratio.toFixed(2)) };
-}
-
 export async function getMarketSnapshot(symbols=['BTC','ETH']){
   const cached = readSnapshotCache(symbols);
   if (cached) return cached;
@@ -636,111 +621,83 @@ export async function getMarketSnapshot(symbols=['BTC','ETH']){
         .catch(()=>({nowUSD:null,prevUSD:null,diffUSD:null}));
 
       let ls = null;
+      if (binanceSym) {
+        ls = await fetchLongShortRatio(binanceSym).catch(()=>null);
+      }
 
+      let series1 = [];
+      if (binanceSym) {
+        series1 = await fetchBinanceFundingSeries(binanceSym, 24).catch(()=>[]);
+      }
       let fundingNow=null, fundingPrev=null, fundingDelta=null;
 
-      if (binanceSym) {
-        const seriesBybit = await fetchFundingBybitSeries(binanceSym).catch(()=>[]);
-        if (seriesBybit.length >= 3) {
-          const nowArr = seriesBybit.slice(-3);
-          const prevArr = seriesBybit.length >= 6 ? seriesBybit.slice(-6,-3) : null;
-          const avg = (arr)=>arr.reduce((a,b)=>a+b,0)/arr.length;
-          fundingNow = avg(nowArr);
-          if (prevArr && prevArr.length) { fundingPrev = avg(prevArr); fundingDelta = fundingNow - fundingPrev; }
-        }
+      let src = series1;
+      if (!src.length && binanceSym) {
+        const series2 = await fetchFundingSeriesViaWWW(binanceSym, 48).catch(()=>[]);
+        if (series2.length) src = series2;
       }
-
-      if (!Number.isFinite(fundingNow) && binanceSym) {
-        const inst = binanceSym==='BTCUSDT' ? 'BTC-USDT-SWAP' : binanceSym==='ETHUSDT' ? 'ETH-USDT-SWAP' : null;
-        if (inst) {
-          const okxRate = await fetchFundingOkx(inst).catch(()=>null);
-          if (Number.isFinite(okxRate)) { fundingNow = okxRate; fundingPrev = null; fundingDelta = null; }
-        }
-      }
-
-      if (!Number.isFinite(fundingNow) && binanceSym && binanceSym==='ETHUSDT') {
-        const der = await fetchFundingDeribitEthSeries(16).catch(()=>[]);
-        if (der.length >= 3) {
-          const nowArr = der.slice(-3);
-          const prevArr = der.length >= 6 ? der.slice(-6,-3) : null;
-          const avg = (arr)=>arr.reduce((a,b)=>a+b,0)/arr.length;
-          fundingNow = avg(nowArr);
-          if (prevArr && prevArr.length) { fundingPrev = avg(prevArr); fundingDelta = fundingNow - fundingPrev; }
-        }
-      }
-
-      if (!Number.isFinite(fundingNow) && binanceSym) {
-        const series1 = await fetchBinanceFundingSeries(binanceSym, 24).catch(()=>[]);
-        let src = series1;
-        if (!src.length) {
-          const series2 = await fetchFundingSeriesViaWWW(binanceSym, 48).catch(()=>[]);
-          if (series2.length) src = series2;
-        }
-        if (src.length >= 6){
-          const nowArr = src.slice(-3);
-          const prevArr = src.slice(-6,-3);
-          const avg = (arr)=>arr.reduce((a,b)=>a+b,0)/arr.length;
-          fundingNow = avg(nowArr);
-          fundingPrev = avg(prevArr);
-          fundingDelta = fundingNow - fundingPrev;
-        } else if (src.length >= 3){
-          fundingNow = (src.slice(-3).reduce((a,b)=>a+b,0))/3;
-        }
+      if (src.length >= 6){
+        const nowArr = src.slice(-3);
+        const prevArr = src.slice(-6,-3);
+        const avg = (arr)=>arr.reduce((a,b)=>a+b,0)/arr.length;
+        fundingNow = avg(nowArr);
+        fundingPrev = avg(prevArr);
+        fundingDelta = fundingNow - fundingPrev;
+      } else if (src.length >= 3){
+        fundingNow = (src.slice(-3).reduce((a,b)=>a+b,0))/3;
       }
 
       if (!Number.isFinite(fundingNow) && binanceSym) {
         const fn = await fetchFundingNowFallback(binanceSym).catch(()=>null);
         if (Number.isFinite(fn)) { fundingNow = fn; fundingPrev = null; fundingDelta = null; }
       }
-
-      if (!Number.isFinite(fundingNow)) {
-        const prevStored = readFundingLast(s);
-        if (prevStored && Number.isFinite(prevStored.now)) {
-          fundingNow = prevStored.now;
-          fundingPrev = prevStored.prev ?? null;
-          fundingDelta = Number.isFinite(fundingPrev) ? (fundingNow - fundingPrev) : null;
+      if (!Number.isFinite(fundingNow) && binanceSym) {
+        const fb = await fetchFundingBybit(binanceSym).catch(()=>[]);
+        if (fb.length >= 3) {
+          const nowArr = fb.slice(-3);
+          const prevArr = fb.length >= 6 ? fb.slice(-6,-3) : null;
+          const avg = (arr)=>arr.reduce((a,b)=>a+b,0)/arr.length;
+          fundingNow = avg(nowArr);
+          if (prevArr && prevArr.length) {
+            fundingPrev = avg(prevArr);
+            fundingDelta = fundingNow - fundingPrev;
+          }
+        }
+      }
+      if (!Number.isFinite(fundingNow) && binanceSym) {
+        const inst = binanceSym==='BTCUSDT' ? 'BTC-USDT-SWAP' : binanceSym==='ETHUSDT' ? 'ETH-USDT-SWAP' : null;
+        if (inst) {
+          const okxRate = await fetchFundingOkx(inst).catch(()=>null);
+          if (Number.isFinite(okxRate)) {
+            fundingNow = okxRate;
+            fundingPrev = null;
+            fundingDelta = null;
+          }
         }
       }
 
-      if (!Number.isFinite(fundingNow)) {
-        const sf = synthFundingFromPctVol(pct24, vol24);
-        if (Number.isFinite(sf)) { fundingNow = sf; fundingPrev = null; fundingDelta = null; }
+      if (!Number.isFinite(fundingDelta)) {
+        if (Number.isFinite(fundingNow) && Number.isFinite(fundingPrev)) {
+          fundingDelta = fundingNow - fundingPrev;
+        } else if (binanceSym) {
+          try {
+            const s = await fetchFundingBybit(binanceSym).catch(()=>[]);
+            if (Array.isArray(s) && s.length >= 2) {
+              const last = s[s.length-1];
+              const prev = s[s.length-2];
+              if (Number.isFinite(last) && Number.isFinite(prev)) {
+                fundingDelta = last - prev;
+                if (!Number.isFinite(fundingNow)) fundingNow = last;
+                if (!Number.isFinite(fundingPrev)) fundingPrev = prev;
+              }
+            }
+          } catch {}
+        }
       }
 
       if (nearZero(fundingNow))  fundingNow = null;
       if (nearZero(fundingPrev)) fundingPrev = null;
       if (nearZero(fundingDelta)) fundingDelta = null;
-
-      if (Number.isFinite(fundingNow)) writeFundingLast(s,{ now: fundingNow, prev: fundingPrev });
-
-      if (binanceSym) {
-        const bybitLs = await fetchLsBybit(binanceSym).catch(()=>null);
-        if (bybitLs && Number.isFinite(bybitLs.longPct)) { ls = bybitLs; }
-      }
-      if (!ls && binanceSym) {
-        const periods = ['4h','1h','30m'];
-        for (const p of periods) {
-          const r = await fetchGlobalLongShort(binanceSym, p).catch(()=>null);
-          if (r && Number.isFinite(r.longPct)) { ls = r; break; }
-        }
-      }
-      if (!ls && binanceSym) {
-        const r1 = await fetchTopLongShortAccounts(binanceSym, '4h').catch(()=>null);
-        if (r1 && Number.isFinite(r1.longPct)) ls = r1;
-      }
-      if (!ls && binanceSym) {
-        const r2 = await fetchTopLongShortPositions(binanceSym, '4h').catch(()=>null);
-        if (r2 && Number.isFinite(r2.longPct)) ls = r2;
-      }
-      if (!ls) {
-        const prevLs = readLsLast(s);
-        if (prevLs && Number.isFinite(prevLs.longPct)) ls = prevLs;
-      }
-      if (!ls) {
-        const synth = synthLsFromFundingPct(fundingNow, pct24);
-        if (synth && Number.isFinite(synth.longPct)) ls = synth;
-      }
-      if (ls && Number.isFinite(ls.longPct)) writeLsLast(s, ls);
 
       const priceRisk=Number.isFinite(pct24)?priceChangeRisk(pct24):0;
       const fundingRisk = Number.isFinite(fundingNow) ? Math.min(1, Math.abs(fundingNow)*10_000/50) : 0;
@@ -887,7 +844,7 @@ export async function buildMorningReportHtml(snapshots, lang='ru'){
     introRSI:'⁴ RSI(14): momentum; ~70/30 — risk/opportunity zones.',
     introFlows:'⁵ Net flows: inflow = potential sell pressure; outflow = supportive.',
     introFunding:'⁶ Funding: positive → longs pay; parentheses show delta and bps.',
-    introLS:'⁷ Long/Short: share of accounts, L/S > 1 — longs dominate.',
+    introLS:'⁷ Long/Short: share of accounts (Binance Futures), L/S > 1 — longs dominate.',
     introRisk:'⁸ Risk: 0–100%, blend of price, funding, and L/S.'
   }:{
     report:'📊 отчет',
@@ -908,7 +865,7 @@ export async function buildMorningReportHtml(snapshots, lang='ru'){
     introRSI:'⁴ RSI(14): импульс; ~70/30 — зоны риска/возможностей.',
     introFlows:'⁵ Net flows: приток = возможное давление продажи; отток = поддержка.',
     introFunding:'⁶ Funding: положит. → лонги платят; в скобках — дельта и б.п.',
-    introLS:'⁷ Лонги/Шорты: доля аккаунтов, L/S > 1 — лонги преобладают.',
+    introLS:'⁷ Лонги/Шорты: доля аккаунтов (Binance Futures), L/S > 1 — лонги преобладают.',
     introRisk:'⁸ Риск: 0–100%, смесь цены, funding и баланса L/S.'
   };
 
@@ -958,16 +915,16 @@ export async function buildMorningReportHtml(snapshots, lang='ru'){
   const fundingLine = (sym) => {
     const now = Number(sym?.fundingNow);
     const prev = Number(sym?.fundingPrev);
-    if(!Number.isFinite(now) || nearZero(now)) return '—';
-    const base = B(fmtFunding(now));
-    if(Number.isFinite(prev) && !nearZero(prev)){
-      const d = now - prev;
-      const circ = circleByDelta(d);
-      const bps = d * 10000;
-      const dTxt = `${circ}(${B(`${d>0?'+':''}${fmtFunding(d)}`)} ${T.over24h}, ${B(`${(bps>0?'+':'')}${(bps).toFixed(2)} б.п.`)})`;
-      return `${base} ${dTxt}`;
+    const delta = Number(sym?.fundingDelta);
+    if(!Number.isFinite(now)) return '—';
+    const nowBps = toBps(now);
+    let tail = '';
+    if (Number.isFinite(delta)) {
+      const circ = circleByDelta(delta);
+      const deltaBps = toBps(delta);
+      tail = ` ${circ}(${B(`${delta>0?'+':''}${fmtFunding(delta)}`)} ${T.over24h}, ${B(`${deltaBps>0?'+':''}${deltaBps.toFixed(2)} б.п.`)})`;
     }
-    return base;
+    return `${B(fmtFunding(now))} ${nowBps!=null?`(${B(`${nowBps.toFixed(2)} б.п.`)})`:''}${tail}`;
   };
 
   const flowsLine = (sym) => {
