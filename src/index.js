@@ -14,6 +14,6 @@ try {
     process.exit(1);
   }
 } catch (e) {
-  console.error('❌ Failed to load ./bot.js:', e?.message || e);
+  console.error('❌ Failed to load ./bot.js:', e?.stack || e?.message || e);
   process.exit(1);
 }
