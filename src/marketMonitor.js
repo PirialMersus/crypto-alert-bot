@@ -1,5 +1,5 @@
 // src/marketMonitor.js
-import { httpGetWithRetry } from './httpClient.js';
+import { httpGetWithRetry, httpClient } from './httpClient.js';
 import { resolveUserLang } from './cache.js';
 import { usersCollection } from './db.js';
 import { MARKET_BATCH_SIZE, MARKET_BATCH_PAUSE_MS } from './constants.js';
@@ -20,7 +20,7 @@ const SNAPSHOT_TTL_MS = Number.isFinite(Number(process.env.SNAPSHOT_TTL_MS)) ? N
 const BUST_CACHE = String(process.env.BUST_CACHE || '0') === '1';
 const ALWAYS_PROXY = String(process.env.ALWAYS_PROXY || '0') === '1';
 const PROXY_FETCH = process.env.PROXY_FETCH || '';
-const NO_PROXY_HOSTS = (process.env.NO_PROXY_HOSTS || 'api.coingecko.com,api.llama.fi,preview.dl.llama.fi,api.alternative.me')
+const NO_PROXY_HOSTS = (process.env.NO_PROXY_HOSTS || 'api.coingecko.com,api.llama.fi,preview.dl.llama.fi,api.alternative.me,api.binance.com,fapi.binance.com,www.binance.com,api.bybit.com,www.okx.com')
   .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 
 const UA = { headers: { 'User-Agent': 'Mozilla/5.0 Chrome/120' } };
@@ -47,8 +47,8 @@ function humanFmt(n) {
 }
 const nearZero = (v) => Number.isFinite(v) && Math.abs(v) < 1e-8;
 
-function fmtFunding(v){ if(!Number.isFinite(v)) return '—'; return Number(v).toFixed(6).replace(/\.0+$|0+$/,''); }
-function toBps(v){ if(!Number.isFinite(v)) return null; return v*10000; }
+function fmtFundingRaw(v) { if(!Number.isFinite(v)) return '—'; return Number(v).toFixed(8).replace(/\.0+$|0+$/,''); }
+function fmtBps(v) { if(!Number.isFinite(v)) return '—'; const bps = v*10000; return `${(bps>=0?'+':'')}${Number(bps.toFixed(2))} б.п.`; }
 function circleByDelta(x) { if(!Number.isFinite(x) || x===0) return '⚪'; return x>0?'🟢':'🔴'; }
 function pctStr(v) { return `${v>0?'+':''}${v.toFixed(2)}%`; }
 
@@ -163,7 +163,7 @@ async function fetchBinanceFundingSeries(symbol, limit=24) {
     const url=`https://fapi.binance.com/fapi/v1/fundingRate?symbol=${encodeURIComponent(symbol)}&limit=${encodeURIComponent(String(limit))}&_t=${Date.now()}`;
     const { data } = await getUrlSmart(url,`binance:funding:${symbol}`);
     const arr=Array.isArray(data)?data:[];
-    const vals = arr.map(r=>Number(r.fundingRate)).filter(v=>Number.isFinite(v) && !nearZero(v));
+    const vals = arr.map(r=>Number(r.fundingRate)).filter(v=>Number.isFinite(v));
     logSrc('funding','binance_series',vals.length>0);
     return vals;
   } catch { logSrc('funding','binance_series',false); return []; }
@@ -173,7 +173,7 @@ async function fetchFundingSeriesViaWWW(symbol, limit=48) {
     const url = `https://www.binance.com/futures/data/fundingRate?symbol=${encodeURIComponent(symbol)}&limit=${encodeURIComponent(String(limit))}&_t=${Date.now()}`;
     const { data } = await getUrlSmart(url,`binance-www:funding:${symbol}`);
     const arr = Array.isArray(data) ? data : [];
-    const vals = arr.map(r => Number(r.fundingRate)).filter(v => Number.isFinite(v) && !nearZero(v));
+    const vals = arr.map(r => Number(r.fundingRate)).filter(v => Number.isFinite(v));
     logSrc('funding','binance_www',vals.length>0);
     return vals;
   }catch{ logSrc('funding','binance_www',false); return []; }
@@ -183,7 +183,7 @@ async function fetchFundingNowFallback(symbol){
     const url = `https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${encodeURIComponent(symbol)}&_t=${Date.now()}`;
     const { data } = await getUrlSmart(url,`binance:premiumIndex:${symbol}`);
     const v = Number(data?.lastFundingRate);
-    const ok = (Number.isFinite(v) && !nearZero(v)) ? v : null;
+    const ok = (Number.isFinite(v)) ? v : null;
     logSrc('funding','binance_snapshot',ok!==null);
     return ok;
   }catch{ logSrc('funding','binance_snapshot',false); return null; }
@@ -194,7 +194,7 @@ async function fetchFundingBybit(symbol){
     const url = `https://api.bybit.com/v5/market/funding/history?category=linear&symbol=${encodeURIComponent(symbol)}&limit=16&_t=${Date.now()}`;
     const { data } = await getUrlSmart(url,`bybit:funding:${symbol}`);
     const arr = Array.isArray(data?.result?.list) ? data.result.list : [];
-    const vals = arr.map(x => Number(x?.fundingRate)).filter(v => Number.isFinite(v) && !nearZero(v));
+    const vals = arr.map(x => Number(x?.fundingRate)).filter(v => Number.isFinite(v));
     logSrc('funding','bybit',vals.length>0);
     return vals;
   } catch { logSrc('funding','bybit',false); return []; }
@@ -206,120 +206,70 @@ async function fetchFundingOkx(instId){
     const { data } = await getUrlSmart(url,`okx:funding:${instId}`);
     const rec = Array.isArray(data?.data) ? data.data[0] : null;
     const v = Number(rec?.fundingRate);
-    const ok = Number.isFinite(v) && !nearZero(v) ? v : null;
+    const ok = Number.isFinite(v) ? v : null;
     logSrc('funding','okx',ok!==null);
     return ok;
   } catch { logSrc('funding','okx',false); return null; }
 }
 
-const lsCache = new Map();
-const LS_TTL_MS = 5 * 60 * 1000;
-
-function readLsCache(symbol){
-  const r=lsCache.get(symbol);
-  if(!r) return null;
-  if(Date.now()-r.ts>LS_TTL_MS) return null;
-  return r.data;
-}
-function writeLsCache(symbol, data){
-  if(!data) return;
-  lsCache.set(symbol, { ts: Date.now(), data });
-}
+const lsMem = new Map();
+function setLsCache(sym, val) { if (val==null) return; lsMem.set(sym, { v: val, t: Date.now() }); }
+function getLsCache(sym, ttlMs = 12 * 60 * 1000) { const e = lsMem.get(sym); if (!e) return null; if (Date.now() - e.t > ttlMs) return null; return e.v; }
 function deriveLsFromRatio(ratio) {
   if (!Number.isFinite(ratio) || ratio <= 0) return null;
   const longPct = (ratio / (1 + ratio)) * 100;
   const shortPct = 100 - longPct;
-  return {
-    longPct: Number(longPct.toFixed(2)),
-    shortPct: Number(shortPct.toFixed(2)),
-    ls: Number(ratio.toFixed(2))
-  };
+  return { longPct: Number(longPct.toFixed(2)), shortPct: Number(shortPct.toFixed(2)), ls: Number(ratio.toFixed(2)) };
 }
-async function fetchGlobalLongShort(symbol, period, limit=30) {
-  const url = `https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}&limit=${encodeURIComponent(String(limit))}&_t=${Date.now()}`;
-  try {
-    const { data } = await getUrlSmart(url,`binance:ls:${symbol}:${period}`);
+
+async function fetchLsBinanceOnce(symbolUSDT) {
+  try{
+    const url = `https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=${symbolUSDT}&period=5m&limit=1&_t=${Date.now()}`;
+    const { data } = await getUrlSmart(url,`binance:ls_one:${symbolUSDT}`);
     const arr = Array.isArray(data) ? data : [];
-    if (!arr.length) { logSrc('ls','binance_global',false,'empty'); return null; }
-    const last = arr[arr.length-1];
+    const last = arr[arr.length-1] || null;
     const ratio = Number(last?.longShortRatio);
-    const longAccount = Number(last?.longAccount);
-    const shortAccount = Number(last?.shortAccount);
-    if (Number.isFinite(longAccount) && Number.isFinite(shortAccount) && (longAccount + shortAccount) > 0) {
-      const sum = longAccount + shortAccount;
-      const r = {
-        longPct: Number(((longAccount / sum) * 100).toFixed(2)),
-        shortPct: Number(((shortAccount / sum) * 100).toFixed(2)),
-        ls: Number((ratio && Number.isFinite(ratio) ? ratio : (longAccount/shortAccount)).toFixed(2))
-      };
-      logSrc('ls','binance_global',true);
-      return r;
-    }
-    const r2 = deriveLsFromRatio(ratio);
-    logSrc('ls','binance_global',!!r2,'derived');
-    return r2;
-  } catch (e) { logSrc('ls','binance_global',false,String(e?.message||e)); return null; }
+    if (Number.isFinite(ratio) && ratio > 0) return deriveLsFromRatio(ratio);
+    const la = Number(last?.longAccount), sa = Number(last?.shortAccount);
+    if (Number.isFinite(la) && Number.isFinite(sa) && la+sa>0) return { longPct: Number(((la/(la+sa))*100).toFixed(2)), shortPct: Number(((sa/(la+sa))*100).toFixed(2)), ls: Number(((la/sa)).toFixed(2)) };
+  }catch{}
+  return null;
 }
-async function fetchTopLongShortAccounts(symbol, period='4h', limit=30) {
-  const url = `https://fapi.binance.com/futures/data/topLongShortAccountRatio?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}&limit=${encodeURIComponent(String(limit))}&_t=${Date.now()}`;
-  try {
-    const { data } = await getUrlSmart(url,`binance:tlsa:${symbol}:${period}`);
-    const arr = Array.isArray(data) ? data : [];
-    if (!arr.length) { logSrc('ls','binance_top_acc',false,'empty'); return null; }
-    const last = arr[arr.length-1];
+async function fetchLsBinanceViaProxy(symbolUSDT) {
+  try{
+    if (!PROXY_FETCH) return null;
+    const raw = `https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=${symbolUSDT}&period=5m&limit=1&_t=${Date.now()}`;
+    const url = `${PROXY_FETCH}?url=${encodeURIComponent(raw)}`;
+    const r = await httpClient.get(url, { timeout: HARD_TIMEOUT_MS+2000 });
+    const arr = Array.isArray(r?.data) ? r.data : (Array.isArray(r?.data?.result) ? r.data.result : []);
+    const last = arr[arr.length-1] || null;
     const ratio = Number(last?.longShortRatio);
-    const r = deriveLsFromRatio(ratio);
-    logSrc('ls','binance_top_acc',!!r);
-    return r;
-  } catch (e) { logSrc('ls','binance_top_acc',false,String(e?.message||e)); return null; }
-}
-async function fetchTopLongShortPositions(symbol, period='4h', limit=30) {
-  const url = `https://fapi.binance.com/futures/data/topLongShortPositionRatio?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}&limit=${encodeURIComponent(String(limit))}&_t=${Date.now()}`;
-  try {
-    const { data } = await getUrlSmart(url,`binance:tlsp:${symbol}:${period}`);
-    const arr = Array.isArray(data) ? data : [];
-    if (!arr.length) { logSrc('ls','binance_top_pos',false,'empty'); return null; }
-    const last = arr[arr.length-1];
-    const ratio = Number(last?.longShortRatio);
-    const r = deriveLsFromRatio(ratio);
-    logSrc('ls','binance_top_pos',!!r);
-    return r;
-  } catch (e) { logSrc('ls','binance_top_pos',false,String(e?.message||e)); return null; }
+    if (Number.isFinite(ratio) && ratio > 0) return deriveLsFromRatio(ratio);
+    const la = Number(last?.longAccount), sa = Number(last?.shortAccount);
+    if (Number.isFinite(la) && Number.isFinite(sa) && la+sa>0) return { longPct: Number(((la/(la+sa))*100).toFixed(2)), shortPct: Number(((sa/(la+sa))*100).toFixed(2)), ls: Number(((la/sa)).toFixed(2)) };
+  }catch{}
+  return null;
 }
 async function fetchLsBybit(symbol){
   try{
     const url = `https://api.bybit.com/v5/market/account-ratio?category=linear&symbol=${encodeURIComponent(symbol)}&period=1800&_t=${Date.now()}`;
     const { data } = await getUrlSmart(url,`bybit:ls:${symbol}`);
     const arr = Array.isArray(data?.result?.list) ? data.result.list : [];
-    if (!arr.length) { logSrc('ls','bybit',false,'empty'); return null; }
-    const last = arr[arr.length-1];
+    const last = arr[arr.length-1] || null;
     const ratio = Number(last?.longShortRatio);
-    const r = deriveLsFromRatio(ratio);
-    logSrc('ls','bybit',!!r);
-    return r;
-  } catch (e) { logSrc('ls','bybit',false,String(e?.message||e)); return null; }
+    if (!Number.isFinite(ratio) || ratio<=0) return null;
+    return deriveLsFromRatio(ratio);
+  } catch { return null; }
 }
 async function fetchLongShortRatio(symbol){
-  const cached = readLsCache(symbol);
-  if (cached) return cached;
-  const periods = ['4h','1h','30m'];
-  for (const p of periods) {
-    const r = await fetchGlobalLongShort(symbol, p).catch(()=>null);
-    if (r && Number.isFinite(r.longPct) && Number.isFinite(r.shortPct) && Number.isFinite(r.ls)) { writeLsCache(symbol, r); return r; }
-  }
-  {
-    const r = await fetchTopLongShortAccounts(symbol, '4h').catch(()=>null);
-    if (r) { writeLsCache(symbol, r); return r; }
-  }
-  {
-    const r = await fetchTopLongShortPositions(symbol, '4h').catch(()=>null);
-    if (r) { writeLsCache(symbol, r); return r; }
-  }
-  {
-    const r = await fetchLsBybit(symbol).catch(()=>null);
-    if (r) { writeLsCache(symbol, r); return r; }
-  }
-  return null;
+  const cached = getLsCache(symbol);
+  const binanceSym = `${symbol}USDT`;
+  let r = await fetchLsBinanceOnce(binanceSym);
+  if (!r) r = await fetchLsBinanceViaProxy(binanceSym);
+  if (!r) r = await fetchLsBybit(binanceSym);
+  if (!r && cached) return cached;
+  if (r) setLsCache(symbol, r);
+  return r || null;
 }
 
 function pickNum(...vals){
@@ -622,7 +572,7 @@ export async function getMarketSnapshot(symbols=['BTC','ETH']){
 
       let ls = null;
       if (binanceSym) {
-        ls = await fetchLongShortRatio(binanceSym).catch(()=>null);
+        ls = await fetchLongShortRatio(s).catch(()=>null);
       }
 
       let series1 = [];
@@ -676,31 +626,12 @@ export async function getMarketSnapshot(symbols=['BTC','ETH']){
         }
       }
 
-      if (!Number.isFinite(fundingDelta)) {
-        if (Number.isFinite(fundingNow) && Number.isFinite(fundingPrev)) {
-          fundingDelta = fundingNow - fundingPrev;
-        } else if (binanceSym) {
-          try {
-            const s = await fetchFundingBybit(binanceSym).catch(()=>[]);
-            if (Array.isArray(s) && s.length >= 2) {
-              const last = s[s.length-1];
-              const prev = s[s.length-2];
-              if (Number.isFinite(last) && Number.isFinite(prev)) {
-                fundingDelta = last - prev;
-                if (!Number.isFinite(fundingNow)) fundingNow = last;
-                if (!Number.isFinite(fundingPrev)) fundingPrev = prev;
-              }
-            }
-          } catch {}
-        }
-      }
-
       if (nearZero(fundingNow))  fundingNow = null;
       if (nearZero(fundingPrev)) fundingPrev = null;
       if (nearZero(fundingDelta)) fundingDelta = null;
 
       const priceRisk=Number.isFinite(pct24)?priceChangeRisk(pct24):0;
-      const fundingRisk = Number.isFinite(fundingNow) ? Math.min(1, Math.abs(fundingNow)*10_000/50) : 0;
+      const fundingRisk = Number.isFinite(fundingNow) ? Math.min(1, Math.abs(fundingNow)*10000/50) : 0;
       const sentimentRisk = Number.isFinite(ls?.longPct) ? Math.max(0, (ls.longPct-60)/40) : 0;
       const score=aggregateScore({ priceRisk, fundingRisk, sentimentRisk });
 
@@ -915,16 +846,15 @@ export async function buildMorningReportHtml(snapshots, lang='ru'){
   const fundingLine = (sym) => {
     const now = Number(sym?.fundingNow);
     const prev = Number(sym?.fundingPrev);
-    const delta = Number(sym?.fundingDelta);
     if(!Number.isFinite(now)) return '—';
-    const nowBps = toBps(now);
-    let tail = '';
-    if (Number.isFinite(delta)) {
-      const circ = circleByDelta(delta);
-      const deltaBps = toBps(delta);
-      tail = ` ${circ}(${B(`${delta>0?'+':''}${fmtFunding(delta)}`)} ${T.over24h}, ${B(`${deltaBps>0?'+':''}${deltaBps.toFixed(2)} б.п.`)})`;
+    const base = `${B(fmtFundingRaw(now))} (${B(fmtBps(now))})`;
+    if(Number.isFinite(prev)){
+      const d = now - prev;
+      const circ = circleByDelta(d);
+      const dTxt = `${circ}(${B(`${fmtFundingRaw(d)}`)} ${T.over24h}, ${B(fmtBps(d))})`;
+      return `${base} ${dTxt}`;
     }
-    return `${B(fmtFunding(now))} ${nowBps!=null?`(${B(`${nowBps.toFixed(2)} б.п.`)})`:''}${tail}`;
+    return base;
   };
 
   const flowsLine = (sym) => {
