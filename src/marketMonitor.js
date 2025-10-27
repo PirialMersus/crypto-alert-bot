@@ -1,4 +1,4 @@
-// src/marketMonitor.js
+// файл: src/marketMonitor.js
 import { httpGetWithRetry } from './httpClient.js';
 import { resolveUserLang } from './cache.js';
 import { usersCollection } from './db.js';
@@ -16,7 +16,6 @@ const EXCHANGES = [
   'bitstamp','bingx','upbit','gemini','poloniex','bitget','deribit','btse','zb','bithumb'
 ];
 
-// ТАЙМАУТЫ/КЕШ управляемые env
 const HARD_TIMEOUT_MS = Number.isFinite(Number(process.env.HARD_TIMEOUT_MS))
   ? Number(process.env.HARD_TIMEOUT_MS) : 8000;
 
@@ -24,8 +23,10 @@ const SNAPSHOT_TTL_MS = Number.isFinite(Number(process.env.SNAPSHOT_TTL_MS))
   ? Number(process.env.SNAPSHOT_TTL_MS) : (30 * 60 * 1000);
 
 const BUST_CACHE = String(process.env.BUST_CACHE || '0') === '1';
+const ALWAYS_PROXY = String(process.env.ALWAYS_PROXY || '0') === '1';
+const PROXY_FETCH = process.env.PROXY_FETCH || '';
 
-// общий UA для запросов к «капризным» API
+// общий UA
 const UA = {
   headers: {
     'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36'
@@ -41,6 +42,18 @@ function withTimeout(promise, ms = HARD_TIMEOUT_MS, label = 'req') {
     promise,
     new Promise((_, rej) => setTimeout(() => rej(new Error(`timeout:${label}`)), ms))
   ]);
+}
+
+function prox(url) {
+  try {
+    if (ALWAYS_PROXY && PROXY_FETCH) {
+      // прокси-воркер ожидает ?url=
+      const u = new URL(PROXY_FETCH);
+      u.searchParams.set('url', url);
+      return u.toString();
+    }
+  } catch {}
+  return url;
 }
 
 const esc = (s) => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -112,7 +125,7 @@ async function fetchCoingeckoMarketChart(id,days=15) {
 // ---------- FETCH: BINANCE (PRICE/VOL) ----------
 async function fetchBinanceTicker24h(symbol) {
   try {
-    const url=`https://api.binance.com/api/v3/ticker/24hr?symbol=${encodeURIComponent(symbol)}&_t=${Date.now()}`;
+    const url=prox(`https://api.binance.com/api/v3/ticker/24hr?symbol=${encodeURIComponent(symbol)}&_t=${Date.now()}`);
     const res=await withTimeout(httpGetWithRetry(url,1,UA),HARD_TIMEOUT_MS,`binance:24hr:${symbol}`);
     const d=res?.data; if(!d) return null;
     const price=Number(d.lastPrice), pct24=Number(d.priceChangePercent), volQuote=Number(d.quoteVolume);
@@ -123,7 +136,7 @@ async function fetchBinanceTicker24h(symbol) {
 // ---------- FETCH: BINANCE (FUNDING) ----------
 async function fetchBinanceFundingSeries(symbol, limit=24) {
   try {
-    const url=`https://fapi.binance.com/fapi/v1/fundingRate?symbol=${encodeURIComponent(symbol)}&limit=${encodeURIComponent(String(limit))}&_t=${Date.now()}`;
+    const url=prox(`https://fapi.binance.com/fapi/v1/fundingRate?symbol=${encodeURIComponent(symbol)}&limit=${encodeURIComponent(String(limit))}&_t=${Date.now()}`);
     const res=await withTimeout(httpGetWithRetry(url,2,UA),HARD_TIMEOUT_MS,`binance:funding:${symbol}`);
     const arr=Array.isArray(res?.data)?res.data:[];
     const vals = arr.map(r=>Number(r.fundingRate)).filter(v=>Number.isFinite(v) && !nearZero(v));
@@ -136,7 +149,7 @@ async function fetchBinanceFundingSeries(symbol, limit=24) {
 
 async function fetchFundingSeriesViaWWW(symbol, limit=48) {
   try{
-    const url = `https://www.binance.com/futures/data/fundingRate?symbol=${encodeURIComponent(symbol)}&limit=${encodeURIComponent(String(limit))}&_t=${Date.now()}`;
+    const url = prox(`https://www.binance.com/futures/data/fundingRate?symbol=${encodeURIComponent(symbol)}&limit=${encodeURIComponent(String(limit))}&_t=${Date.now()}`);
     const res = await withTimeout(httpGetWithRetry(url,2,UA),HARD_TIMEOUT_MS,`binance-www:funding:${symbol}`);
     const arr = Array.isArray(res?.data) ? res.data : [];
     const vals = arr.map(r => Number(r.fundingRate)).filter(v => Number.isFinite(v) && !nearZero(v));
@@ -144,10 +157,9 @@ async function fetchFundingSeriesViaWWW(symbol, limit=48) {
   }catch{ return []; }
 }
 
-// быстрый «снимок» последнего значения, если серии не дали цифры
 async function fetchFundingNowFallback(symbol){
   try{
-    const url = `https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${encodeURIComponent(symbol)}&_t=${Date.now()}`;
+    const url = prox(`https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${encodeURIComponent(symbol)}&_t=${Date.now()}`);
     const res = await withTimeout(httpGetWithRetry(url,2,UA),HARD_TIMEOUT_MS,`binance:premiumIndex:${symbol}`);
     const v = Number(res?.data?.lastFundingRate);
     return (Number.isFinite(v) && !nearZero(v)) ? v : null;
@@ -179,7 +191,7 @@ function deriveLsFromRatio(ratio) {
   };
 }
 async function fetchGlobalLongShort(symbol, period, limit=30) {
-  const url = `https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}&limit=${encodeURIComponent(String(limit))}&_t=${Date.now()}`;
+  const url = prox(`https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}&limit=${encodeURIComponent(String(limit))}&_t=${Date.now()}`);
   const res = await withTimeout(httpGetWithRetry(url,1,UA),HARD_TIMEOUT_MS,`binance:ls:${symbol}:${period}`);
   const arr = Array.isArray(res?.data) ? res.data : [];
   if (!arr.length) return null;
@@ -198,7 +210,7 @@ async function fetchGlobalLongShort(symbol, period, limit=30) {
   return deriveLsFromRatio(ratio);
 }
 async function fetchTopLongShortAccounts(symbol, period='4h', limit=30) {
-  const url = `https://fapi.binance.com/futures/data/topLongShortAccountRatio?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}&limit=${encodeURIComponent(String(limit))}&_t=${Date.now()}`;
+  const url = prox(`https://fapi.binance.com/futures/data/topLongShortAccountRatio?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}&limit=${encodeURIComponent(String(limit))}&_t=${Date.now()}`);
   const res = await withTimeout(httpGetWithRetry(url,1,UA),HARD_TIMEOUT_MS,`binance:tlsa:${symbol}:${period}`);
   const arr = Array.isArray(res?.data) ? res.data : [];
   if (!arr.length) return null;
@@ -207,7 +219,7 @@ async function fetchTopLongShortAccounts(symbol, period='4h', limit=30) {
   return deriveLsFromRatio(ratio);
 }
 async function fetchTopLongShortPositions(symbol, period='4h', limit=30) {
-  const url = `https://fapi.binance.com/futures/data/topLongShortPositionRatio?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}&limit=${encodeURIComponent(String(limit))}&_t=${Date.now()}`;
+  const url = prox(`https://fapi.binance.com/futures/data/topLongShortPositionRatio?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}&limit=${encodeURIComponent(String(limit))}&_t=${Date.now()}`);
   const res = await withTimeout(httpGetWithRetry(url,1,UA),HARD_TIMEOUT_MS,`binance:tlsp:${symbol}:${period}`);
   const arr = Array.isArray(res?.data) ? res.data : [];
   if (!arr.length) return null;
@@ -234,6 +246,7 @@ async function fetchLongShortRatio(symbol){
 }
 
 // ---------- FETCH: CEX NET FLOWS (DefiLlama) ----------
+// (без изменений)
 function pickNum(...vals){
   for(const v of vals){ const n=Number(v); if(Number.isFinite(n)) return n; }
   return null;
@@ -363,9 +376,7 @@ function synthNetFlowsUSD(pct24, vol24){
 }
 async function fetchProxyNetFlowsUSDWithPrev(assetKey, spotUSD, pctNow, volNow, pctPrev, volPrev){
   const sym=assetKey==='BTC'?'BTC':(assetKey==='ETH'?'ETH':null);
-  if(!sym){
-    return { nowUSD:null, prevUSD:null, diffUSD:null };
-  }
+  if(!sym){ return { nowUSD:null, prevUSD:null, diffUSD:null }; }
   const cached=readNetflowsCache(sym);
   if(cached) return cached;
 
@@ -908,7 +919,7 @@ export async function buildMorningReportHtml(snapshots, lang='ru'){
   lines.push(T.report);
   lines.push('');
 
-  // ----- PRICE (BTC, ETH, и дополнительно PAXG с подписью) -----
+  // PRICE (BTC, ETH, PAXG c подписью)
   lines.push(U(T.price));
   const priceSymbols = ['BTC','ETH','PAXG'].filter(k => snapshots && snapshots[k]);
   for (const key of priceSymbols) {
@@ -917,42 +928,35 @@ export async function buildMorningReportHtml(snapshots, lang='ru'){
   }
   lines.push('');
 
-  // ----- FGI по BTC -----
   lines.push(U(T.fgi));
   lines.push(`• ${fgiLine((snapshots.BTC)||{})}`);
   lines.push('');
 
-  // ----- VOLUMES (BTC, ETH) -----
   lines.push(U(T.volumes));
   lines.push(`• BTC: ${volumeLine((snapshots.BTC)||{})}`);
   lines.push(`• ETH: ${volumeLine((snapshots.ETH)||{})}`);
   lines.push('');
 
-  // ----- RSI (BTC, ETH) -----
   lines.push(U(T.rsi));
   lines.push(`• BTC: ${rsiLine((snapshots.BTC)||{})}`);
   lines.push(`• ETH: ${rsiLine((snapshots.ETH)||{})}`);
   lines.push('');
 
-  // ----- FLOWS (BTC, ETH) -----
   lines.push(U(T.flows));
   lines.push(`• BTC: ${flowsLine((snapshots.BTC)||{})}`);
   lines.push(`• ETH: ${flowsLine((snapshots.ETH)||{})}`);
   lines.push('');
 
-  // ----- FUNDING (BTC, ETH) -----
   lines.push(U(T.funding));
   lines.push(`• BTC: ${fundingLine((snapshots.BTC)||{})}`);
   lines.push(`• ETH: ${fundingLine((snapshots.ETH)||{})}`);
   lines.push('');
 
-  // ----- LS (BTC, ETH) -----
   lines.push(U(T.ls));
   lines.push(renderLsBlock(((snapshots.BTC)||{}).longShort, isEn, 'BTC'));
   lines.push(renderLsBlock(((snapshots.ETH)||{}).longShort, isEn, 'ETH'));
   lines.push('');
 
-  // ----- RISKS (BTC, ETH) -----
   lines.push(U(T.risks));
   const rB = riskBarStr((snapshots.BTC)||{});
   const rE = riskBarStr((snapshots.ETH)||{});
@@ -960,7 +964,6 @@ export async function buildMorningReportHtml(snapshots, lang='ru'){
   lines.push(`• ETH:\n${rE.bar}`);
   lines.push('');
 
-  // ----- REF -----
   lines.push(T.ref);
 
   const priceNow = isEn
@@ -996,7 +999,7 @@ export async function buildMorningReportHtml(snapshots, lang='ru'){
   lines.push(`${T.introFlows} ${flowsNow}`);
   lines.push(`${T.introFunding} ${fundingNow}`);
   lines.push(`${T.introLS} ${lsNow}`);
-  // Убрали T.introGold из справки
+  // introGold опционально можно убрать, если не нужно в "Справке"
   lines.push(`${T.introRisk} ${riskNow}`);
 
   return lines.join('\n');

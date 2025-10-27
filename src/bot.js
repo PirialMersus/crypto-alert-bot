@@ -170,6 +170,12 @@ bot.start(async (ctx) => {
   await ctx.reply(`${greet}\n${isEn ? '(Language: English)' : '(Язык: Русский)'}`, getMainMenuSync(ctx.from.id, lang));
 });
 
+// быстрый возврат главного меню в любой момент
+bot.command('menu', async (ctx) => {
+  const lang = await resolveUserLang(ctx.from?.id, null, ctx.from?.language_code);
+  await ctx.reply(String(lang).startsWith('en') ? 'Main menu' : 'Главное меню', getMainMenuSync(ctx.from.id, lang));
+});
+
 bot.hears('⚙️ Настройки', async (ctx) => {
   const inline = await buildSettingsInlineForUser(ctx.from.id);
   await ctx.reply('⚙️ Настройки\n— порядок новых алертов\n— язык сообщений\n— ежедневная мотивация\n— утренний отчёт по рынку\n\nНажимай, чтобы переключить.', { reply_markup: inline });
@@ -263,6 +269,10 @@ async function handleMarketSnapshotRequest(ctx) {
 
 bot.hears('📊 прислать данные мониторинга', handleMarketSnapshotRequest);
 bot.hears('📊 Send market snapshot', handleMarketSnapshotRequest);
+// обработчики «занятой» кнопки — повторный запуск и нормализация меню
+bot.hears('📊 ⏳ Формирую…', handleMarketSnapshotRequest);
+bot.hears('📊 ⏳ Building…', handleMarketSnapshotRequest);
+
 bot.command('market', handleMarketSnapshotRequest);
 bot.command('snapshot', handleMarketSnapshotRequest);
 bot.command('report', handleMarketSnapshotRequest);
@@ -447,7 +457,7 @@ bot.on('callback_query', async (ctx) => {
       if (!doc) { await ctx.answerCbQuery('Алерт не найден'); return; }
 
       let sourcePage = null;
-      if (token) { sourcePage = (token === 'all') ? null : Math.max(0, parseInt(token, 10)); }
+      if (token) { sourcePage = (token === 'all') ? null : Math.max(0, Math.min(parseInt(token, 10), pages.length - 1)); }
       else {
         try {
           const alertsBefore = await getUserAlertsCached(ctx.from.id);
