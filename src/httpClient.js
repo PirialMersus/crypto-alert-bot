@@ -1,4 +1,3 @@
-// src/httpClient.js
 import axios from 'axios'
 import dotenv from 'dotenv'
 dotenv.config()
@@ -20,11 +19,26 @@ const NEED_PROXY = [
 
 const ALWAYS_PROXY = String(process.env.ALWAYS_PROXY || '0') === '1';
 
+function isAlreadyProxied(u) {
+  try {
+    const p = process.env.PROXY_FETCH;
+    if (!p) return false;
+    const target = new URL(u);
+    const proxy = new URL(p);
+    // прямой вызов на воркер
+    if (target.origin === proxy.origin) return true;
+    // воркер с параметром ?url=
+    if (target.searchParams?.has('url') && target.origin === proxy.origin) return true;
+  } catch {}
+  return false;
+}
+
 function proxiedUrl(u) {
   try {
     const url = new URL(u);
     const p = process.env.PROXY_FETCH;
     if (!p) return u;
+    if (isAlreadyProxied(u)) return u; // защита от «двойного проксирования»
     if (ALWAYS_PROXY) return p + '?url=' + encodeURIComponent(u);
     if (!NEED_PROXY.includes(url.hostname)) return u;
     return p + '?url=' + encodeURIComponent(u);

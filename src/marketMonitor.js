@@ -1,4 +1,3 @@
-// src/marketMonitor.js
 import { httpGetWithRetry } from './httpClient.js';
 import { resolveUserLang } from './cache.js';
 import { usersCollection } from './db.js';
@@ -20,11 +19,8 @@ const SNAPSHOT_TTL_MS = Number.isFinite(Number(process.env.SNAPSHOT_TTL_MS)) ? N
 const BUST_CACHE = String(process.env.BUST_CACHE || '0') === '1';
 const ALWAYS_PROXY = String(process.env.ALWAYS_PROXY || '0') === '1';
 const PROXY_FETCH = process.env.PROXY_FETCH || '';
-const NO_PROXY_HOSTS = (process.env.NO_PROXY_HOSTS || 'api.coingecko.com,api.llama.fi,preview.dl.llama.fi,api.alternative.me,api.binance.com,fapi.binance.com,www.binance.com,api.bybit.com,www.okx.com')
-  .split(',')
-  .map(s => s.trim().toLowerCase())
-  .filter(Boolean);
-
+const NO_PROXY_HOSTS = (process.env.NO_PROXY_HOSTS || 'api.coingecko.com,api.llama.fi,preview.dl.llama.fi,api.alternative.me')
+  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 
 const UA = { headers: { 'User-Agent': 'Mozilla/5.0 Chrome/120' } };
 
@@ -88,49 +84,50 @@ function logSrc(section, src, ok, extra='') {
 function hostOf(url){ try{ return new URL(url).host.toLowerCase(); }catch{ return ''; } }
 function buildProxied(url) { if (!PROXY_FETCH) return null; return `${PROXY_FETCH}?url=${encodeURIComponent(url)}`; }
 
+// НОВАЯ устойчивая версия: пробуем direct/proxy и делаем прокси-фоллбек даже для NO_PROXY_HOSTS
 async function getUrlSmart(url, label, useUa = true, tryProxyToo = true) {
   const headers = useUa ? UA : undefined;
   const host = hostOf(url);
   const mustDirect = NO_PROXY_HOSTS.includes(host);
   const directFirst = !ALWAYS_PROXY || mustDirect;
-  const proxied = mustDirect ? null : buildProxied(url);
+  // всегда готовим вариант через прокси как fallback
+  const proxiedUrlStr = buildProxied(url);
 
-  if (directFirst) {
-    try {
+  try {
+    if (directFirst) {
+      // 1) прямой
       const r = await withTimeout(httpGetWithRetry(url,1,headers), HARD_TIMEOUT_MS, `${label}:direct`);
       return { data: r?.data ?? null, via: 'direct' };
-    } catch (e1) {
-      logSrc(label, 'direct', false, String(e1?.message||e1));
-      if (tryProxyToo && proxied) {
-        try {
-          const r2 = await withTimeout(httpGetWithRetry(proxied,1,headers), HARD_TIMEOUT_MS+2000, `${label}:proxy`);
-          return { data: r2?.data ?? null, via: 'proxy' };
-        } catch (e2) {
-          logSrc(label, 'proxy', false, String(e2?.message||e2));
-          throw e2;
-        }
-      }
-      throw e1;
     }
-  } else {
-    if (proxied) {
+    // 2) сперва прокси, если не обязателен direct
+    if (proxiedUrlStr) {
+      const r = await withTimeout(httpGetWithRetry(proxiedUrlStr,1,headers), HARD_TIMEOUT_MS+2000, `${label}:proxy`);
+      return { data: r?.data ?? null, via: 'proxy' };
+    }
+    // 3) прокси нет — прямой
+    const r = await withTimeout(httpGetWithRetry(url,1,headers), HARD_TIMEOUT_MS, `${label}:direct`);
+    return { data: r?.data ?? null, via: 'direct' };
+  } catch (e1) {
+    logSrc(label, directFirst ? 'direct' : 'proxy', false, String(e1?.message||e1));
+    // Fallback: даже для NO_PROXY_HOSTS пробуем через прокси, если он доступен
+    if (tryProxyToo && proxiedUrlStr) {
       try {
-        const r = await withTimeout(httpGetWithRetry(proxied,1,headers), HARD_TIMEOUT_MS+2000, `${label}:proxy`);
-        return { data: r?.data ?? null, via: 'proxy' };
-      } catch (e1) {
-        logSrc(label, 'proxy', false, String(e1?.message||e1));
-        try {
-          const r2 = await withTimeout(httpGetWithRetry(url,1,headers), HARD_TIMEOUT_MS, `${label}:direct`);
-          return { data: r2?.data ?? null, via: 'direct' };
-        } catch (e2) {
-          logSrc(label, 'direct', false, String(e2?.message||e2));
-          throw e2;
-        }
+        const r2 = await withTimeout(httpGetWithRetry(proxiedUrlStr,1,headers), HARD_TIMEOUT_MS+2000, `${label}:proxy_fallback`);
+        return { data: r2?.data ?? null, via: 'proxy' };
+      } catch (e2) {
+        logSrc(label, 'proxy_fallback', false, String(e2?.message||e2));
       }
-    } else {
-      const r = await withTimeout(httpGetWithRetry(url,1,headers), HARD_TIMEOUT_MS, `${label}:direct`);
-      return { data: r?.data ?? null, via: 'direct' };
     }
+    // Последняя попытка — прямой, если изначально шли через прокси
+    if (!directFirst) {
+      try {
+        const r3 = await withTimeout(httpGetWithRetry(url,1,headers), HARD_TIMEOUT_MS, `${label}:direct_fallback`);
+        return { data: r3?.data ?? null, via: 'direct' };
+      } catch (e3) {
+        logSrc(label, 'direct_fallback', false, String(e3?.message||e3));
+      }
+    }
+    throw e1;
   }
 }
 
@@ -996,7 +993,7 @@ export async function buildMorningReportHtml(snapshots, lang='ru'){
     : `Сейчас: BTC — ${guideVolOne(((snapshots.BTC)||{}).volDeltaPct,false)}; ETH — ${guideVolOne(((snapshots.ETH)||{}).volDeltaPct,false)}.`;
   const rsiNow = isEn
     ? `Now: BTC — ${guideRSIOne(((snapshots.BTC)||{}).rsi14,true)}; ETH — ${guideRSIOne(((snapshots.ETH)||{}).rsi14,true)}.`
-    : `Сейчас: BTC — ${guideRSIOne(((snapshots.BTC)||{}).rsi14,false)}; ETH — ${guideRSIOne(((snapshots.ETH)||{}).rsi14,false)}.`;
+    : `Сейчас: BTC — ${guideRSIOne(((snapshots.ETH)||{}).rsi14,false)}; ETH — ${guideRSIOne(((snapshots.ETH)||{}).rsi14,false)}.`;
   const flowsNow = isEn
     ? `Now: BTC — ${guideFlowsOne(((snapshots.BTC)||{}).netFlowsUSDNow,true)}; ETH — ${guideFlowsOne(((snapshots.ETH)||{}).netFlowsUSDNow,true)}.`
     : `Сейчас: BTC — ${guideFlowsOne(((snapshots.BTC)||{}).netFlowsUSDNow,false)}; ETH — ${guideFlowsOne(((snapshots.ETH)||{}).netFlowsUSDNow,false)}.`;
