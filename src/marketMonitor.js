@@ -418,79 +418,129 @@ async function fetchProxyNetFlowsUSDWithPrev(assetKey, spotUSD, pctNow, volNow, 
   return { nowUSD:null, prevUSD:null, diffUSD:null };
 }
 
-// ---------- FETCH: GOLD ----------
 async function fetchGoldSpotAndDelta(){
   try {
-    // несколько эндпоинтов metals.live, берём первый, который отвечает массивом
+    // 1) Пытаемся получить spot с metals.live (как и раньше)
     const candidates = [
       `https://api.metals.live/v1/spot/gold?_t=${Date.now()}`,
       `https://api.metals.live/v1/spot/XAU?_t=${Date.now()}`,
       `https://api.metals.live/v1/spot?_t=${Date.now()}`
     ];
-    let raw = null;
+    let spot = null;
+
+    const normalizeList = (raw) => {
+      const nums = [];
+      if (!Array.isArray(raw)) return nums;
+      for (const item of raw) {
+        if (typeof item === 'number') { if (item > 0) nums.push(item); continue; }
+        if (Array.isArray(item)) {
+          const v = Number(item[1] ?? item[0]);
+          if (Number.isFinite(v) && v > 0) nums.push(v);
+          continue;
+        }
+        if (item && typeof item === 'object') {
+          const keys = ['gold','xau','price','ask','bid','close'];
+          let v = null;
+          for (const k of keys) {
+            const n = Number(item[k]);
+            if (Number.isFinite(n) && n > 0) { v = n; break; }
+          }
+          if (v == null) {
+            const any = Number(Object.values(item).find(x => Number.isFinite(Number(x))));
+            if (Number.isFinite(any) && any > 0) v = any;
+          }
+          if (v != null) nums.push(v);
+        }
+      }
+      return nums;
+    };
+
     for (const url of candidates) {
       try {
         const r = await withTimeout(httpGetWithRetry(url, 1, UA), HARD_TIMEOUT_MS, `gold:${url}`);
-        if (Array.isArray(r?.data) && r.data.length) { raw = r.data; break; }
+        const nums = normalizeList(r?.data);
+        if (nums.length) {
+          spot = nums[nums.length - 1];
+          break;
+        }
       } catch {}
     }
-    if (!Array.isArray(raw) || !raw.length) {
-      // жёсткий фоллбек: Yahoo (часто закрыт), просто пробуем
+
+    // 2) Готовим помощник для Yahoo ежедневного close
+    async function yahooPrevClose(ticker) {
       try {
         const y = await withTimeout(
-          httpGetWithRetry(`https://query1.finance.yahoo.com/v8/finance/chart/GC=F?range=2d&interval=1d&_t=${Date.now()}`, 1, UA),
+          httpGetWithRetry(
+            `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=2d&interval=1d&_t=${Date.now()}`,
+            1,
+            UA
+          ),
           HARD_TIMEOUT_MS,
-          'gold:yahoo'
+          `gold:yahoo:${ticker}`
         );
         const res = y?.data?.chart?.result?.[0];
-        const c = Number(res?.meta?.regularMarketPrice);
-        const prev = Array.isArray(res?.indicators?.quote?.[0]?.close) ? Number(res.indicators.quote[0].close?.[0]) : null;
-        if (Number.isFinite(c) && c>0) {
-          const pct = (Number.isFinite(prev) && prev>0) ? ((c - prev) / prev) * 100 : null;
-          return { price: c, pct24: Number.isFinite(pct)?pct:null, source: 'XAU' };
+        const closes = res?.indicators?.quote?.[0]?.close;
+        if (Array.isArray(closes) && closes.length >= 2) {
+          // closes[0] — prev close, closes[1] — текущее дневное close
+          return { prev: Number(closes[0]), lastClose: Number(closes[1]) };
         }
       } catch {}
-      return { price:null, pct24:null, source:null };
+      return { prev: null, lastClose: null };
     }
 
-    // нормализуем в список положительных чисел (цен)
-    const nums = [];
-    for (const item of raw) {
-      if (typeof item === 'number') { if (item > 0) nums.push(item); continue; }
-      if (Array.isArray(item)) {
-        const v = Number(item[1] ?? item[0]);
-        if (Number.isFinite(v) && v > 0) nums.push(v);
-        continue;
-      }
-      if (item && typeof item === 'object') {
-        const keys = ['gold','xau','price','ask','bid','close'];
-        let v = null;
-        for (const k of keys) {
-          const n = Number(item[k]);
-          if (Number.isFinite(n) && n > 0) { v = n; break; }
-        }
-        if (v == null) {
-          const any = Number(Object.values(item).find(x => Number.isFinite(Number(x))));
-          if (Number.isFinite(any) && any > 0) v = any;
-        }
-        if (v != null) nums.push(v);
+    // 3) Если spot не удалось, попытаемся взять спот с Yahoo
+    if (!Number.isFinite(spot) || spot <= 0) {
+      // сначала XAUUSD=X (спот), потом GC=F (фьючи)
+      const xau = await yahooPrevClose('XAUUSD=X');
+      if (Number.isFinite(xau.lastClose) && xau.lastClose > 0) spot = xau.lastClose;
+      else {
+        const gc = await yahooPrevClose('GC=F');
+        if (Number.isFinite(gc.lastClose) && gc.lastClose > 0) spot = gc.lastClose;
       }
     }
-    if (nums.length < 1) return { price:null, pct24:null, source:null };
 
-    const price = nums[nums.length - 1];
-    // ищем предыдущую отличную от текущей
-    let prev = null;
-    for (let i = nums.length - 2; i >= 0; i--) {
-      const n = nums[i];
-      if (Number.isFinite(n) && n > 0 && n !== price) { prev = n; break; }
+    // 4) Всегда берём prevClose из Yahoo (сначала XAUUSD=X, затем GC=F)
+    let prevClose = null;
+    let prevPack = await yahooPrevClose('XAUUSD=X');
+    if (Number.isFinite(prevPack.prev) && prevPack.prev > 0) {
+      prevClose = prevPack.prev;
+    } else {
+      prevPack = await yahooPrevClose('GC=F');
+      if (Number.isFinite(prevPack.prev) && prevPack.prev > 0) prevClose = prevPack.prev;
     }
-    const pct = (Number.isFinite(prev) && prev > 0) ? ((price - prev) / prev) * 100 : null;
-    return { price, pct24: (Number.isFinite(pct) ? pct : null), source: 'XAU' };
+
+    // 5) Если и spot, и prevClose есть — считаем % строго к prevClose
+    if (Number.isFinite(spot) && spot > 0 && Number.isFinite(prevClose) && prevClose > 0) {
+      const pct = ((spot - prevClose) / prevClose) * 100;
+      return { price: spot, pct24: Number.isFinite(pct) ? pct : null, source: 'XAU' };
+    }
+
+    // Фолбэк: если есть только spot — вернём цену без процента
+    if (Number.isFinite(spot) && spot > 0) {
+      return { price: spot, pct24: null, source: 'XAU' };
+    }
+
+    // Совсем жёсткий фолбэк — как раньше по GC=F
+    try {
+      const y = await withTimeout(
+        httpGetWithRetry(`https://query1.finance.yahoo.com/v8/finance/chart/GC=F?range=2d&interval=1d&_t=${Date.now()}`, 1, UA),
+        HARD_TIMEOUT_MS,
+        'gold:yahoo:final'
+      );
+      const res = y?.data?.chart?.result?.[0];
+      const c = Number(res?.meta?.regularMarketPrice);
+      const prev = Array.isArray(res?.indicators?.quote?.[0]?.close) ? Number(res.indicators.quote[0].close?.[0]) : null;
+      if (Number.isFinite(c) && c > 0) {
+        const pct = (Number.isFinite(prev) && prev > 0) ? ((c - prev) / prev) * 100 : null;
+        return { price: c, pct24: Number.isFinite(pct) ? pct : null, source: 'XAU' };
+      }
+    } catch {}
+    return { price: null, pct24: null, source: null };
   } catch {
-    return { price:null, pct24:null, source:null };
+    return { price: null, pct24: null, source: null };
   }
 }
+
 
 // ---------- FGI ----------
 async function fetchFearGreedIndex() {
