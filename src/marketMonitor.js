@@ -156,8 +156,7 @@ function flowsHeaderLine(sym, isEn){
   const prev = Number(sym?.netFlowsUSDPrev);
   const diff = Number(sym?.netFlowsUSDDiff);
   if (!Number.isFinite(now) && !Number.isFinite(prev)) return '—';
-  const sNowMoney = Number.isFinite(now) ? `${now>=0?'+':'−'}$${humanFmt(Math.abs(now))}` : '—';
-  const sNowAbbr  = Number.isFinite(now) ? `${now>=0?'+':'−'}${abbrevWithUnit(Math.abs(now), isEn)}` : '';
+  const abbr = Number.isFinite(now) ? `${now>=0?'+':'−'}${abbrevWithUnit(Math.abs(now), isEn)}` : '';
   let deltaPart = '';
   if (Number.isFinite(prev) && Math.abs(prev) > 0 && Number.isFinite(diff)) {
     const diffPct = (diff/Math.abs(prev))*100;
@@ -166,7 +165,7 @@ function flowsHeaderLine(sym, isEn){
       deltaPart = ` ${circ}(${B(pctStr(diffPct))} ${isEn?'vs prev 24h':'к пред. 24ч'})`;
     }
   }
-  return `${B(`${sNowMoney}`)} (${B(sNowAbbr)})${deltaPart}`;
+  return `${B(abbr || '—')}${deltaPart}`;
 }
 
 function buildMorningReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=null, extras={}){
@@ -230,11 +229,10 @@ function buildMorningReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=nul
     const vol = Number(sym?.vol24);
     const deltaPct = Number(sym?.volDeltaPct);
     const circ = circleByDelta(deltaPct);
-    const fullMoney = Number.isFinite(vol) ? `$${humanFmt(vol)}` : '—';
     const abbrVal = Number.isFinite(vol) ? abbrevWithUnit(vol, isEn) : '';
-    const abbr = abbrVal ? `(${B(abbrVal)})` : '';
-    const pctTxt = Number.isFinite(deltaPct) ? `${circ}(${B(`${deltaPct>0?'+':''}${deltaPct.toFixed(2)}%`)} ${T.over24h})` : '(—)';
-    return `${B(fullMoney)} ${abbr} ${pctTxt}`;
+    const abbr = abbrVal ? B(abbrVal) : '—';
+    const pctTxt = Number.isFinite(deltaPct) ? `${circ}(${B(`${deltaPct>0?'+':''}${deltaPct.toFixed(2)}%`)} ${T.over24h})` : '';
+    return [abbr, pctTxt].filter(Boolean).join(' ');
   };
   const rsiLine = (sym) => {
     const now = Number(sym?.rsi14), prev = Number(sym?.rsi14Prev);
@@ -242,9 +240,8 @@ function buildMorningReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=nul
     const base = B(humanFmt(now));
     if(Number.isFinite(prev)){
       const d = now - prev;
-      const bps = d * 10000;
       const circ = circleByDelta(d);
-      const dTxt = `${circ}(${B(`${d>0?'+':''}${d.toFixed(2)}`)} ${T.over24h}, ${B(`${d>0?'+':''}${Math.round(bps)} б.п.`)})`;
+      const dTxt = `${circ}(${B(`${d>0?'+':''}${d.toFixed(2)}`)} ${T.over24h})`;
       return `${base} ${dTxt}`;
     }
     return base;
@@ -258,7 +255,7 @@ function buildMorningReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=nul
       const d = now - prev;
       const circ = circleByDelta(d);
       const bps = d * 10000;
-      const dTxt = `${circ}(${B(`${d>0?'+':''}${fmtFunding(d)}`)} ${T.over24h}, ${B(`${(bps>0?'+':'')}${(bps).toFixed(2)} б.п.`)})`;
+      const dTxt = `${circ}(${B(`${(bps>0?'+':'')}${(bps).toFixed(2)} б.п.`)})`;
       return `${base} ${dTxt}`;
     }
     return base;
@@ -271,10 +268,7 @@ function buildMorningReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=nul
   head.push(BU(T.price));
   if (snapshots.BTC) head.push(`BTC ${priceLine((snapshots.BTC)||{})}`);
   if (snapshots.ETH) head.push(`ETH ${priceLine((snapshots.ETH)||{})}`);
-  if (snapshots.PAXG) {
-    const lbl = isEn ? 'PAXG (tokenized gold) ' : 'PAXG (токенизированное золото) ';
-    head.push(priceLine((snapshots.PAXG)||{}, lbl));
-  }
+  if (snapshots.PAXG) head.push(`PAXG ${priceLine((snapshots.PAXG)||{}, '')}`);
   head.push('');
 
   head.push(BU(T.fgi));
@@ -348,7 +342,7 @@ function buildMorningReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=nul
   help.push(BU(T.ref));
   help.push('');
 
-  help.push(`${B('¹ Цена: спот.')} — кратко фиксирует текущую цену и её изменение за 24ч.`);
+  help.push(`${B('¹ Цена: спот.')} — кратко фиксирует текущую цену и её изменение за 24ч. PAXG — токенизированное золото (≈ 1 унция золота на 1 токен).`);
   if (snapshots.BTC) help.push(`• ${B('BTC:')} ${concisePriceAdvice((snapshots.BTC||{}).pct24)}`);
   if (snapshots.ETH) help.push(`• ${B('ETH:')} ${concisePriceAdvice((snapshots.ETH||{}).pct24)}`);
   if (snapshots.PAXG) help.push(`• ${B('PAXG:')} ${concisePriceAdvice((snapshots.PAXG||{}).pct24)}`);
@@ -372,8 +366,6 @@ function buildMorningReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=nul
 
   help.push('');
   help.push(`${B('⁵ Объем 24 ч')} — подтверждает/ослабляет движение цены.`);
-  if (snapshots.BTC) help.push(`• ${B('BTC:')} ${conciseVolAdvice((snapshots.BTC||{}).volDeltaPct)}`);
-  if (snapshots.ETH) help.push(`• ${B('ETH:')} ${conciseVolAdvice((snapshots.ETH||{}).volDeltaPct)}`);
 
   help.push('');
   help.push(`${B('⁶ RSI(14)')} — импульс: ≈70 перегрев, ≈30 перепроданность.`);
