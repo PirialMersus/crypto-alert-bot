@@ -10,22 +10,20 @@ const symbolsCfg = {
   PAXG: { binance: null, coingecko: 'pax-gold' }
 };
 
-const HARD_TIMEOUT_MS = 8000;
-
 const UA = { headers: { 'User-Agent': 'Mozilla/5.0 Chrome/120' } };
 
 const esc = (s) => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 const B = (s) => `<b>${esc(s)}</b>`;
 const U = (s) => `<u>${esc(s)}</u>`;
 const BU = (s) => `<b><u>${esc(s)}</u></b>`;
+const ADMIN_ID = process.env.ADMIN_ID ? String(process.env.ADMIN_ID) : '';
 
 function humanFmt(n) {
   if (!Number.isFinite(n)) return '—';
   try {
-    if (Math.abs(n) >= 1_000_000) return Intl.NumberFormat('en-US',{maximumFractionDigits:0}).format(Math.round(n));
-    if (Math.abs(n) >= 1000)      return Intl.NumberFormat('en-US',{maximumFractionDigits:0}).format(Math.round(n));
-    if (Math.abs(n) >= 1)         return Intl.NumberFormat('en-US',{maximumFractionDigits:2}).format(Number(n.toFixed(2)));
-    return Number(n).toPrecision(6).replace(/(?:\.0+|(?<=\.[0-9]*?)0+)$/,'');
+    if (Math.abs(n) >= 1000) return Intl.NumberFormat('en-US',{maximumFractionDigits:0}).format(Math.round(n));
+    if (Math.abs(n) >= 1)   return Intl.NumberFormat('en-US',{maximumFractionDigits:2}).format(Number(n.toFixed(2)));
+    return Number(n).toPrecision(6).replace(/(?:\.0+$|(?<=\.[0-9]*?)0+)$/,'');
   } catch { return String(n); }
 }
 const nearZero = (v) => Number.isFinite(v) && Math.abs(v) < 1e-8;
@@ -33,19 +31,6 @@ const nearZero = (v) => Number.isFinite(v) && Math.abs(v) < 1e-8;
 function fmtFunding(v) { if(!Number.isFinite(v)) return '—'; return Number(v).toFixed(8).replace(/\.0+$|0+$/,''); }
 function circleByDelta(x) { if(!Number.isFinite(x) || x===0) return '⚪'; return x>0?'🟢':'🔴'; }
 function pctStr(v) { return `${v>0?'+':''}${v.toFixed(2)}%`; }
-
-function computeRSI(closes=[], period=14) {
-  try {
-    if(!Array.isArray(closes)||closes.length<period+1) return null;
-    let gains=0,losses=0;
-    for(let i=1;i<=period;i++){ const d=closes[i]-closes[i-1]; if(d>0) gains+=d; else losses+=Math.abs(d); }
-    let avgGain=gains/period, avgLoss=losses/period;
-    for(let i=period+1;i<closes.length;i++){ const d=closes[i]-closes[i-1]; avgGain=((avgGain*(period-1))+Math.max(0,d))/period; avgLoss=((avgLoss*(period-1))+Math.max(0,-d))/period; }
-    if(avgLoss===0) return 100;
-    const rs=avgGain/avgLoss, rsi=100-(100/(1+rs));
-    return Number.isFinite(rsi)?Number(rsi.toFixed(2)):null;
-  }catch{return null;}
-}
 
 function riskBar(score){
   const n=Math.max(0,Math.min(10,Math.round((score||0)*10)));
@@ -75,12 +60,11 @@ function aggregateScore({ priceRisk, fundingRisk=0, sentimentRisk=0 }){
 function fearGreedBarColorized(v){
   const val = Number(v);
   if (!Number.isFinite(val) || val < 0 || val > 100) return '⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜';
-  const filled = Math.max(0, Math.min(10, Math.round(val/10)));
+  const filled = Math.max(0, Math.min(10, Math.floor(val/10)));
   let color = '🟨';
   if (val <= 24) color = '🟥';
   else if (val <= 44) color = '🟧';
   else if (val <= 54) color = '🟨';
-  else if (val <= 74) color = '🟩';
   else color = '🟩';
   return color.repeat(filled) + '⬜'.repeat(10 - filled);
 }
@@ -349,8 +333,7 @@ export async function buildMorningReportHtml(snapshots, lang='ru', tsIsoKyiv='',
   let fgiAdvice = 'Нейтрально — держать план; не бегать за движением.';
   if (Number.isFinite(fgiVal)) {
     if (fgiVal <= 25) fgiAdvice = 'Страх — входы только по подтверждениям; не усреднять без стопа.';
-    else if (fgiVal >= 75) fgiAdvice = 'Экстремальная жадность — частичная фиксация; не открывать новые агрессивные лонги.';
-    else if (fgiVal >= 55) fgiAdvice = 'Жадность — снижать плечо; фиксировать по правилам.';
+    else if (fgiVal >= 75) fgiAdvice = 'Жадность — снижать плечо; фиксировать по правилам.';
   }
 
   lines.push('');
