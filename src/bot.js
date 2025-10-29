@@ -210,6 +210,20 @@ bot.hears('📋 My alerts', async (ctx) => {
   } catch { await ctx.reply('Error fetching alerts.'); }
 });
 
+async function handleMotivationRequest(ctx) {
+  try {
+    const lang = await resolveUserLang(ctx.from?.id, null, ctx.from?.language_code).catch(() => ctx.from?.language_code || 'ru');
+    const isEn = String(lang).toLowerCase().startsWith('en');
+    try { await ctx.telegram.sendChatAction(ctx.chat.id, 'upload_photo').catch(()=>{}); } catch {}
+    const dateStr = new Date().toLocaleDateString('sv-SE', { timeZone: KYIV_TZ });
+    const ok = await sendDailyToUser(bot, ctx.from.id, dateStr, { disableNotification: false, forceRefresh: false }).catch(()=>false);
+    if (!ok) await ctx.reply(isEn ? '⚠️ Could not send motivation now.' : '⚠️ Не удалось отправить мотивацию сейчас.');
+  } catch {
+    try { await ctx.reply('⚠️ Внутренняя ошибка при отправке мотивации.'); } catch {}
+  }
+}
+
+
 async function handleMarketSnapshotRequest(ctx) {
   try {
     const pref = await resolveUserLang(ctx.from?.id, null, ctx.from?.language_code).catch(() => ctx.from?.language_code || 'ru');
@@ -256,7 +270,10 @@ bot.hears('📊 прислать данные мониторинга', handleMar
 bot.hears('📊 Send market snapshot', handleMarketSnapshotRequest);
 bot.hears('📊 ⏳ Формирую…', handleMarketSnapshotRequest);
 bot.hears('📊 ⏳ Building…', handleMarketSnapshotRequest);
+bot.hears('🌅 Прислать мотивацию', handleMotivationRequest);
+bot.hears('🌅 Send motivation', handleMotivationRequest);
 
+bot.command('motivate', handleMotivationRequest);
 bot.command('market', handleMarketSnapshotRequest);
 bot.command('snapshot', handleMarketSnapshotRequest);
 bot.command('report', handleMarketSnapshotRequest);
@@ -317,6 +334,17 @@ bot.on('callback_query', async (ctx) => {
     if (!data) return ctx.answerCbQuery();
 
     const lang = await resolveUserLang(ctx.from.id);
+
+    if (data === 'market_help') {
+      const mm = await import('./marketMonitor.js');
+      try {
+        await mm.editReportMessageWithHelp(ctx);
+        await ctx.answerCbQuery();
+      } catch {
+        try { await ctx.answerCbQuery('Ошибка'); } catch {}
+      }
+      return;
+    }
 
     if (data === 'back_to_main') {
       try { await ctx.editMessageReplyMarkup({ inline_keyboard: [] }); } catch {}

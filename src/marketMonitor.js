@@ -4,19 +4,12 @@ import { resolveUserLang } from './cache.js';
 import { usersCollection, client } from './db.js';
 import { MARKET_BATCH_SIZE, MARKET_BATCH_PAUSE_MS } from './constants.js';
 
-const symbolsCfg = {
-  BTC: { binance: 'BTCUSDT', coingecko: 'bitcoin' },
-  ETH: { binance: 'ETHUSDT', coingecko: 'ethereum' },
-  PAXG: { binance: null, coingecko: 'pax-gold' }
-};
-
 const UA = { headers: { 'User-Agent': 'Mozilla/5.0 Chrome/120' } };
 
 const esc = (s) => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 const B = (s) => `<b>${esc(s)}</b>`;
 const U = (s) => `<u>${esc(s)}</u>`;
 const BU = (s) => `<b><u>${esc(s)}</u></b>`;
-const ADMIN_ID = process.env.ADMIN_ID ? String(process.env.ADMIN_ID) : '';
 
 function humanFmt(n) {
   if (!Number.isFinite(n)) return '—';
@@ -99,12 +92,17 @@ function renderLsBlock(ls, isEn, label){
 }
 function formatKyiv(tsEpoch, tsIso) {
   try {
-    const d = Number.isFinite(Number(tsEpoch)) ? new Date(Number(tsEpoch)) : (tsIso ? new Date(tsIso) : new Date());
+    const d = Number.isFinite(Number(tsEpoch)) && Number(tsEpoch) > 0
+      ? new Date(Number(tsEpoch))
+      : (tsIso ? new Date(tsIso) : new Date());
     const ru = new Intl.DateTimeFormat('ru-RU',{ timeZone:'Europe/Kyiv', year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit' }).format(d);
     const en = new Intl.DateTimeFormat('en-GB',{ timeZone:'Europe/Kyiv', year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit' }).format(d);
     return { ru, en };
   } catch {
-    return { ru: String(tsIso||tsEpoch||''), en: String(tsIso||tsEpoch||'') };
+    const now = new Date();
+    const ru = new Intl.DateTimeFormat('ru-RU',{ timeZone:'Europe/Kyiv', year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit' }).format(now);
+    const en = new Intl.DateTimeFormat('en-GB',{ timeZone:'Europe/Kyiv', year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit' }).format(now);
+    return { ru, en };
   }
 }
 
@@ -171,7 +169,7 @@ function flowsHeaderLine(sym, isEn){
   return `${B(`${sNowMoney}`)} (${B(sNowAbbr)})${deltaPart}`;
 }
 
-export async function buildMorningReportHtml(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=null){
+function buildMorningReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=null, extras={}){
   const isEn=String(lang).toLowerCase().startsWith('en');
 
   const T=isEn?{
@@ -179,26 +177,30 @@ export async function buildMorningReportHtml(snapshots, lang='ru', tsIsoKyiv='',
     asof:'As of',
     price:'Price *¹',
     fgi:'Fear & Greed *²',
-    volumes:'24h Volume *³',
-    rsi:'RSI (14) *⁴',
-    flows:'Net flows *⁵',
-    funding:'Funding rate (avg) *⁶',
-    ls:'Longs vs Shorts *⁷',
-    risks:'Risk *⁸',
+    dom:'BTC Dominance *³',
+    spx:'S&P 500 *⁴',
+    volumes:'24h Volume *⁵',
+    rsi:'RSI (14) *⁶',
+    flows:'Net flows *⁷',
+    funding:'Funding rate (avg) *⁸',
+    ls:'Longs vs Shorts *⁹',
+    risks:'Risk *¹⁰',
     over24h:'over 24h',
-    ref:'Reference',
+    ref:'Справка',
     updatesNote:'updates every 30 min'
   }:{
     report:'ОТЧЕТ',
     asof:'Данные на',
     price:'Цена *¹',
     fgi:'Индекс страха и жадности *²',
-    volumes:'Объем 24 ч *³',
-    rsi:'RSI (14) *⁴',
-    flows:'Притоки/оттоки *⁵',
-    funding:'Funding rate (avg) *⁶',
-    ls:'Лонги vs Шорты *⁷',
-    risks:'Риск *⁸',
+    dom:'Доминация BTC *³',
+    spx:'S&P 500 *⁴',
+    volumes:'Объем 24 ч *⁵',
+    rsi:'RSI (14) *⁶',
+    flows:'Притоки/оттоки *⁷',
+    funding:'Funding rate (avg) *⁸',
+    ls:'Лонги vs Шорты *⁹',
+    risks:'Риск *¹⁰',
     over24h:'за 24 часа',
     ref:'Справка',
     updatesNote:'обновляются каждые 30 мин'
@@ -262,49 +264,70 @@ export async function buildMorningReportHtml(snapshots, lang='ru', tsIsoKyiv='',
     return base;
   };
 
-  const lines=[];
-  lines.push(`📊 ${BU(T.report)}`);
-  lines.push('');
+  const head=[];
+  head.push(`📊 ${BU(T.report)}`);
+  head.push('');
 
-  lines.push(BU(T.price));
-  if (snapshots.BTC) lines.push(`BTC ${priceLine((snapshots.BTC)||{})}`);
-  if (snapshots.ETH) lines.push(`ETH ${priceLine((snapshots.ETH)||{})}`);
+  head.push(BU(T.price));
+  if (snapshots.BTC) head.push(`BTC ${priceLine((snapshots.BTC)||{})}`);
+  if (snapshots.ETH) head.push(`ETH ${priceLine((snapshots.ETH)||{})}`);
   if (snapshots.PAXG) {
     const lbl = isEn ? 'PAXG (tokenized gold) ' : 'PAXG (токенизированное золото) ';
-    lines.push(priceLine((snapshots.PAXG)||{}, lbl));
+    head.push(priceLine((snapshots.PAXG)||{}, lbl));
   }
-  lines.push('');
+  head.push('');
 
-  lines.push(BU(T.fgi));
-  lines.push(`• ${fgiLine((snapshots.BTC)||{})}`);
-  lines.push('');
+  head.push(BU(T.fgi));
+  head.push(`• ${fgiLine((snapshots.BTC)||{})}`);
+  head.push('');
 
-  lines.push(BU(T.volumes));
-  if (snapshots.BTC) lines.push(`• BTC: ${volumeLine((snapshots.BTC)||{})}`);
-  if (snapshots.ETH) lines.push(`• ETH: ${volumeLine((snapshots.ETH)||{})}`);
-  lines.push('');
+  head.push(BU(T.dom));
+  const domPct = typeof extras?.btcDominancePct === 'number' ? extras.btcDominancePct : null;
+  head.push(`• ${Number.isFinite(domPct) ? B(`${domPct.toFixed(2)}%`) : '—'}`);
+  head.push('');
 
-  lines.push(BU(T.rsi));
-  if (snapshots.BTC) lines.push(`• BTC: ${rsiLine((snapshots.BTC)||{})}`);
-  if (snapshots.ETH) lines.push(`• ETH: ${rsiLine((snapshots.ETH)||{})}`);
-  lines.push('');
+  head.push(BU(T.spx));
+  const spxPrice = (extras?.spx && typeof extras.spx.price === 'number') ? extras.spx.price : null;
+  const spxPct = (extras?.spx && typeof extras.spx.pct === 'number') ? extras.spx.pct : null;
+  let spxLine = '—';
+  if (Number.isFinite(spxPrice) || Number.isFinite(spxPct)) {
+    const parts = [];
+    if (Number.isFinite(spxPrice)) parts.push(B(humanFmt(spxPrice)));
+    if (Number.isFinite(spxPct)) {
+      const spxCirc = circleByDelta(spxPct);
+      parts.push(`${spxCirc} (${B(`${spxPct>0?'+':''}${spxPct.toFixed(2)}%`)} ${T.over24h})`);
+    }
+    spxLine = parts.join(' ');
+  }
+  head.push(`• ${spxLine}`);
+  head.push('');
 
-  lines.push(BU(T.flows));
-  if (snapshots.BTC) lines.push(`• BTC: ${flowsHeaderLine((snapshots.BTC)||{}, isEn)}`);
-  if (snapshots.ETH) lines.push(`• ETH: ${flowsHeaderLine((snapshots.ETH)||{}, isEn)}`);
-  lines.push('');
+  head.push(BU(T.volumes));
+  if (snapshots.BTC) head.push(`• BTC: ${volumeLine((snapshots.BTC)||{})}`);
+  if (snapshots.ETH) head.push(`• ETH: ${volumeLine((snapshots.ETH)||{})}`);
+  head.push('');
 
-  lines.push(BU(T.funding));
-  if (snapshots.BTC) lines.push(`• BTC: ${fundingLine((snapshots.BTC)||{})}`);
-  if (snapshots.ETH) lines.push(`• ETH: ${fundingLine((snapshots.ETH)||{})}`);
-  lines.push('');
+  head.push(BU(T.rsi));
+  if (snapshots.BTC) head.push(`• BTC: ${rsiLine((snapshots.BTC)||{})}`);
+  if (snapshots.ETH) head.push(`• ETH: ${rsiLine((snapshots.ETH)||{})}`);
+  head.push('');
 
-  lines.push(BU(T.ls));
-  if (snapshots.BTC) lines.push(renderLsBlock(((snapshots.BTC)||{}).longShort, isEn, 'BTC'));
-  if (snapshots.ETH) lines.push(renderLsBlock(((snapshots.ETH)||{}).longShort, isEn, 'ETH'));
-  lines.push('');
+  head.push(BU(T.flows));
+  if (snapshots.BTC) head.push(`• BTC: ${flowsHeaderLine((snapshots.BTC)||{}, isEn)}`);
+  if (snapshots.ETH) head.push(`• ETH: ${flowsHeaderLine((snapshots.ETH)||{}, isEn)}`);
+  head.push('');
 
-  lines.push(BU(T.risks));
+  head.push(BU(T.funding));
+  if (snapshots.BTC) head.push(`• BTC: ${fundingLine((snapshots.BTC)||{})}`);
+  if (snapshots.ETH) head.push(`• ETH: ${fundingLine((snapshots.ETH)||{})}`);
+  head.push('');
+
+  head.push(BU(T.ls));
+  if (snapshots.BTC) head.push(renderLsBlock(((snapshots.BTC)||{}).longShort, isEn, 'BTC'));
+  if (snapshots.ETH) head.push(renderLsBlock(((snapshots.ETH)||{}).longShort, isEn, 'ETH'));
+  head.push('');
+
+  head.push(BU(T.risks));
   const scoreBTC = aggregateScore({
     priceRisk: priceChangeRisk((snapshots.BTC||{}).pct24),
     fundingRisk: fundingRiskFromNow((snapshots.BTC||{}).fundingNow),
@@ -317,17 +340,18 @@ export async function buildMorningReportHtml(snapshots, lang='ru', tsIsoKyiv='',
   });
   const rBbar = `${riskBar(scoreBTC)} ${B(`${Math.round(scoreBTC*100)}%`)}`;
   const rEbar = `${riskBar(scoreETH)} ${B(`${Math.round(scoreETH*100)}%`)}`;
-  if (snapshots.BTC) lines.push(`• BTC:\n${rBbar}`);
-  if (snapshots.ETH) lines.push(`• ETH:\n${rEbar}`);
-  lines.push('');
+  if (snapshots.BTC) head.push(`• BTC:\n${rBbar}`);
+  if (snapshots.ETH) head.push(`• ETH:\n${rEbar}`);
+  head.push('');
 
-  lines.push(BU(T.ref));
-  lines.push('');
+  const help=[];
+  help.push(BU(T.ref));
+  help.push('');
 
-  lines.push(`${B('¹ Цена: спот.')} — кратко фиксирует текущую цену и её изменение за 24ч.`);
-  if (snapshots.BTC) lines.push(`• ${B('BTC:')} ${concisePriceAdvice((snapshots.BTC||{}).pct24)}`);
-  if (snapshots.ETH) lines.push(`• ${B('ETH:')} ${concisePriceAdvice((snapshots.ETH||{}).pct24)}`);
-  if (snapshots.PAXG) lines.push(`• ${B('PAXG:')} ${concisePriceAdvice((snapshots.PAXG||{}).pct24)}`);
+  help.push(`${B('¹ Цена: спот.')} — кратко фиксирует текущую цену и её изменение за 24ч.`);
+  if (snapshots.BTC) help.push(`• ${B('BTC:')} ${concisePriceAdvice((snapshots.BTC||{}).pct24)}`);
+  if (snapshots.ETH) help.push(`• ${B('ETH:')} ${concisePriceAdvice((snapshots.ETH||{}).pct24)}`);
+  if (snapshots.PAXG) help.push(`• ${B('PAXG:')} ${concisePriceAdvice((snapshots.PAXG||{}).pct24)}`);
 
   const fgiVal = Number((snapshots.BTC||{}).fgiValue);
   let fgiAdvice = 'Нейтрально — держать план; не бегать за движением.';
@@ -336,46 +360,60 @@ export async function buildMorningReportHtml(snapshots, lang='ru', tsIsoKyiv='',
     else if (fgiVal >= 75) fgiAdvice = 'Жадность — снижать плечо; фиксировать по правилам.';
   }
 
-  lines.push('');
-  lines.push(`${B('² Индекс страха и жадности')} — сводный индикатор настроений по BTC.`);
-  lines.push(`• ${B('BTC/Market:')} ${fgiAdvice}`);
+  help.push('');
+  help.push(`${B('² Индекс страха и жадности')} — сводный индикатор настроений по BTC.`);
+  help.push(`• ${B('BTC/Market:')} ${fgiAdvice}`);
 
-  lines.push('');
-  lines.push(`${B('³ Объем 24 ч')} — подтверждает/ослабляет движение цены.`);
-  if (snapshots.BTC) lines.push(`• ${B('BTC:')} ${conciseVolAdvice((snapshots.BTC||{}).volDeltaPct)}`);
-  if (snapshots.ETH) lines.push(`• ${B('ETH:')} ${conciseVolAdvice((snapshots.ETH||{}).volDeltaPct)}`);
+  help.push('');
+  help.push(`${B('³ Доминация BTC')} — доля BTC в общей капитализации рынка. Рост — капитал уходит в BTC, падение — интерес к альтам.`);
 
-  lines.push('');
-  lines.push(`${B('⁴ RSI(14)')} — импульс: ≈70 перегрев, ≈30 перепроданность.`);
-  if (snapshots.BTC) lines.push(`• ${B('BTC:')} ${conciseRsiAdvice((snapshots.BTC||{}).rsi14)}`);
-  if (snapshots.ETH) lines.push(`• ${B('ETH:')} ${conciseRsiAdvice((snapshots.ETH||{}).rsi14)}`);
+  help.push('');
+  help.push(`${B('⁴ S&P 500')} — ориентир риска на традиционных рынках; слабость часто давит на крипту, рост поддерживает риск.`);
 
-  lines.push('');
-  lines.push(`${B('⁵ Net flows')} — чистые притоки/оттоки на биржи (приток = давление продажи, отток = поддержка).`);
-  if (snapshots.BTC) lines.push(`• ${B('BTC:')} ${conciseFlowsAdvice((snapshots.BTC||{}).netFlowsUSDNow)}`);
-  if (snapshots.ETH) lines.push(`• ${B('ETH:')} ${conciseFlowsAdvice((snapshots.ETH||{}).netFlowsUSDNow)}`);
+  help.push('');
+  help.push(`${B('⁵ Объем 24 ч')} — подтверждает/ослабляет движение цены.`);
+  if (snapshots.BTC) help.push(`• ${B('BTC:')} ${conciseVolAdvice((snapshots.BTC||{}).volDeltaPct)}`);
+  if (snapshots.ETH) help.push(`• ${B('ETH:')} ${conciseVolAdvice((snapshots.ETH||{}).volDeltaPct)}`);
 
-  lines.push('');
-  lines.push(`${B('⁶ Funding')} — ставка между лонгами и шортами на фьючерсах.`);
-  if (snapshots.BTC) lines.push(`• ${B('BTC:')} ${conciseFundingAdvice((snapshots.BTC||{}).fundingNow)}`);
-  if (snapshots.ETH) lines.push(`• ${B('ETH:')} ${conciseFundingAdvice((snapshots.ETH||{}).fundingNow)}`);
+  help.push('');
+  help.push(`${B('⁶ RSI(14)')} — импульс: ≈70 перегрев, ≈30 перепроданность.`);
+  if (snapshots.BTC) help.push(`• ${B('BTC:')} ${conciseRsiAdvice((snapshots.BTC||{}).rsi14)}`);
+  if (snapshots.ETH) help.push(`• ${B('ETH:')} ${conciseRsiAdvice((snapshots.ETH||{}).rsi14)}`);
 
-  lines.push('');
-  lines.push(`${B('⁷ Лонги/Шорты (L/S)')} — перекос повышает риск сквиза.`);
-  if (snapshots.BTC) lines.push(`• ${B('BTC:')} ${conciseLsAdvice((snapshots.BTC||{}).longShort?.longPct)}`);
-  if (snapshots.ETH) lines.push(`• ${B('ETH:')} ${conciseLsAdvice((snapshots.ETH||{}).longShort?.longPct)}`);
+  help.push('');
+  help.push(`${B('⁷ Net flows')} — чистые притоки/оттоки на биржи (приток = давление продажи, отток = поддержка).`);
+  if (snapshots.BTC) help.push(`• ${B('BTC:')} ${conciseFlowsAdvice((snapshots.BTC||{}).netFlowsUSDNow)}`);
+  if (snapshots.ETH) help.push(`• ${B('ETH:')} ${conciseFlowsAdvice((snapshots.ETH||{}).netFlowsUSDNow)}`);
 
-  lines.push('');
-  lines.push(`${B('⁸ Риск')} — агрегат цены, funding и L/S (0% низкий, 100% высокий).`);
-  if (snapshots.BTC) lines.push(`• ${B('BTC:')} ${conciseRiskAdvice(scoreBTC)}`);
-  if (snapshots.ETH) lines.push(`• ${B('ETH:')} ${conciseRiskAdvice(scoreETH)}`);
+  help.push('');
+  help.push(`${B('⁸ Funding')} — ставка между лонгами и шортами на фьючерсах.`);
+  if (snapshots.BTC) help.push(`• ${B('BTC:')} ${conciseFundingAdvice((snapshots.BTC||{}).fundingNow)}`);
+  if (snapshots.ETH) help.push(`• ${B('ETH:')} ${conciseFundingAdvice((snapshots.ETH||{}).fundingNow)}`);
+
+  help.push('');
+  help.push(`${B('⁹ Лонги/Шорты (L/S)')} — перекос повышает риск сквиза.`);
+  if (snapshots.BTC) help.push(`• ${B('BTC:')} ${conciseLsAdvice((snapshots.BTC||{}).longShort?.longPct)}`);
+  if (snapshots.ETH) help.push(`• ${B('ETH:')} ${conciseLsAdvice((snapshots.ETH||{}).longShort?.longPct)}`);
+
+  help.push('');
+  help.push(`${B('¹⁰ Риск')} — агрегат цены, funding и L/S (0% низкий, 100% высокий).`);
+  if (snapshots.BTC) help.push(`• ${B('BTC:')} ${conciseRiskAdvice(scoreBTC)}`);
+  if (snapshots.ETH) help.push(`• ${B('ETH:')} ${conciseRiskAdvice(scoreETH)}`);
 
   if (asOf) {
-    lines.push('');
-    lines.push(`${T.asof}: ${B(`${asOf}${tzSuffix}`)} - ${T.updatesNote}`);
+    help.push('');
+    help.push(`${T.asof}: ${B(`${asOf}${tzSuffix}`)} - ${T.updatesNote}`);
   }
 
-  return lines.join('\n');
+  const headHtml = head.join('\n');
+  const helpHtml = help.join('\n');
+  const fullHtml = headHtml + '\n' + helpHtml;
+  return { headHtml, helpHtml, fullHtml };
+}
+
+export async function buildMorningReportHtml(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=null, extras={}){
+  const { fullHtml } = buildMorningReportParts(snapshots, lang, tsIsoKyiv, tsEpoch, extras);
+  return fullHtml;
 }
 
 function pickSubsetBySymbols(snapshots, symbols){
@@ -391,39 +429,33 @@ export async function getMarketSnapshot(symbols=['BTC','ETH','PAXG']){
   const doc = await db.collection(collection).find().sort({ at: -1 }).limit(1).next();
   if (!doc || !doc.snapshots) return { ok:false, reason:'no_snapshot' };
   const subset = pickSubsetBySymbols(doc.snapshots, symbols);
-  return { ok:true, snapshots: subset, fetchedAt: doc.at, atIsoKyiv: doc.atIsoKyiv || '' };
+  const domPct = Number.isFinite(Number(doc.btcDominancePct)) ? Number(doc.btcDominancePct) : null;
+  const spx = doc.spx && typeof doc.spx === 'object' ? { price: Number.isFinite(Number(doc.spx.price)) ? Number(doc.spx.price) : null, pct: Number.isFinite(Number(doc.spx.pct)) ? Number(doc.spx.pct) : null, src: doc.spx.src || null } : { price:null, pct:null, src:null };
+  return { ok:true, snapshots: subset, fetchedAt: doc.at, atIsoKyiv: doc.atIsoKyiv || '', btcDominancePct: domPct, spx };
 }
 
 export async function startMarketMonitor(){ return { ok:true }; }
 
 export async function broadcastMarketSnapshot(bot, { batchSize=MARKET_BATCH_SIZE || 25, pauseMs=MARKET_BATCH_PAUSE_MS || 400 } = {}){
   if (!usersCollection) return { ok:false, reason:'mongo_not_connected' };
-
   const recipients = await usersCollection.find(
     { botBlocked: { $ne: true }, sendMarketReport: { $ne: false } },
     { projection: { userId: 1, lang: 1 } }
   ).toArray();
-
   if (!recipients.length) return { ok:true, delivered:0, users:0, batchSize, pauseMs };
-
   const snap = await getMarketSnapshot(['BTC','ETH','PAXG']).catch(()=>null);
   if (!snap?.ok) return { ok:false, reason:'snapshot_failed', delivered:0, users:recipients.length };
-
-  const { snapshots, atIsoKyiv, fetchedAt } = snap;
-
-  const [ruHtml, enHtml] = await Promise.all([
-    buildMorningReportHtml(snapshots, 'ru', atIsoKyiv, fetchedAt),
-    buildMorningReportHtml(snapshots, 'en', atIsoKyiv, fetchedAt)
-  ]);
-
+  const { snapshots, atIsoKyiv, fetchedAt, btcDominancePct, spx } = snap;
   let delivered = 0;
   for (let i = 0; i < recipients.length; i += batchSize) {
     const chunk = recipients.slice(i, i + batchSize);
     await Promise.all(chunk.map(async (u) => {
       try {
         const lang = await resolveUserLang(u.userId).catch(() => u.lang || 'ru');
-        const html = String(lang || '').toLowerCase().startsWith('en') ? enHtml : ruHtml;
-        await bot.telegram.sendMessage(u.userId, html, { parse_mode:'HTML' });
+        const parts = buildMorningReportParts(snapshots, lang, atIsoKyiv, fetchedAt, { btcDominancePct, spx });
+        const isEn = String(lang).toLowerCase().startsWith('en');
+        const kb = { inline_keyboard: [[{ text: isEn ? 'Get data guide' : 'Получить справку по отчёту', callback_data: 'market_help' }]] };
+        await bot.telegram.sendMessage(u.userId, parts.headHtml, { parse_mode:'HTML', reply_markup: kb });
         delivered++;
       } catch (err) {
         const code = err?.response?.error_code;
@@ -443,7 +475,6 @@ export async function broadcastMarketSnapshot(bot, { batchSize=MARKET_BATCH_SIZE
       await new Promise(r => setTimeout(r, pauseMs));
     }
   }
-
   return { ok:true, delivered, users: recipients.length, batchSize, pauseMs };
 }
 
@@ -451,7 +482,23 @@ export async function sendMarketReportToUser(bot, userId){
   const snap=await getMarketSnapshot(['BTC','ETH','PAXG']);
   if(!snap?.ok) return { ok:false };
   const lang=await resolveUserLang(userId).catch(()=> 'ru');
-  const html=await buildMorningReportHtml(snap.snapshots, lang, snap.atIsoKyiv || '', snap.fetchedAt ?? null);
-  await bot.telegram.sendMessage(userId, html, { parse_mode:'HTML' });
+  const parts = buildMorningReportParts(snap.snapshots, lang, snap.atIsoKyiv || '', snap.fetchedAt ?? null, { btcDominancePct: snap.btcDominancePct, spx: snap.spx });
+  const isEn = String(lang).toLowerCase().startsWith('en');
+  const kb = { inline_keyboard: [[{ text: isEn ? 'Get data guide' : 'Получить справку по отчёту', callback_data: 'market_help' }]] };
+  await bot.telegram.sendMessage(userId, parts.headHtml, { parse_mode:'HTML', reply_markup: kb });
   return { ok:true };
+}
+
+export async function editReportMessageWithHelp(ctx){
+  try {
+    const userId = ctx.from?.id;
+    const lang = await resolveUserLang(userId).catch(()=> 'ru');
+    const snap=await getMarketSnapshot(['BTC','ETH','PAXG']);
+    if(!snap?.ok) { await ctx.answerCbQuery(); return; }
+    const parts = buildMorningReportParts(snap.snapshots, lang, snap.atIsoKyiv || '', snap.fetchedAt ?? null, { btcDominancePct: snap.btcDominancePct, spx: snap.spx });
+    await ctx.editMessageText(parts.fullHtml, { parse_mode:'HTML', reply_markup: { inline_keyboard: [] } });
+    await ctx.answerCbQuery();
+  } catch {
+    try { await ctx.answerCbQuery('Ошибка'); } catch {}
+  }
 }
