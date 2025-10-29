@@ -51,19 +51,37 @@ function riskBar(score){
   const n=Math.max(0,Math.min(10,Math.round((score||0)*10)));
   return '🟥'.repeat(n)+'⬜'.repeat(10-n);
 }
+
 function priceChangeRisk(pct24h){
-  if(typeof pct24h!=='number'||Number.isNaN(pct24h)||pct24h<=0) return 0;
-  return Math.min(1,pct24h/10);
+  if(!Number.isFinite(pct24h)) return 0;
+  const mag = Math.min(1, Math.abs(pct24h)/8);
+  return mag;
+}
+function fundingRiskFromNow(f){
+  if(!Number.isFinite(f)) return 0;
+  return Math.min(1, Math.abs(f)*10000/30);
+}
+function sentimentRiskFromLS(longPct){
+  if(!Number.isFinite(longPct)) return 0;
+  if(longPct>=60) return Math.min(1, (longPct-60)/15);
+  if(longPct<=40) return Math.min(1, (40-longPct)/15);
+  return 0;
 }
 function aggregateScore({ priceRisk, fundingRisk=0, sentimentRisk=0 }){
-  return Math.max(0, Math.min(1, 0.7*priceRisk + 0.2*fundingRisk + 0.1*sentimentRisk));
+  const s = 0.5*priceRisk + 0.2*fundingRisk + 0.3*sentimentRisk;
+  return Math.max(0, Math.min(1, s));
 }
 
 function fearGreedBarColorized(v){
   const val = Number(v);
   if (!Number.isFinite(val) || val < 0 || val > 100) return '⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜';
   const filled = Math.max(0, Math.min(10, Math.round(val/10)));
-  const color = val <= 24 ? '🟥' : (val <= 44 ? '🟧' : (val <= 54 ? '🟨' : (val <= 74 ? '🟩' : '🟩')));
+  let color = '🟨';
+  if (val <= 24) color = '🟥';
+  else if (val <= 44) color = '🟧';
+  else if (val <= 54) color = '🟨';
+  else if (val <= 74) color = '🟩';
+  else color = '🟩';
   return color.repeat(filled) + '⬜'.repeat(10 - filled);
 }
 function translateFgiClass(cls, isEn) {
@@ -93,7 +111,6 @@ function renderLsBlock(ls, isEn, label){
   const greens = Math.max(0, Math.min(10, Math.round(ls.longPct/10)));
   const reds   = 10 - greens;
   const bar = '🟩'.repeat(greens) + '🟥'.repeat(reds);
-  if (isEn) return `${lbl}:\n• Longs ${B(`${ls.longPct}%`)} | Shorts ${B(`${ls.shortPct}%`)}\n${bar}`;
   return `${lbl}:\n• Longs ${B(`${ls.longPct}%`)} | Shorts ${B(`${ls.shortPct}%`)}\n${bar}`;
 }
 function formatKyiv(tsEpoch, tsIso) {
@@ -152,6 +169,24 @@ function conciseRiskAdvice(score){
   return 'Держать/аккуратно усреднять; риск не повышать.';
 }
 
+function flowsHeaderLine(sym, isEn){
+  const now = Number(sym?.netFlowsUSDNow);
+  const prev = Number(sym?.netFlowsUSDPrev);
+  const diff = Number(sym?.netFlowsUSDDiff);
+  if (!Number.isFinite(now) && !Number.isFinite(prev)) return '—';
+  const sNowMoney = Number.isFinite(now) ? `${now>=0?'+':'−'}$${humanFmt(Math.abs(now))}` : '—';
+  const sNowAbbr  = Number.isFinite(now) ? `${now>=0?'+':'−'}${abbrevWithUnit(Math.abs(now), isEn)}` : '';
+  let deltaPart = '';
+  if (Number.isFinite(prev) && Math.abs(prev) > 0 && Number.isFinite(diff)) {
+    const diffPct = (diff/Math.abs(prev))*100;
+    if (Number.isFinite(diffPct)) {
+      const circ = circleByDelta(diffPct);
+      deltaPart = ` ${circ}(${B(pctStr(diffPct))} ${isEn?'vs prev 24h':'к пред. 24ч'})`;
+    }
+  }
+  return `${B(`${sNowMoney}`)} (${B(sNowAbbr)})${deltaPart}`;
+}
+
 export async function buildMorningReportHtml(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=null){
   const isEn=String(lang).toLowerCase().startsWith('en');
 
@@ -176,7 +211,7 @@ export async function buildMorningReportHtml(snapshots, lang='ru', tsIsoKyiv='',
     fgi:'Индекс страха и жадности *²',
     volumes:'Объем 24 ч *³',
     rsi:'RSI (14) *⁴',
-    flows:'Net flows *⁵',
+    flows:'Притоки/оттоки *⁵',
     funding:'Funding rate (avg) *⁶',
     ls:'Лонги vs Шорты *⁷',
     risks:'Риск *⁸',
@@ -187,6 +222,7 @@ export async function buildMorningReportHtml(snapshots, lang='ru', tsIsoKyiv='',
 
   const when = formatKyiv(tsEpoch, tsIsoKyiv);
   const asOf = isEn ? when.en : when.ru;
+  const tzSuffix = ' (Europe/Kyiv)';
 
   const priceLine = (sym, label) => {
     const pct = Number(sym?.pct24);
@@ -269,6 +305,11 @@ export async function buildMorningReportHtml(snapshots, lang='ru', tsIsoKyiv='',
   if (snapshots.ETH) lines.push(`• ETH: ${rsiLine((snapshots.ETH)||{})}`);
   lines.push('');
 
+  lines.push(BU(T.flows));
+  if (snapshots.BTC) lines.push(`• BTC: ${flowsHeaderLine((snapshots.BTC)||{}, isEn)}`);
+  if (snapshots.ETH) lines.push(`• ETH: ${flowsHeaderLine((snapshots.ETH)||{}, isEn)}`);
+  lines.push('');
+
   lines.push(BU(T.funding));
   if (snapshots.BTC) lines.push(`• BTC: ${fundingLine((snapshots.BTC)||{})}`);
   if (snapshots.ETH) lines.push(`• ETH: ${fundingLine((snapshots.ETH)||{})}`);
@@ -280,10 +321,18 @@ export async function buildMorningReportHtml(snapshots, lang='ru', tsIsoKyiv='',
   lines.push('');
 
   lines.push(BU(T.risks));
-  const rBscore = Number.isFinite((snapshots.BTC||{}).score) ? (snapshots.BTC||{}).score : 0;
-  const rEscore = Number.isFinite((snapshots.ETH||{}).score) ? (snapshots.ETH||{}).score : 0;
-  const rBbar = `${riskBar(rBscore)} ${B(`${Math.round(rBscore*100)}%`)}`;
-  const rEbar = `${riskBar(rEscore)} ${B(`${Math.round(rEscore*100)}%`)}`;
+  const scoreBTC = aggregateScore({
+    priceRisk: priceChangeRisk((snapshots.BTC||{}).pct24),
+    fundingRisk: fundingRiskFromNow((snapshots.BTC||{}).fundingNow),
+    sentimentRisk: sentimentRiskFromLS((snapshots.BTC||{}).longShort?.longPct)
+  });
+  const scoreETH = aggregateScore({
+    priceRisk: priceChangeRisk((snapshots.ETH||{}).pct24),
+    fundingRisk: fundingRiskFromNow((snapshots.ETH||{}).fundingNow),
+    sentimentRisk: sentimentRiskFromLS((snapshots.ETH||{}).longShort?.longPct)
+  });
+  const rBbar = `${riskBar(scoreBTC)} ${B(`${Math.round(scoreBTC*100)}%`)}`;
+  const rEbar = `${riskBar(scoreETH)} ${B(`${Math.round(scoreETH*100)}%`)}`;
   if (snapshots.BTC) lines.push(`• BTC:\n${rBbar}`);
   if (snapshots.ETH) lines.push(`• ETH:\n${rEbar}`);
   lines.push('');
@@ -296,8 +345,6 @@ export async function buildMorningReportHtml(snapshots, lang='ru', tsIsoKyiv='',
   if (snapshots.ETH) lines.push(`• ${B('ETH:')} ${concisePriceAdvice((snapshots.ETH||{}).pct24)}`);
   if (snapshots.PAXG) lines.push(`• ${B('PAXG:')} ${concisePriceAdvice((snapshots.PAXG||{}).pct24)}`);
 
-  lines.push('');
-  lines.push(`${B('² Индекс страха и жадности')} — сводный индикатор настроений по BTC.`);
   const fgiVal = Number((snapshots.BTC||{}).fgiValue);
   let fgiAdvice = 'Нейтрально — держать план; не бегать за движением.';
   if (Number.isFinite(fgiVal)) {
@@ -305,6 +352,9 @@ export async function buildMorningReportHtml(snapshots, lang='ru', tsIsoKyiv='',
     else if (fgiVal >= 75) fgiAdvice = 'Экстремальная жадность — частичная фиксация; не открывать новые агрессивные лонги.';
     else if (fgiVal >= 55) fgiAdvice = 'Жадность — снижать плечо; фиксировать по правилам.';
   }
+
+  lines.push('');
+  lines.push(`${B('² Индекс страха и жадности')} — сводный индикатор настроений по BTC.`);
   lines.push(`• ${B('BTC/Market:')} ${fgiAdvice}`);
 
   lines.push('');
@@ -334,23 +384,21 @@ export async function buildMorningReportHtml(snapshots, lang='ru', tsIsoKyiv='',
 
   lines.push('');
   lines.push(`${B('⁸ Риск')} — агрегат цены, funding и L/S (0% низкий, 100% высокий).`);
-  if (snapshots.BTC) lines.push(`• ${B('BTC:')} ${conciseRiskAdvice((snapshots.BTC||{}).score)}`);
-  if (snapshots.ETH) lines.push(`• ${B('ETH:')} ${conciseRiskAdvice((snapshots.ETH||{}).score)}`);
+  if (snapshots.BTC) lines.push(`• ${B('BTC:')} ${conciseRiskAdvice(scoreBTC)}`);
+  if (snapshots.ETH) lines.push(`• ${B('ETH:')} ${conciseRiskAdvice(scoreETH)}`);
 
   if (asOf) {
     lines.push('');
-    lines.push(`${T.asof}: ${B(asOf)} - ${T.updatesNote}`);
+    lines.push(`${T.asof}: ${B(`${asOf}${tzSuffix}`)} - ${T.updatesNote}`);
   }
 
   return lines.join('\n');
 }
 
 function pickSubsetBySymbols(snapshots, symbols){
-  const out={}
-  for(const s of symbols){
-    if (snapshots?.[s]) out[s]=snapshots[s]
-  }
-  return out
+  const out={};
+  for(const s of symbols){ if (snapshots?.[s]) out[s]=snapshots[s]; }
+  return out;
 }
 
 export async function getMarketSnapshot(symbols=['BTC','ETH','PAXG']){
