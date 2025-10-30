@@ -3,6 +3,8 @@ import { resolveUserLang } from './cache.js';
 import { usersCollection, client } from './db.js';
 import { MARKET_BATCH_SIZE, MARKET_BATCH_PAUSE_MS } from './constants.js';
 
+const ADMIN_ID = process.env.CREATOR_ID ? String(process.env.CREATOR_ID) : '';
+
 const esc = (s) => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 const B = (s) => `<b>${esc(s)}</b>`;
 const U = (s) => `<u>${esc(s)}</u>`;
@@ -11,6 +13,14 @@ const nearZero = (v) => Number.isFinite(v) && Math.abs(v) < 1e-8;
 const isNum = (v) => Number.isFinite(Number(v));
 
 function humanFmt(n) {
+  if (!Number.isFinite(n)) return '—';
+  try {
+    if (Math.abs(n) >= 1000) return Intl.NumberFormat('ru-RU',{maximumFractionDigits:0}).format(Math.round(n));
+    if (Math.abs(n) >= 1)   return Intl.NumberFormat('ru-RU',{maximumFractionDigits:2}).format(Number(n.toFixed(2)));
+    return Number(n).toPrecision(6).replace(/(?:\.0+$|(?<=\.[0-9]*?)0+)$/,'');
+  } catch { return String(n); }
+}
+function humanFmtEN(n) {
   if (!Number.isFinite(n)) return '—';
   try {
     if (Math.abs(n) >= 1000) return Intl.NumberFormat('en-US',{maximumFractionDigits:0}).format(Math.round(n));
@@ -29,8 +39,6 @@ function abbrevWithUnit(n, isEn=false) {
 }
 function fmtFunding(v) { if(!Number.isFinite(v)) return '—'; return Number(v).toFixed(8).replace(/\.0+$|0+$/,''); }
 function circleByDelta(x) { if(!Number.isFinite(x) || x===0) return '⚪'; return x>0?'🟢':'🔴'; }
-function pctStr(v) { return `${v>0?'+':''}${v.toFixed(2)}%`; }
-function ppStr(v){ const sign = v>0?'+':''; return `${sign}${v.toFixed(2)} п.п.`; }
 
 function riskBar(score){
   const n=Math.max(0,Math.min(10,Math.round((score||0)*10)));
@@ -93,9 +101,9 @@ function renderLsBlock(ls, isEn, label){
   const greens = Math.max(0, Math.min(10, Math.round(ls.longPct/10)));
   const reds   = 10 - greens;
   const bar = '🟩'.repeat(greens) + '🟥'.repeat(reds);
-  const l = isEn ? 'Longs' : 'Longs';
-  const s = isEn ? 'Shorts' : 'Shorts';
-  return `${lbl}:\n• ${l} ${B(`${ls.longPct}%`)} | ${s} ${B(`${ls.shortPct}%`)}\n${bar}`;
+  const L = isEn ? 'Longs' : 'Лонги';
+  const S = isEn ? 'Shorts' : 'Шорты';
+  return `${lbl}:\n• ${L} ${B(`${ls.longPct}%`)} | ${S} ${B(`${ls.shortPct}%`)}\n${bar}`;
 }
 function formatKyiv(tsEpoch, tsIso) {
   try {
@@ -113,43 +121,43 @@ function formatKyiv(tsEpoch, tsIso) {
   }
 }
 
-function concisePriceAdvice(pct, isEn){
-  if (!Number.isFinite(pct)) return isEn?'Wait for confirmations; no entry without setup.':'Ждать подтверждений; не входить без сетапа.';
+function concisePriceAdvice(pct,isEn){
+  if (!Number.isFinite(pct)) return isEn?'Wait for confirmations; don’t enter without a setup.':'Ждать подтверждений; не входить без сетапа.';
   if (pct >= 3) return isEn?'Hold/partial TP; don’t chase or add leverage.':'Держать/частично фиксировать; не догонять и не увеличивать плечо.';
   if (pct >= 1) return isEn?'Hold/soft DCA; avoid impulsive leveraged longs.':'Держать/мягкий DCA; избегать импульсных лонгов с плечом.';
-  if (pct <= -3) return isEn?'Wait for reversal; don’t catch knives; reduce size.':'Ждать разворота; не ловить ножи, размер снижать.';
-  if (pct <= -1) return isEn?'Wait for confirmations; don’t raise risk.':'Ждать подтверждений; риск не повышать.';
+  if (pct <= -3) return isEn?'Wait for reversal; don’t catch knives, reduce size.':'Ждать разворота; не ловить ножи, размер снижать.';
+  if (pct <= -1) return isEn?'Wait for confirmations; do not raise risk.':'Ждать подтверждений; риск не повышать.';
   return isEn?'Neutral; entries only on signals.':'Нейтрально; входы только по сигналу.';
 }
-function conciseRsiAdvice(v, isEn){
+function conciseRsiAdvice(v,isEn){
   if (!Number.isFinite(v)) return isEn?'No RSI — rely on price/volume.':'Без RSI — опора на цену/объём.';
-  if (v >= 70) return isEn?'Overbought risk — tighten risk, watch divergences.':'Риск перекупленности — ужать риск, искать дивергенции.';
-  if (v <= 30) return isEn?'Oversold — wait for reversal, avoid blind shorts.':'Перепроданность — ждать разворота, не шортить без подтверждения.';
+  if (v >= 70) return isEn?'Overbought risk — tighten risk, watch for divergences.':'Риск перекупленности — ужать риск, искать дивергенции.';
+  if (v <= 30) return isEn?'Oversold — wait for reversal; avoid naked shorts.':'Перепроданность — ждать разворота, не шортить без подтверждения.';
   return isEn?'Momentum neutral — trade trend with stops.':'Импульс нейтрален — работать по тренду и стопам.';
 }
-function conciseFlowsAdvice(usd, isEn){
-  if (!Number.isFinite(usd)) return isEn?'Don’t rely on flows alone; use confluence.':'Не полагайся на потоки отдельно; решения по совокупности сигналов.';
-  if (usd > 0) return isEn?'Inflow — possible sell pressure; avoid all-in on pumps.':'Приток — возможные продажи; не входить all-in на росте.';
-  if (usd < 0) return isEn?'Outflow — supportive; look for spot adds on pullbacks.':'Отток — поддержка; смотреть спот-добавки на откатах.';
-  return isEn?'Flat — stick to the plan.':'Ровно — держать план.';
+function conciseFlowsAdvice(usd,isEn){
+  if (!Number.isFinite(usd)) return isEn?'Don’t rely on flows alone; decide by confluence.':'Не полагайся на потоки отдельно; решения по совокупности сигналов.';
+  if (usd > 0) return isEn?'Inflow — potential sell pressure; avoid all-in on pumps.':'Приток — возможные продажи; не входить all-in на росте.';
+  if (usd < 0) return isEn?'Outflow — supportive; longs only on confirmation.':'Отток — поддержка; лонги только по подтверждению.';
+  return isEn?'Flat — stick to plan.':'Ровно — держать план.';
 }
-function conciseFundingAdvice(f, isEn){
-  if (!Number.isFinite(f)) return isEn?'Assess without funding; don’t overweigh it.':'Оценивай без funding; не переоценивать метрику.';
-  if (Math.abs(f) > 0.0003) return isEn?'Elevated funding — cut leverage; be ready for squeezes.':'Повышенный funding — резать плечо; готовность к сквизам.';
+function conciseFundingAdvice(f,isEn){
+  if (!Number.isFinite(f)) return isEn?'Evaluate without funding; don’t overrate it.':'Оценивай без funding; не переоценивать метрику.';
+  if (Math.abs(f) > 0.0003) return isEn?'Elevated funding — cut leverage, be ready for squeezes.':'Повышенный funding — резать плечо, готовность к сквизам.';
   return isEn?'Moderate funding — don’t add leverage without confirmation.':'Умеренный funding — плечо не увеличивать без подтверждений.';
 }
-function conciseLsAdvice(longPct, isEn){
-  if (!Number.isFinite(longPct)) return isEn?'Use price/volume; L/S not informative now.':'Смотри цену/объём; L/S малоинформативен сейчас.';
-  if (longPct > 65) return isEn?'Long-crowded — long squeeze risk; don’t add leverage.':'Перегружены лонги — риск лонг-сквиза; не добавлять плечо.';
-  if (longPct < 45) return isEn?'Short-crowded — short squeeze risk; hedge shorts.':'Перегружены шорты — риск шорт-сквиза; осторожно с шортами.';
-  return isEn?'Balanced positions — no extremes.':'Баланс позиций — без крайностей.';
+function conciseLsAdvice(longPct,isEn){
+  if (!Number.isFinite(longPct)) return isEn?'Watch price/volume; L/S low value now.':'Смотри цену/объём; L/S малоинформативен сейчас.';
+  if (longPct > 65) return isEn?'Longs crowded — long-squeeze risk; don’t add leverage.':'Перегружены лонги — риск лонг-сквиза; не добавлять плечо.';
+  if (longPct < 45) return isEn?'Shorts crowded — short-squeeze risk; careful with shorts.':'Перегружены шорты — риск шорт-сквиза; осторожно с шортами.';
+  return isEn?'Balanced positioning — no extremes.':'Баланс позиций — без крайностей.';
 }
-function conciseRiskAdvice(score, isEn){
+function conciseRiskAdvice(score,isEn){
   const pct = Math.round((Number(score)||0)*100);
   if (pct >= 60) return isEn?'Reduce exposure, partial TP; avoid new aggressive longs.':'Снижать экспозицию, частично фиксировать; не открывать новые агрессивные лонги.';
   if (pct >= 30) return isEn?'Cut leverage, trail stops; don’t ramp positions.':'Резать плечо, тянуть стопы; не разгонять позицию.';
-  if (pct >= 10) return isEn?'Entries only on confirmation; no leverage adds.':'Входы только по подтверждению; не добавлять плечо.';
-  return isEn?'Hold/slow DCA; don’t raise risk.':'Держать/аккуратно усреднять; риск не повышать.';
+  if (pct >= 10) return isEn?'Entries only on confirmation; don’t add leverage.':'Входы только по подтверждению; не добавлять плечо.';
+  return isEn?'Hold / gentle DCA; do not raise risk.':'Держать/аккуратно усреднять; риск не повышать.';
 }
 
 function flowsHeaderLine(sym, isEn){
@@ -163,7 +171,7 @@ function flowsHeaderLine(sym, isEn){
     const diffPct = (diff/Math.abs(prev))*100;
     if (Number.isFinite(diffPct)) {
       const circ = circleByDelta(diffPct);
-      deltaPart = ` ${circ}(${B(pctStr(diffPct))} ${isEn?'vs prev 24h':'к пред. 24ч'})`;
+      deltaPart = ` ${circ}(${B(`${diffPct>0?'+':''}${diffPct.toFixed(2)}%`)} ${isEn?'vs prev 24h':'к пред. 24ч'})`;
     }
   }
   return `${B(abbr || '—')}${deltaPart}`;
@@ -179,7 +187,7 @@ async function findClosestWith(db, collection, target, hasValue, windowMs=48*360
   const minTs = target - windowMs;
   const maxTs = target + windowMs;
   const q = { at: { $gte: minTs, $lte: maxTs } };
-  const proj = { at:1, snapshots:1, btcDominancePct:1, spx:1 };
+  const proj = { at:1, snapshots:1, btcDominancePct:1, spx:1, totals:1 };
   const cur = db.collection(collection).find(q, { projection: proj }).sort({ at: 1 }).limit(1000);
   let best=null, bestDist=Infinity;
   while (await cur.hasNext()) {
@@ -203,7 +211,7 @@ async function findClosestWith(db, collection, target, hasValue, windowMs=48*360
 }
 
 async function findLatestDocWith(db, collection, hasValue){
-  const cur = db.collection(collection).find({}, { projection: { at:1, snapshots:1, btcDominancePct:1, spx:1 } }).sort({ at: -1 }).limit(500);
+  const cur = db.collection(collection).find({}, { projection: { at:1, snapshots:1, btcDominancePct:1, spx:1, totals:1 } }).sort({ at: -1 }).limit(500);
   while (await cur.hasNext()) { const d = await cur.next(); if (hasValue(d)) return d; }
   return null;
 }
@@ -213,7 +221,7 @@ export async function getMarketSnapshot(symbols=['BTC','ETH','PAXG']){
   const collection = process.env.COLLECTION || 'marketSnapshots';
   const db = client.db(dbName);
 
-  const freshest = await db.collection(collection).find({}, { projection: { snapshots:1, at:1, atIsoKyiv:1, btcDominancePct:1, spx:1 } }).sort({ at: -1 }).limit(1).next();
+  const freshest = await db.collection(collection).find({}, { projection: { snapshots:1, at:1, atIsoKyiv:1, btcDominancePct:1, spx:1, totals:1 } }).sort({ at: -1 }).limit(1).next();
   if (!freshest || !freshest.snapshots) return { ok:false, reason:'no_snapshot' };
 
   const subset = pickSubsetBySymbols(freshest.snapshots, symbols);
@@ -225,7 +233,7 @@ export async function getMarketSnapshot(symbols=['BTC','ETH','PAXG']){
     const target = Number(domNowDoc.at) - 24*3600*1000;
     const ref = await findClosestWith(db, collection, target, d => isNum(d?.btcDominancePct));
     const refVal = isNum(ref?.btcDominancePct) ? Number(ref.btcDominancePct) : null;
-    if (isNum(refVal)) domDeltaVal = domNowVal - refVal;
+    if (isNum(refVal) && refVal !== 0) domDeltaVal = ((domNowVal - refVal) / refVal) * 100;
   }
 
   let spxNowDoc = isNum(freshest?.spx?.price) ? freshest : (await findLatestDocWith(db, collection, d => isNum(d?.spx?.price)));
@@ -239,6 +247,8 @@ export async function getMarketSnapshot(symbols=['BTC','ETH','PAXG']){
   }
   const spx = { price: isNum(spxNowPrice) ? spxNowPrice : null, pct: isNum(spxNowPct) ? spxNowPct : null, src: spxNowDoc?.spx?.src || null };
 
+  const totals = freshest?.totals ?? null;
+
   return {
     ok:true,
     snapshots: subset,
@@ -246,7 +256,8 @@ export async function getMarketSnapshot(symbols=['BTC','ETH','PAXG']){
     atIsoKyiv: freshest.atIsoKyiv || '',
     btcDominancePct: isNum(domNowVal) ? domNowVal : null,
     btcDominanceDelta: isNum(domDeltaVal) ? domDeltaVal : null,
-    spx
+    spx,
+    totals
   };
 }
 
@@ -259,14 +270,14 @@ function buildMorningReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=nul
     fgi:'Fear & Greed *²',
     dom:'BTC Dominance *³',
     spx:'S&P 500 *⁴',
-    volumes:'24h Volume *⁵',
-    rsi:'RSI (14) *⁶',
-    flows:'Net flows *⁷',
-    funding:'Funding rate (avg) *⁸',
-    ls:'Longs vs Shorts *⁹',
-    risks:'Risk *¹⁰',
+    totals:'Market cap *⁵',
+    volumes:'24h Volume *⁶',
+    rsi:'RSI (14) *⁷',
+    flows:'Net flows *⁸',
+    funding:'Funding rate (avg) *⁹',
+    ls:'Longs vs Shorts *¹⁰',
+    risks:'Risk *¹¹',
     over24h:'over 24h',
-    ref:'Guide',
     updatesNote:'updates every 30 min'
   }:{
     report:'ОТЧЕТ',
@@ -275,14 +286,14 @@ function buildMorningReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=nul
     fgi:'Индекс страха и жадности *²',
     dom:'Доминация BTC *³',
     spx:'S&P 500 *⁴',
-    volumes:'Объем 24 ч *⁵',
-    rsi:'RSI (14) *⁶',
-    flows:'Притоки/оттоки *⁷',
-    funding:'Funding rate (avg) *⁸',
-    ls:'Лонги vs Шорты *⁹',
-    risks:'Риск *¹⁰',
+    totals:'Рыночная капитализация *⁵',
+    volumes:'Объем 24 ч *⁶',
+    rsi:'RSI (14) *⁷',
+    flows:'Притоки/оттоки *⁸',
+    funding:'Фандинг (ср.) *⁹',
+    ls:'Лонги vs Шорты *¹⁰',
+    risks:'Риск *¹¹',
     over24h:'за 24 часа',
-    ref:'Справка',
     updatesNote:'обновляются каждые 30 мин'
   };
 
@@ -294,7 +305,7 @@ function buildMorningReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=nul
     const pct = Number(sym?.pct24);
     const circ = circleByDelta(pct);
     const pctTxt = Number.isFinite(pct) ? `${circ} (${B(`${pct>0?'+':''}${pct.toFixed(2)}%`)} ${T.over24h})` : '(—)';
-    const p = Number.isFinite(sym?.price) ? `$${humanFmt(sym.price)}` : '—';
+    const p = Number.isFinite(sym?.price) ? `$${isEn?humanFmtEN(sym.price):humanFmt(sym.price)}` : '—';
     const lbl = label ? `${label} ` : '';
     return `${lbl}${B(p)} ${pctTxt}`;
   };
@@ -317,7 +328,7 @@ function buildMorningReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=nul
   const rsiLine = (sym) => {
     const now = Number(sym?.rsi14), prev = Number(sym?.rsi14Prev);
     if(!Number.isFinite(now)) return '—';
-    const base = B(humanFmt(now));
+    const base = B(isEn?humanFmtEN(now):humanFmt(now));
     if(Number.isFinite(prev)){
       const d = now - prev;
       const circ = circleByDelta(d);
@@ -335,7 +346,7 @@ function buildMorningReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=nul
       const d = now - prev;
       const circ = circleByDelta(d);
       const bps = d * 10000;
-      const dTxt = `${circ}(${B(`${(bps>0?'+':'')}${(bps).toFixed(2)} б.п.`)})`;
+      const dTxt = `${circ}(${B(`${(bps>0?'+':'')}${(bps).toFixed(2)} ${isEn?'bps':'б.п.'}`)})`;
       return `${base} ${dTxt}`;
     }
     return base;
@@ -360,9 +371,9 @@ function buildMorningReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=nul
   const domDelta = typeof extras?.btcDominanceDelta === 'number' ? extras.btcDominanceDelta : null;
   const domParts = [];
   if (Number.isFinite(domPct)) domParts.push(B(`${domPct.toFixed(2)}%`));
-  if (Number.isFinite(domDelta) && Math.abs(domDelta) > 0) {
+  if (Number.isFinite(domDelta)) {
     const circ = circleByDelta(domDelta);
-    domParts.push(`${circ} (${B(pctStr(domDelta))} ${T.over24h})`);
+    domParts.push(`${circ} (${B(`${domDelta>0?'+':''}${domDelta.toFixed(2)}%`)} ${T.over24h})`);
   }
   head.push(`• ${domParts.length ? domParts.join(' ') : '—'}`);
   head.push('');
@@ -371,12 +382,26 @@ function buildMorningReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=nul
   const spxPrice = (extras?.spx && typeof extras.spx.price === 'number') ? extras.spx.price : null;
   const spxPct = (extras?.spx && typeof extras.spx.pct === 'number') ? extras.spx.pct : null;
   const spxParts = [];
-  if (Number.isFinite(spxPrice)) spxParts.push(B(humanFmt(spxPrice)));
+  if (Number.isFinite(spxPrice)) spxParts.push(B(isEn?humanFmtEN(spxPrice):humanFmt(spxPrice)));
   if (Number.isFinite(spxPct)) {
     const spxCirc = circleByDelta(spxPct);
     spxParts.push(`${spxCirc} (${B(`${spxPct>0?'+':''}${spxPct.toFixed(2)}%`)} ${T.over24h})`);
   }
   head.push(`• ${spxParts.length ? spxParts.join(' ') : '—'}`);
+  head.push('');
+
+  head.push(BU(T.totals));
+  const tot = extras?.totals || null;
+  if (tot && Number.isFinite(tot.total)) {
+    const t1 = `${B((isEn?abbrevWithUnit(tot.total,true):abbrevWithUnit(tot.total,false)) || '—')}${Number.isFinite(tot.d1) ? ` ${circleByDelta(tot.d1)}(${B(`${tot.d1>0?'+':''}${tot.d1.toFixed(2)}%`)} ${T.over24h})` : ''}`;
+    const t2 = `${B((isEn?abbrevWithUnit(tot.total2,true):abbrevWithUnit(tot.total2,false)) || '—')}${Number.isFinite(tot.d2) ? ` ${circleByDelta(tot.d2)}(${B(`${tot.d2>0?'+':''}${tot.d2.toFixed(2)}%`)} ${T.over24h})` : ''}`;
+    const t3 = `${B((isEn?abbrevWithUnit(tot.total3,true):abbrevWithUnit(tot.total3,false)) || '—')}${Number.isFinite(tot.d3) ? ` ${circleByDelta(tot.d3)}(${B(`${tot.d3>0?'+':''}${tot.d3.toFixed(2)}%`)} ${T.over24h})` : ''}`;
+    head.push(`• TOTAL: ${t1}`);
+    head.push(`• TOTAL2: ${t2}`);
+    head.push(`• TOTAL3: ${t3}`);
+  } else {
+    head.push('• —');
+  }
   head.push('');
 
   head.push(BU(T.volumes));
@@ -422,60 +447,67 @@ function buildMorningReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=nul
   head.push('');
 
   const help=[];
-  help.push(BU(T.ref));
+  help.push(BU(isEn?'Guide':'Справка'));
   help.push('');
 
-  help.push(`${B(isEn?'¹ Price: spot.':'¹ Цена: спот.')} ${isEn?'Snapshot of current price and 24h change. PAXG ≈ tokenized gold (≈1 troy oz per token).':'— кратко фиксирует текущую цену и её изменение за 24ч. PAXG — токенизированное золото (≈ 1 унция золота на 1 токен).'}`);
-  if (snapshots.BTC) help.push(`• BTC: ${concisePriceAdvice((snapshots.BTC||{}).pct24, isEn)}`);
-  if (snapshots.ETH) help.push(`• ETH: ${concisePriceAdvice((snapshots.ETH||{}).pct24, isEn)}`);
-  if (snapshots.PAXG) help.push(`• PAXG: ${concisePriceAdvice((snapshots.PAXG||{}).pct24, isEn)}`);
+  help.push(`${B(isEn?'¹ Price: spot.':'¹ Цена: спот.')} ${isEn?'— snapshot of current price and 24h change. PAXG = tokenized gold (≈ 1 troy oz per token).':'— кратко фиксирует текущую цену и её изменение за 24ч. PAXG — токенизированное золото (≈ 1 унция золота на 1 токен).'}${snapshots.PAXG?'':''}`);
+  if (snapshots.BTC) help.push(`• ${B('BTC:')} ${isEn?'Wait for confirmations; do not raise risk.':'Ждать подтверждений; риск не повышать.'}`);
+  if (snapshots.ETH) help.push(`• ${B('ETH:')} ${isEn?'Wait for confirmations; do not raise risk.':'Ждать подтверждений; риск не повышать.'}`);
+  if (snapshots.PAXG) help.push(`• ${B('PAXG:')} ${isEn?'Wait for confirmations; do not raise risk.':'Ждать подтверждений; риск не повышать.'}`);
 
   const fgiVal = Number((snapshots.BTC||{}).fgiValue);
   let fgiAdvice = isEn?'Neutral — stick to plan; don’t chase.':'Нейтрально — держать план; не бегать за движением.';
   if (Number.isFinite(fgiVal)) {
     if (fgiVal <= 24) fgiAdvice = isEn?'Extreme fear — reduce size; A+ setups only.':'Экстремальный страх — размер снижать, входы только по A+ сетапам.';
-    else if (fgiVal <= 44) fgiAdvice = isEn?'Fear — entries on confirmations only; no blind averaging.':'Страх — входы только по подтверждениям; не усреднять без стопа.';
+    else if (fgiVal <= 44) fgiAdvice = isEn?'Fear — entries only on confirmations; no averaging without stop.':'Страх — входы только по подтверждениям; не усреднять без стопа.';
     else if (fgiVal >= 75) fgiAdvice = isEn?'Extreme greed — cut leverage; take profits per plan.':'Экстремальная жадность — снижать плечо; фиксировать по правилам.';
-    else if (fgiVal >= 55) fgiAdvice = isEn?'Greed — tighten risk; partial TP.':'Жадность — резать плечо, частичная фиксация по плану.';
+    else if (fgiVal >= 55) fgiAdvice = isEn?'Greed — trim leverage; partial TP by rules.':'Жадность — резать плечо, частичная фиксация по плану.';
+    else fgiAdvice = isEn?'Neutral — stick to plan; don’t chase.':'Нейтрально — держать план; не бегать за движением.';
   }
 
   help.push('');
-  help.push(`${B(isEn?'² Fear & Greed':'² Индекс страха и жадности')} ${isEn? '— market sentiment composite for BTC.':'— сводный индикатор настроений по BTC.'}`);
-  help.push(`• ${isEn?'BTC/Market:':'BTC/Market:'} ${fgiAdvice}`);
+  help.push(`${B(isEn?'² Fear & Greed':'² Индекс страха и жадности')} ${isEn?'— composite BTC sentiment.':'— сводный индикатор настроений по BTC.'}`);
+  help.push(`• ${B(isEn?'BTC/Market:':'BTC/Market:')} ${fgiAdvice}`);
 
   help.push('');
-  help.push(`${B(isEn?'³ BTC Dominance':'³ Доминация BTC')} ${isEn?'— BTC share of total crypto market cap. Rising → rotation to BTC; falling → interest in alts.':'— доля BTC в общей капитализации рынка. Рост — капитал уходит в BTC, падение — интерес к альтам.'}`);
+  help.push(`${B(isEn?'³ BTC Dominance':'³ Доминация BTC')} ${isEn?'— BTC share of total crypto market cap. Rising = capital rotates to BTC; falling = interest in alts.':'— доля BTC в общей капитализации рынка. Рост — капитал уходит в BTC; падение — интерес к альтам.'}`);
 
   help.push('');
-  help.push(`${B('⁴ S&P 500')} ${isEn?'— traditional risk barometer; weakness pressures crypto, strength supports risk.':'— ориентир риска на традиционных рынках; слабость часто давит на крипту, рост поддерживает риск.'}`);
+  help.push(`${B('⁴ S&P 500')} ${isEn?'— broad risk barometer; weakness pressures crypto, strength supports risk.':'— ориентир риска; слабость давит на крипту, рост поддерживает риск.'}`);
 
   help.push('');
-  help.push(`${B(isEn?'⁵ 24h Volume':'⁵ Объем 24 ч')} ${isEn?'— confirms/weakens price moves.':'— подтверждает/ослабляет движение цены.'}`);
+  help.push(`${B(isEn?'⁵ Market cap':'⁵ Рыночная капитализация')} ${isEn?'— breadth of the crypto market.':'— ширина/масштаб крипторынка.'}`);
+  help.push(`• ${B('TOTAL')}: ${isEn?'Total crypto market cap.':'Вся капитализация крипторынка.'} ${isEn?'When falling — reduce risk; when rising with volume — follow trend, partial TP by plan.':'При падении — снижать риск; при росте на объёме — работать по тренду, частичная фиксация по плану.'}`);
+  help.push(`• ${B(isEn?'TOTAL2 (ex-BTC)':'TOTAL2 (без BTC)')}: ${isEn?'Market cap without BTC — proxy for altcoin breadth.':'Капитализация без BTC — прокси широты «альтсезона».'} ${isEn?'Rising TOTAL2 > TOTAL suggests alt rotation; fading warns to avoid weak alts.':'Рост TOTAL2 относительно TOTAL — ротация в альты; угасание — не залетать в слабые альты.'}`);
+  help.push(`• ${B(isEn?'TOTAL3 (ex-BTC & ETH)':'TOTAL3 (без BTC и ETH)')}: ${isEn?'Altcoins without BTC & ETH — high beta segment.':'Альты без BTC и ETH — высокобета-сегмент.'} ${isEn?'Use for risk-on/off in small/mid-caps; manage size strictly.':'Используй для оценки risk-on/off в small/mid-cap; строго контролируй размер.'}`);
 
   help.push('');
-  help.push(`${B('⁶ RSI(14)')} ${isEn?'— momentum: ≈70 overbought, ≈30 oversold.':'— импульс: ≈70 перегрев, ≈30 перепроданность.'}`);
-  if (snapshots.BTC) help.push(`• BTC: ${conciseRsiAdvice((snapshots.BTC||{}).rsi14, isEn)}`);
-  if (snapshots.ETH) help.push(`• ETH: ${conciseRsiAdvice((snapshots.ETH||{}).rsi14, isEn)}`);
+  help.push(`${B(isEn?'⁶ 24h Volume':'⁶ Объем 24 ч')} ${isEn?'— confirms/weakens price moves.':'— подтверждает/ослабляет движение цены.'}`);
 
   help.push('');
-  help.push(`${B(isEn?'⁷ Net flows':'⁷ Net flows')} ${isEn?'— exchange inflows/outflows (inflow=sell pressure, outflow=support).':'— чистые притоки/оттоки на биржи (приток = давление продажи, отток = поддержка).'}`);
-  if (snapshots.BTC) help.push(`• BTC: ${conciseFlowsAdvice((snapshots.BTC||{}).netFlowsUSDNow, isEn)}`);
-  if (snapshots.ETH) help.push(`• ETH: ${conciseFlowsAdvice((snapshots.ETH||{}).netFlowsUSDNow, isEn)}`);
+  help.push(`${B('⁷ RSI(14)')} ${isEn?'— momentum: ~70 overbought, ~30 oversold.':'— импульс: ≈70 перегрев, ≈30 перепроданность.'}`);
+  if (snapshots.BTC) help.push(`• ${B('BTC:')} ${conciseRsiAdvice((snapshots.BTC||{}).rsi14,isEn)}`);
+  if (snapshots.ETH) help.push(`• ${B('ETH:')} ${conciseRsiAdvice((snapshots.ETH||{}).rsi14,isEn)}`);
 
   help.push('');
-  help.push(`${B('⁸ Funding')} ${isEn?'— perp rate between longs & shorts.':'— ставка между лонгами и шортами на фьючерсах.'}`);
-  if (snapshots.BTC) help.push(`• BTC: ${conciseFundingAdvice((snapshots.BTC||{}).fundingNow, isEn)}`);
-  if (snapshots.ETH) help.push(`• ETH: ${conciseFundingAdvice((snapshots.ETH||{}).fundingNow, isEn)}`);
+  help.push(`${B(isEn?'⁸ Net flows':'⁸ Net flows')} ${isEn?'— exchange inflows/outflows (inflow = sell pressure, outflow = support).':'— чистые притоки/оттоки на биржи (приток = давление продажи, отток = поддержка).'}`);
+  if (snapshots.BTC) help.push(`• ${B('BTC:')} ${conciseFlowsAdvice((snapshots.BTC||{}).netFlowsUSDNow,isEn)}`);
+  if (snapshots.ETH) help.push(`• ${B('ETH:')} ${conciseFlowsAdvice((snapshots.ETH||{}).netFlowsUSDNow,isEn)}`);
 
   help.push('');
-  help.push(`${B(isEn?'⁹ Longs/Shorts (L/S)':'⁹ Лонги/Шорты (L/S)')} ${isEn?'— imbalance raises squeeze risk.':'— перекос повышает риск сквиза.'}`);
-  if (snapshots.BTC) help.push(`• BTC: ${conciseLsAdvice((snapshots.BTC||{}).longShort?.longPct, isEn)}`);
-  if (snapshots.ETH) help.push(`• ETH: ${conciseLsAdvice((snapshots.ETH||{}).longShort?.longPct, isEn)}`);
+  help.push(`${B(isEn?'⁹ Funding':'⁹ Funding')} ${isEn?'— perp rate between longs & shorts.':'— ставка между лонгами и шортами на фьючерсах.'}`);
+  if (snapshots.BTC) help.push(`• ${B('BTC:')} ${conciseFundingAdvice((snapshots.BTC||{}).fundingNow,isEn)}`);
+  if (snapshots.ETH) help.push(`• ${B('ETH:')} ${conciseFundingAdvice((snapshots.ETH||{}).fundingNow,isEn)}`);
 
   help.push('');
-  help.push(`${B(isEn?'¹⁰ Risk':'¹⁰ Риск')} ${isEn?'— aggregate of price, funding, and L/S (0% low, 100% high).':'— агрегат цены, funding и L/S (0% низкий, 100% высокий).'}`);
-  if (snapshots.BTC) help.push(`• BTC: ${conciseRiskAdvice(scoreBTC, isEn)}`);
-  if (snapshots.ETH) help.push(`• ETH: ${conciseRiskAdvice(scoreETH, isEn)}`);
+  help.push(`${B(isEn?'¹⁰ Longs/Shorts (L/S)':'¹⁰ Лонги/Шорты (L/S)')} ${isEn?'— imbalance raises squeeze risk.':'— перекос повышает риск сквиза.'}`);
+  if (snapshots.BTC) help.push(`• ${B('BTC:')} ${conciseLsAdvice((snapshots.BTC||{}).longShort?.longPct,isEn)}`);
+  if (snapshots.ETH) help.push(`• ${B('ETH:')} ${conciseLsAdvice((snapshots.ETH||{}).longShort?.longPct,isEn)}`);
+
+  help.push('');
+  help.push(`${B(isEn?'¹¹ Risk':'¹¹ Риск')} ${isEn?'— aggregate of price, funding, and L/S (0% low, 100% high).':'— агрегат цены, funding и L/S (0% низкий, 100% высокий).'}`);
+  if (snapshots.BTC) help.push(`• ${B('BTC:')} ${conciseRiskAdvice(scoreBTC,isEn)}`);
+  if (snapshots.ETH) help.push(`• ${B('ETH:')} ${conciseRiskAdvice(scoreETH,isEn)}`);
 
   if (asOf) {
     help.push('');
@@ -493,6 +525,13 @@ export async function buildMorningReportHtml(snapshots, lang='ru', tsIsoKyiv='',
   return fullHtml;
 }
 
+async function maybeNotifyAdmin(bot, text){
+  try {
+    if (!ADMIN_ID) return;
+    await bot.telegram.sendMessage(ADMIN_ID, text);
+  } catch {}
+}
+
 export async function startMarketMonitor(){ return { ok:true }; }
 
 export async function broadcastMarketSnapshot(bot, { batchSize=MARKET_BATCH_SIZE || 25, pauseMs=MARKET_BATCH_PAUSE_MS || 400 } = {}){
@@ -508,7 +547,7 @@ export async function broadcastMarketSnapshot(bot, { batchSize=MARKET_BATCH_SIZE
   const snap = await getMarketSnapshot(['BTC','ETH','PAXG']).catch(()=>null);
   if (!snap?.ok) return { ok:false, reason:'snapshot_failed', delivered:0, users:recipients.length };
 
-  const { snapshots, atIsoKyiv, fetchedAt, btcDominancePct, btcDominanceDelta, spx } = snap;
+  const { snapshots, atIsoKyiv, fetchedAt, btcDominancePct, btcDominanceDelta, spx, totals } = snap;
 
   let delivered = 0;
   for (let i = 0; i < recipients.length; i += batchSize) {
@@ -516,7 +555,7 @@ export async function broadcastMarketSnapshot(bot, { batchSize=MARKET_BATCH_SIZE
     await Promise.all(chunk.map(async (u) => {
       try {
         const lang = await resolveUserLang(u.userId).catch(() => u.lang || 'ru');
-        const parts = buildMorningReportParts(snapshots, lang, atIsoKyiv, fetchedAt, { btcDominancePct, btcDominanceDelta, spx });
+        const parts = buildMorningReportParts(snapshots, lang, atIsoKyiv, fetchedAt, { btcDominancePct, btcDominanceDelta, spx, totals });
         const isEn = String(lang).toLowerCase().startsWith('en');
         const kb = { inline_keyboard: [[{ text: isEn ? 'Get data guide' : 'Получить справку по отчёту', callback_data: 'market_help' }]] };
         await bot.telegram.sendMessage(u.userId, parts.headHtml, { parse_mode:'HTML', reply_markup: kb });
@@ -552,7 +591,7 @@ export async function sendMarketReportToUser(bot, userId){
     lang,
     snap.atIsoKyiv || '',
     snap.fetchedAt ?? null,
-    { btcDominancePct: snap.btcDominancePct, btcDominanceDelta: snap.btcDominanceDelta, spx: snap.spx }
+    { btcDominancePct: snap.btcDominancePct, btcDominanceDelta: snap.btcDominanceDelta, spx: snap.spx, totals: snap.totals }
   );
   const isEn = String(lang).toLowerCase().startsWith('en');
   const kb = { inline_keyboard: [[{ text: isEn ? 'Get data guide' : 'Получить справку по отчёту', callback_data: 'market_help' }]] };
@@ -564,17 +603,21 @@ export async function editReportMessageWithHelp(ctx){
   try {
     const userId = ctx.from?.id;
     const lang = await resolveUserLang(userId).catch(()=> 'ru');
+    const isEn = String(lang).toLowerCase().startsWith('en');
+    const okText = isEn ? 'Done.' : 'Готово.';
+    const errText = isEn ? 'Error' : 'Ошибка';
+
     const snap=await getMarketSnapshot(['BTC','ETH','PAXG']);
-    if(!snap?.ok) { await ctx.answerCbQuery(); return; }
+    if(!snap?.ok) { await ctx.answerCbQuery(errText); return; }
     const parts = buildMorningReportParts(
       snap.snapshots,
       lang,
       snap.atIsoKyiv || '',
       snap.fetchedAt ?? null,
-      { btcDominancePct: snap.btcDominancePct, btcDominanceDelta: snap.btcDominanceDelta, spx: snap.spx }
+      { btcDominancePct: snap.btcDominancePct, btcDominanceDelta: snap.btcDominanceDelta, spx: snap.spx, totals: snap.totals }
     );
     await ctx.editMessageText(parts.fullHtml, { parse_mode:'HTML', reply_markup: { inline_keyboard: [] } });
-    await ctx.answerCbQuery();
+    await ctx.answerCbQuery(okText);
   } catch {
     try { await ctx.answerCbQuery('Ошибка'); } catch {}
   }

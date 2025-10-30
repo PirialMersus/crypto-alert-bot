@@ -228,7 +228,7 @@ async function handleMarketSnapshotRequest(ctx) {
   try {
     const pref = await resolveUserLang(ctx.from?.id, null, ctx.from?.language_code).catch(() => ctx.from?.language_code || 'ru');
     const isEn = String(pref).toLowerCase().startsWith('en');
-    if (isLocked(ctx.from.id)) { try { await ctx.reply(isEn ? '⏳ Уже формирую отчёт…' : '⏳ Уже формирую отчёт…', getMainMenuBusy(ctx.from.id, pref)); } catch {} return; }
+    if (isLocked(ctx.from.id)) { try { await ctx.reply(isEn ? '⏳ Already generating the report…' : '⏳ Уже формирую отчёт…', getMainMenuBusy(ctx.from.id, pref)); } catch {} return; }
     lockReport(ctx.from.id, 60000);
     try { await ctx.telegram.sendChatAction(ctx.chat.id, 'typing'); } catch {}
     const typingTimer = startTyping(ctx);
@@ -236,7 +236,7 @@ async function handleMarketSnapshotRequest(ctx) {
     if (state) state.typingTimer = typingTimer;
     let startedMsgId = null;
     try {
-      const m = await ctx.reply(isEn ? '⏳ Формирую отчёт…' : '⏳ Формирую отчёт…', getMainMenuBusy(ctx.from.id, pref)).catch(()=>null);
+      const m = await ctx.reply(isEn ? '⏳ Generating the report…' : '⏳ Формирую отчёт…', getMainMenuBusy(ctx.from.id, pref)).catch(()=>null);
       if (m?.message_id) startedMsgId = m.message_id;
       if (state) state.startedMsgId = startedMsgId;
     } catch {}
@@ -256,7 +256,7 @@ async function handleMarketSnapshotRequest(ctx) {
       try { await ctx.reply(isEn ? '⚠️ Ошибка при формировании отчёта.' : '⚠️ Ошибка при формировании отчёта.'); } catch {}
     } finally {
       try { if (startedMsgId) { await ctx.deleteMessage(startedMsgId).catch(()=>{}); } } catch {}
-      try { await ctx.reply(isEn ? '✅ Готово.' : '✅ Готово.', getMainMenuSync(ctx.from.id, pref)); } catch {}
+      try { await ctx.reply(isEn ? '✅ Done.' : '✅ Готово.', getMainMenuSync(ctx.from.id, pref)); } catch {}
       unlockReport(ctx.from.id);
     }
   } catch (e) {
