@@ -94,6 +94,15 @@ function fgiClassFromValue(v, isEn){
   if (!key) return null;
   return isEn ? dict[key].en : dict[key].ru;
 }
+function fgiEmojiFromValue(v){
+  const val = Number(v);
+  if (!Number.isFinite(val)) return '—';
+  if (val <= 24) return '😱';
+  if (val <= 44) return '😟';
+  if (val <= 54) return '😐';
+  if (val <= 74) return '🙂';
+  return '😎';
+}
 
 function renderLsBlock(ls, isEn, label){
   const lbl = label || (isEn ? 'Asset' : 'Актив');
@@ -218,7 +227,7 @@ async function findLatestDocWith(db, collection, hasValue){
 
 export async function getMarketSnapshot(symbols=['BTC','ETH','PAXG']){
   const dbName = process.env.DB_NAME || 'crypto_alert_dev';
-  const collection = process.env.COLLECTION || 'marketSnapshots';
+  const collection = process.env.COLLLECTION || process.env.COLLECTION || 'marketSnapshots';
   const db = client.db(dbName);
 
   const freshest = await db.collection(collection).find({}, { projection: { snapshots:1, at:1, atIsoKyiv:1, btcDominancePct:1, spx:1, totals:1 } }).sort({ at: -1 }).limit(1).next();
@@ -249,6 +258,15 @@ export async function getMarketSnapshot(symbols=['BTC','ETH','PAXG']){
 
   const totals = freshest?.totals ?? null;
 
+  const fgiNow = isNum(freshest?.snapshots?.BTC?.fgiValue) ? Number(freshest.snapshots.BTC.fgiValue) : null;
+  let fgiDelta = null;
+  if (isNum(freshest?.at) && isNum(fgiNow)) {
+    const target = Number(freshest.at) - 24*3600*1000;
+    const ref = await findClosestWith(db, collection, target, d => isNum(d?.snapshots?.BTC?.fgiValue));
+    const refVal = isNum(ref?.snapshots?.BTC?.fgiValue) ? Number(ref.snapshots.BTC.fgiValue) : null;
+    if (isNum(refVal)) fgiDelta = fgiNow - refVal;
+  }
+
   return {
     ok:true,
     snapshots: subset,
@@ -257,7 +275,9 @@ export async function getMarketSnapshot(symbols=['BTC','ETH','PAXG']){
     btcDominancePct: isNum(domNowVal) ? domNowVal : null,
     btcDominanceDelta: isNum(domDeltaVal) ? domDeltaVal : null,
     spx,
-    totals
+    totals,
+    fgiNow: isNum(fgiNow) ? fgiNow : null,
+    fgiDelta: isNum(fgiDelta) ? fgiDelta : null
   };
 }
 
@@ -362,10 +382,6 @@ function buildMorningReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=nul
   if (snapshots.PAXG) head.push(`PAXG ${priceLine((snapshots.PAXG)||{}, '')}`);
   head.push('');
 
-  head.push(BU(T.fgi));
-  head.push(`• ${fgiLine((snapshots.BTC)||{})}`);
-  head.push('');
-
   head.push(BU(T.dom));
   const domPct = typeof extras?.btcDominancePct === 'number' ? extras.btcDominancePct : null;
   const domDelta = typeof extras?.btcDominanceDelta === 'number' ? extras.btcDominanceDelta : null;
@@ -376,6 +392,15 @@ function buildMorningReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=nul
     domParts.push(`${circ} (${B(`${domDelta>0?'+':''}${domDelta.toFixed(2)}%`)} ${T.over24h})`);
   }
   head.push(`• ${domParts.length ? domParts.join(' ') : '—'}`);
+  head.push('');
+
+  head.push(BU(T.fgi));
+  head.push(`• ${fgiLine((snapshots.BTC)||{})}`);
+  head.push('');
+
+  head.push(BU(T.ls));
+  if (snapshots.BTC) head.push(renderLsBlock(((snapshots.BTC)||{}).longShort, isEn, 'BTC'));
+  if (snapshots.ETH) head.push(renderLsBlock(((snapshots.ETH)||{}).longShort, isEn, 'ETH'));
   head.push('');
 
   head.push(BU(T.spx));
@@ -422,11 +447,6 @@ function buildMorningReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=nul
   head.push(BU(T.funding));
   if (snapshots.BTC) head.push(`• BTC: ${fundingLine((snapshots.BTC)||{})}`);
   if (snapshots.ETH) head.push(`• ETH: ${fundingLine((snapshots.ETH)||{})}`);
-  head.push('');
-
-  head.push(BU(T.ls));
-  if (snapshots.BTC) head.push(renderLsBlock(((snapshots.BTC)||{}).longShort, isEn, 'BTC'));
-  if (snapshots.ETH) head.push(renderLsBlock(((snapshots.ETH)||{}).longShort, isEn, 'ETH'));
   head.push('');
 
   head.push(BU(T.risks));
@@ -520,6 +540,95 @@ function buildMorningReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=nul
   return { headHtml, helpHtml, fullHtml };
 }
 
+function buildShortReportParts(snapshots, lang='ru', extras={}){
+  const isEn = String(lang).toLowerCase().startsWith('en');
+  const T = isEn ? {
+    short:'SHORT REPORT',
+    market:'Market',
+    btc:'BTC',
+    eth:'ETH',
+    gold:'Gold',
+    total:'Total',
+    rsi:'RSI (BTC)',
+    dom:'BTC.D',
+    ratio:'BTC/ETH'
+  } : {
+    short:'КРАТКИЙ ОТЧЕТ',
+    market:'Рынок',
+    btc:'BTC',
+    eth:'ETH',
+    gold:'Золото',
+    total:'Total',
+    rsi:'RSI (BTC)',
+    dom:'BTC.D',
+    ratio:'BTC/ETH'
+  };
+
+  const btc = snapshots.BTC || {};
+  const eth = snapshots.ETH || {};
+  const paxg = snapshots.PAXG || {};
+
+  const ratioNow = (Number.isFinite(btc.price) && Number.isFinite(eth.price) && eth.price!==0) ? (btc.price/eth.price) : null;
+  const ratioDelta = (Number.isFinite(btc.pct24) && Number.isFinite(eth.pct24)) ? (((1+btc.pct24/100)/(1+eth.pct24/100))-1)*100 : null;
+
+  const domPct = Number.isFinite(extras?.btcDominancePct) ? Number(extras.btcDominancePct) : null;
+  const domDelta = Number.isFinite(extras?.btcDominanceDelta) ? Number(extras.btcDominanceDelta) : null;
+
+  const fgiNow = Number.isFinite(extras?.fgiNow) ? Number(extras.fgiNow) : (Number.isFinite(btc.fgiValue) ? Number(btc.fgiValue) : null);
+  const fgiDeltaAbs = Number.isFinite(extras?.fgiDelta) ? Number(extras.fgiDelta) : null;
+  const fgiPrev = (Number.isFinite(fgiNow) && Number.isFinite(fgiDeltaAbs)) ? (fgiNow - fgiDeltaAbs) : null;
+  const fgiDeltaPct = (Number.isFinite(fgiDeltaAbs) && Number.isFinite(fgiPrev) && fgiPrev !== 0)
+    ? (fgiDeltaAbs / Math.abs(fgiPrev)) * 100
+    : null;
+
+  const goldPct = Number.isFinite(paxg.pct24) ? Number(paxg.pct24) : null;
+  const goldPrice = Number.isFinite(paxg.price) ? (isEn?`$${humanFmtEN(paxg.price)}`:`$${humanFmt(paxg.price)}`) : null;
+
+  const rsiNow = Number.isFinite(btc.rsi14) ? Number(btc.rsi14) : null;
+  const rsiPrev = Number.isFinite(btc.rsi14Prev) ? Number(btc.rsi14Prev) : null;
+  const rsiDelta = (Number.isFinite(rsiNow) && Number.isFinite(rsiPrev)) ? (rsiNow - rsiPrev) : null;
+
+  const mcap = extras?.totals || null;
+  const mcapNow = Number.isFinite(mcap?.total) ? Number(mcap.total) : null;
+  const mcapPct = Number.isFinite(mcap?.d1) ? Number(mcap.d1) : null;
+
+  const arrow = (v) => Number.isFinite(v) ? (v>0 ? '↗' : (v<0 ? '↘' : '→')) : '→';
+  const pctFmt = (v) => Number.isFinite(v) ? `${v>0?'+':''}${v.toFixed(2)}%` : '—';
+  const priceFmt = (v) => Number.isFinite(v) ? (isEn?`$${humanFmtEN(v)}`:`$${humanFmt(v)}`) : '—';
+  const capFmtTight = (v) => {
+    if (!Number.isFinite(v)) return '—';
+    return (isEn ? abbrevWithUnit(v, true) : abbrevWithUnit(v, false))
+      .replace(/ (?=[A-Za-zА-Яа-яЁё.]+$)/, '');
+  };
+  const ratioFmt = (v) => Number.isFinite(v) ? v.toFixed(4) : '—';
+  const circ = (v) => circleByDelta(Number(v));
+
+  const lines = [];
+  lines.push(`📌 ${BU(T.short)}`);
+
+  const fgiLabelTxt = Number.isFinite(fgiNow)
+    ? (isEn ? `${fgiNow} - ${fgiClassFromValue(fgiNow,true)}` : `${fgiNow} - ${fgiClassFromValue(fgiNow,false)}`)
+    : '—';
+  lines.push(`${circ(fgiDeltaPct)} ${T.market}: ${arrow(fgiDeltaPct)} ${pctFmt(fgiDeltaPct)} (${B(fgiLabelTxt)})`);
+
+  lines.push(`${circ(btc.pct24)} ${T.btc}: ${arrow(btc.pct24)} ${pctFmt(btc.pct24)} (${B(priceFmt(btc.price))})`);
+  lines.push(`${circ(eth.pct24)} ${T.eth}: ${arrow(eth.pct24)} ${pctFmt(eth.pct24)} (${B(priceFmt(eth.price))})`);
+  lines.push(`${circ(goldPct)} ${T.gold}: ${arrow(goldPct)} ${pctFmt(goldPct)} (${B(goldPrice||'—')})`);
+
+  lines.push(`${circ(mcapPct)} ${T.total}: ${arrow(mcapPct)} ${pctFmt(mcapPct)} (${B(capFmtTight(mcapNow))})`);
+
+  const rsiDeltaTxt = Number.isFinite(rsiDelta) ? (rsiDelta>0?`+${rsiDelta.toFixed(2)}`:rsiDelta.toFixed(2)) : '—';
+  const rsiValTxt = Number.isFinite(rsiNow) ? B(rsiNow.toFixed(2)) : '—';
+  lines.push(`${circ(rsiDelta)} ${T.rsi}: ${arrow(rsiDelta)} ${rsiDeltaTxt} (${rsiValTxt})`);
+
+  const domPctTxt = Number.isFinite(domPct) ? `${domPct.toFixed(2)}%` : '—';
+  lines.push(`${circ(domDelta)} ${T.dom}: ${arrow(domDelta)} ${pctFmt(domDelta)} (${B(domPctTxt)})`);
+
+  lines.push(`${circ(ratioDelta)} ${T.ratio}: ${arrow(ratioDelta)} ${pctFmt(ratioDelta)} (${B(ratioFmt(ratioNow))})`);
+
+  return { shortHtml: lines.join('\n') };
+}
+
 export async function buildMorningReportHtml(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=null, extras={}){
   const { fullHtml } = buildMorningReportParts(snapshots, lang, tsIsoKyiv, tsEpoch, extras);
   return fullHtml;
@@ -547,7 +656,7 @@ export async function broadcastMarketSnapshot(bot, { batchSize=MARKET_BATCH_SIZE
   const snap = await getMarketSnapshot(['BTC','ETH','PAXG']).catch(()=>null);
   if (!snap?.ok) return { ok:false, reason:'snapshot_failed', delivered:0, users:recipients.length };
 
-  const { snapshots, atIsoKyiv, fetchedAt, btcDominancePct, btcDominanceDelta, spx, totals } = snap;
+  const { snapshots, atIsoKyiv, fetchedAt, btcDominancePct, btcDominanceDelta, spx, totals, fgiNow, fgiDelta } = snap;
 
   let delivered = 0;
   for (let i = 0; i < recipients.length; i += batchSize) {
@@ -555,9 +664,12 @@ export async function broadcastMarketSnapshot(bot, { batchSize=MARKET_BATCH_SIZE
     await Promise.all(chunk.map(async (u) => {
       try {
         const lang = await resolveUserLang(u.userId).catch(() => u.lang || 'ru');
-        const parts = buildMorningReportParts(snapshots, lang, atIsoKyiv, fetchedAt, { btcDominancePct, btcDominanceDelta, spx, totals });
+        const parts = buildMorningReportParts(snapshots, lang, atIsoKyiv, fetchedAt, { btcDominancePct, btcDominanceDelta, spx, totals, fgiNow, fgiDelta });
         const isEn = String(lang).toLowerCase().startsWith('en');
-        const kb = { inline_keyboard: [[{ text: isEn ? 'Get data guide' : 'Получить справку по отчёту', callback_data: 'market_help' }]] };
+        const kb = { inline_keyboard: [[
+            { text: isEn ? 'Short report' : 'Краткий отчёт', callback_data: 'market_short' },
+            { text: isEn ? 'Guide' : 'Справка', callback_data: 'market_help' }
+          ]] };
         await bot.telegram.sendMessage(u.userId, parts.headHtml, { parse_mode:'HTML', reply_markup: kb });
         delivered++;
       } catch (err) {
@@ -591,11 +703,32 @@ export async function sendMarketReportToUser(bot, userId){
     lang,
     snap.atIsoKyiv || '',
     snap.fetchedAt ?? null,
-    { btcDominancePct: snap.btcDominancePct, btcDominanceDelta: snap.btcDominanceDelta, spx: snap.spx, totals: snap.totals }
+    { btcDominancePct: snap.btcDominancePct, btcDominanceDelta: snap.btcDominanceDelta, spx: snap.spx, totals: snap.totals, fgiNow: snap.fgiNow, fgiDelta: snap.fgiDelta }
   );
   const isEn = String(lang).toLowerCase().startsWith('en');
-  const kb = { inline_keyboard: [[{ text: isEn ? 'Get data guide' : 'Получить справку по отчёту', callback_data: 'market_help' }]] };
+  const kb = { inline_keyboard: [[
+      { text: isEn ? 'Short report' : 'Краткий отчёт', callback_data: 'market_short' },
+      { text: isEn ? 'Guide' : 'Справка', callback_data: 'market_help' }
+    ]] };
   await bot.telegram.sendMessage(userId, parts.headHtml, { parse_mode:'HTML', reply_markup: kb });
+  return { ok:true };
+}
+
+export async function sendShortReportToUser(bot, userId){
+  const snap=await getMarketSnapshot(['BTC','ETH','PAXG']);
+  if(!snap?.ok) return { ok:false };
+  const lang=await resolveUserLang(userId).catch(()=> 'ru');
+  const { shortHtml } = buildShortReportParts(
+    snap.snapshots,
+    lang,
+    { btcDominancePct: snap.btcDominancePct, btcDominanceDelta: snap.btcDominanceDelta, totals: snap.totals, fgiNow: snap.fgiNow, fgiDelta: snap.fgiDelta }
+  );
+  const isEn = String(lang).toLowerCase().startsWith('en');
+  const kb = { inline_keyboard: [[
+      { text: isEn ? 'Full report' : 'Полный отчёт', callback_data: 'market_full' },
+      { text: isEn ? 'Guide' : 'Справка', callback_data: 'market_help' }
+    ]] };
+  await bot.telegram.sendMessage(userId, shortHtml, { parse_mode:'HTML', reply_markup: kb });
   return { ok:true };
 }
 
@@ -614,11 +747,54 @@ export async function editReportMessageWithHelp(ctx){
       lang,
       snap.atIsoKyiv || '',
       snap.fetchedAt ?? null,
-      { btcDominancePct: snap.btcDominancePct, btcDominanceDelta: snap.btcDominanceDelta, spx: snap.spx, totals: snap.totals }
+      { btcDominancePct: snap.btcDominancePct, btcDominanceDelta: snap.btcDominanceDelta, spx: snap.spx, totals: snap.totals, fgiNow: snap.fgiNow, fgiDelta: snap.fgiDelta }
     );
-    await ctx.editMessageText(parts.fullHtml, { parse_mode:'HTML', reply_markup: { inline_keyboard: [] } });
+    await ctx.editMessageText(parts.fullHtml, { parse_mode:'HTML', reply_markup: { inline_keyboard: [[
+          { text: isEn ? 'Short report' : 'Краткий отчёт', callback_data: 'market_short' }
+        ]] } });
     await ctx.answerCbQuery(okText);
   } catch {
     try { await ctx.answerCbQuery('Ошибка'); } catch {}
   }
+}
+
+export async function editReportMessageToShort(ctx){
+  try{
+    const userId = ctx.from?.id;
+    const lang = await resolveUserLang(userId).catch(()=> 'ru');
+    const isEn = String(lang).toLowerCase().startsWith('en');
+    const snap=await getMarketSnapshot(['BTC','ETH','PAXG']);
+    if(!snap?.ok) { await ctx.answerCbQuery(isEn?'Error':'Ошибка'); return; }
+    const { shortHtml } = buildShortReportParts(
+      snap.snapshots,
+      lang,
+      { btcDominancePct: snap.btcDominancePct, btcDominanceDelta: snap.btcDominanceDelta, totals: snap.totals, fgiNow: snap.fgiNow, fgiDelta: snap.fgiDelta }
+    );
+    const kb = { inline_keyboard: [[
+        { text: isEn ? 'Full report' : 'Полный отчёт', callback_data: 'market_full' },
+        { text: isEn ? 'Guide' : 'Справка', callback_data: 'market_help' }
+      ]] };
+    await ctx.editMessageText(shortHtml, { parse_mode:'HTML', reply_markup: kb });
+    await ctx.answerCbQuery(isEn?'Done.':'Готово.');
+  } catch { try { await ctx.answerCbQuery('Ошибка'); } catch {} }
+}
+
+export async function editReportMessageToFull(ctx){
+  try{
+    const userId = ctx.from?.id;
+    const lang = await resolveUserLang(userId).catch(()=> 'ru');
+    const isEn = String(lang).toLowerCase().startsWith('en');
+    const snap=await getMarketSnapshot(['BTC','ETH','PAXG']);
+    if(!snap?.ok) { await ctx.answerCbQuery(isEn?'Error':'Ошибка'); return; }
+    const parts = buildMorningReportParts(
+      snap.snapshots, lang, snap.atIsoKyiv || '', snap.fetchedAt ?? null,
+      { btcDominancePct: snap.btcDominancePct, btcDominanceDelta: snap.btcDominanceDelta, spx: snap.spx, totals: snap.totals, fgiNow: snap.fgiNow, fgiDelta: snap.fgiDelta }
+    );
+    const kb = { inline_keyboard: [[
+        { text: isEn ? 'Short report' : 'Краткий отчёт', callback_data: 'market_short' },
+        { text: isEn ? 'Guide' : 'Справка', callback_data: 'market_help' }
+      ]] };
+    await ctx.editMessageText(parts.headHtml, { parse_mode:'HTML', reply_markup: kb });
+    await ctx.answerCbQuery(isEn?'Done.':'Готово.');
+  } catch { try { await ctx.answerCbQuery('Ошибка'); } catch {} }
 }

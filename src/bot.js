@@ -11,7 +11,16 @@ import { fmtNum, safeSendTelegram } from './utils.js';
 import { sendDailyToUser, processDailyQuoteRetry, watchForNewQuotes, fetchAndStoreDailyMotivation, ensureDailyImageBuffer } from './daily.js';
 import { CACHE_TTL, INACTIVE_DAYS, DAY_MS, IMAGE_FETCH_HOUR, PREPARE_SEND_HOUR, ENTRIES_PER_PAGE, KYIV_TZ, MARKET_SEND_HOUR, MARKET_SEND_MIN, MARKET_BATCH_SIZE, MARKET_BATCH_PAUSE_MS } from './constants.js';
 import { setLastHeartbeat } from './monitor.js';
-import { startMarketMonitor, getMarketSnapshot, broadcastMarketSnapshot, sendMarketReportToUser, buildMorningReportHtml } from './marketMonitor.js';
+import {
+  startMarketMonitor,
+  getMarketSnapshot,
+  broadcastMarketSnapshot,
+  sendMarketReportToUser,
+  buildMorningReportHtml,
+  editReportMessageToFull,
+  editReportMessageToShort,
+  sendShortReportToUser
+} from './marketMonitor.js';
 
 dotenv.config();
 
@@ -58,17 +67,18 @@ function supportText(isEn) { return isEn ? '🛠️ Support/wishes' : '🛠️ �
 
 function getMainMenuSync(userId, lang = 'ru') {
   const isEn = String(lang).split('-')[0] === 'en';
-  const create = isEn ? '➕ Create alert' : '➕ Создать алерт';
-  const my = isEn ? '📋 My alerts' : '📋 Мои алерты';
+  const create   = isEn ? '➕ Create alert' : '➕ Создать алерт';
+  const my       = isEn ? '📋 My alerts' : '📋 Мои алерты';
   const settings = isEn ? '⚙️ Settings' : '⚙️ Настройки';
-  const old = isEn ? '📜 Old alerts' : '📜 Старые алерты';
-  const search = isEn ? '🔎 Search old alerts' : '🔎 Поиск старых алертов';
+  const old      = isEn ? '📜 Old alerts' : '📜 Старые алерты';
+  const search   = isEn ? '🔎 Search old alerts' : '🔎 Поиск старых алертов';
   const motivate = isEn ? '🌅 Send motivation' : '🌅 Прислать мотивацию';
-  const stats = isEn ? '👥 Active users' : '👥 Количество активных пользователей';
-  const marketBtn = isEn ? '📊 Send market snapshot' : '📊 прислать данные мониторинга';
+  const stats    = isEn ? '👥 Active users' : '👥 Количество активных пользователей';
+  const shortBtn = isEn ? '📈 Short market report' : '📈 Краткий отчёт';
+  const fullBtn  = isEn ? '📊 Full report' : '📊 Полный отчёт';
   const kb = [
     [{ text: create }, { text: my }],
-    [{ text: marketBtn }],
+    [{ text: shortBtn }, { text: fullBtn }],
     [{ text: old }, { text: search }],
     [{ text: supportText(isEn) }, { text: settings }]
   ];
@@ -78,17 +88,18 @@ function getMainMenuSync(userId, lang = 'ru') {
 
 function getMainMenuBusy(userId, lang = 'ru') {
   const isEn = String(lang).split('-')[0] === 'en';
-  const create = isEn ? '➕ Create alert' : '➕ Создать алерт';
-  const my = isEn ? '📋 My alerts' : '📋 Мои алерты';
+  const create   = isEn ? '➕ Create alert' : '➕ Создать алерт';
+  const my       = isEn ? '📋 My alerts' : '📋 Мои алерты';
   const settings = isEn ? '⚙️ Settings' : '⚙️ Настройки';
-  const old = isEn ? '📜 Old alerts' : '📜 Старые алерты';
-  const search = isEn ? '🔎 Search old alerts' : '🔎 Поиск старых алертов';
-  const busy = isEn ? '📊 ⏳ Building…' : '📊 ⏳ Формирую…';
+  const old      = isEn ? '📜 Old alerts' : '📜 Старые алерты';
+  const search   = isEn ? '🔎 Search old alerts' : '🔎 Поиск старых алертов';
+  const busy     = isEn ? '📊 ⏳ Building…' : '📊 ⏳ Формирую…';
+  const shortBtn = isEn ? '📈 Short market report' : '📈 Краткий отчёт';
   const motivate = isEn ? '🌅 Send motivation' : '🌅 Прислать мотивацию';
-  const stats = isEn ? '👥 Active users' : '👥 Количество активных пользователей';
+  const stats    = isEn ? '👥 Active users' : '👥 Количество активных пользователей';
   const kb = [
     [{ text: create }, { text: my }],
-    [{ text: busy }],
+    [{ text: shortBtn }, { text: busy }],
     [{ text: old }, { text: search }],
     [{ text: supportText(isEn) }, { text: settings }]
   ];
@@ -223,7 +234,7 @@ async function handleMotivationRequest(ctx) {
   }
 }
 
-
+// === Полный отчёт (оставлен) ===
 async function handleMarketSnapshotRequest(ctx) {
   try {
     const pref = await resolveUserLang(ctx.from?.id, null, ctx.from?.language_code).catch(() => ctx.from?.language_code || 'ru');
@@ -266,10 +277,26 @@ async function handleMarketSnapshotRequest(ctx) {
   }
 }
 
+// === Короткий отчёт — делегирован в marketMonitor ===
+bot.hears('📈 Краткий отчёт', async (ctx) => {
+  try { await ctx.telegram.sendChatAction(ctx.chat.id, 'typing').catch(()=>{}); } catch {}
+  try { await sendShortReportToUser(bot, ctx.from.id); }
+  catch (e) { try { await ctx.reply('⚠️ Не удалось сформировать краткий отчёт.'); } catch {} }
+});
+bot.hears('📈 Short market report', async (ctx) => {
+  try { await ctx.telegram.sendChatAction(ctx.chat.id, 'typing').catch(()=>{}); } catch {}
+  try { await sendShortReportToUser(bot, ctx.from.id); }
+  catch (e) { try { await ctx.reply('⚠️ Failed to build short report.'); } catch {} }
+});
+
+// === Полный отчёт / обратная совместимость ===
+bot.hears('📊 Полный отчёт', handleMarketSnapshotRequest);
+bot.hears('📊 Full report', handleMarketSnapshotRequest);
 bot.hears('📊 прислать данные мониторинга', handleMarketSnapshotRequest);
 bot.hears('📊 Send market snapshot', handleMarketSnapshotRequest);
 bot.hears('📊 ⏳ Формирую…', handleMarketSnapshotRequest);
 bot.hears('📊 ⏳ Building…', handleMarketSnapshotRequest);
+
 bot.hears('🌅 Прислать мотивацию', handleMotivationRequest);
 bot.hears('🌅 Send motivation', handleMotivationRequest);
 
@@ -334,6 +361,23 @@ bot.on('callback_query', async (ctx) => {
     if (!data) return ctx.answerCbQuery();
 
     const lang = await resolveUserLang(ctx.from.id);
+    if (data === 'market_short') {
+      try {
+        await editReportMessageToShort(ctx);
+      } catch (e) {
+        try { await ctx.answerCbQuery('Ошибка'); } catch {}
+      }
+      return;
+    }
+
+    if (data === 'market_full') {
+      try {
+        await editReportMessageToFull(ctx);
+      } catch (e) {
+        try { await ctx.answerCbQuery('Ошибка'); } catch {}
+      }
+      return;
+    }
 
     if (data === 'market_help') {
       const mm = await import('./marketMonitor.js');
