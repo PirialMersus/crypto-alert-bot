@@ -1,4 +1,4 @@
-// src/alerts.js
+// /src/alerts.js
 import { ENTRIES_PER_PAGE, BG_CHECK_INTERVAL, DELETE_LABEL_TARGET_LEN } from './constants.js';
 import { alertsCollection, usersCollection, alertsArchiveCollection } from './db.js';
 import { tickersCache, pricesCache, allAlertsCache, getUserAlertsCached, getAllAlertsCached, getUserLastViews, setUserLastViews, invalidateUserAlertsCache, getUserAlertsOrder } from './cache.js';
@@ -13,7 +13,7 @@ function t(lang, key, ...vars) {
       your_alerts_title: '📋 *Your alerts:*',
       no_active_alerts: 'You have no active alerts.',
       delete_menu: '❌ Delete pair № ...',
-      page: (p, total) => `Page *${p}*/${total}`,
+      page: (p, total) => `Page ${p}${total > 1 ? ' of ' + total : ''}`,
       prev: '◀️ Previous',
       next: 'Next ▶️',
       collapse: '⬆️ Collapse',
@@ -51,7 +51,7 @@ function t(lang, key, ...vars) {
       your_alerts_title: '📋 *Твои алерты:*',
       no_active_alerts: 'У тебя нет активных алертов.',
       delete_menu: '❌ Удалить пару № ...',
-      page: (p, total) => `Страница *${p}*/${total}`,
+      page: (p, total) => `Страница ${p}${total > 1 ? ' из ' + total : ''}`,
       prev: '◀️ Предыдущая страница',
       next: 'Следующая страница ▶️',
       collapse: '⬆️ Свернуть',
@@ -197,7 +197,7 @@ export async function renderAlertsList(userId, options = { fast: false, lang: 'r
   }
 
   for (let p = 0; p < pages.length; p++) {
-    pages[p].text = pages[p].text + `${t(lang, 'page', p+1, pages.length)}
+    pages[p].text = pages[p].text + `${t(lang, 'page', p+1, pages.length)}\u2063
 
 `;
     const rows = [];
@@ -357,7 +357,7 @@ ${timeLabel}: ${whenStr}${firedInfo}${reason}
     }
 
     for (let p = 0; p < pages.length; p++) {
-      pages[p].text = pages[p].text + `${t(lang, 'page', p+1, pages.length)}
+      pages[p].text = pages[p].text + `${t(lang, 'page', p+1, pages.length)}\u2063
 
 `;
       const rows = [];
