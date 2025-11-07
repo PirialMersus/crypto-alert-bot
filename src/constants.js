@@ -33,3 +33,6 @@ export const MARKET_SEND_HOUR = 7;          // час отправки (Europe/K
 export const MARKET_SEND_MIN = 30;          // минута отправки
 export const MARKET_BATCH_SIZE = 25;        // размер батча при массовой отправке
 export const MARKET_BATCH_PAUSE_MS = 400;   // пауза между батчами, мс
+
+export const OI_CVD_PERIOD = process.env.OI_CVD_PERIOD || '5m';
+export const OI_CVD_LIMIT = process.env.OI_CVD_LIMIT ? parseInt(process.env.OI_CVD_LIMIT, 10) : 6;
