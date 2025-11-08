@@ -30,6 +30,7 @@ const CREATOR_ID = process.env.CREATOR_ID ? parseInt(process.env.CREATOR_ID, 10)
 if (!BOT_TOKEN) throw new Error('BOT_TOKEN не задан в окружении');
 
 export const bot = new Telegraf(BOT_TOKEN);
+bot.command('interest', (ctx) => handleInterest(ctx, { size: 50 }));
 
 bot.catch(async (err, ctx) => {
   try { console.error('[telegraf.catch]', err?.stack || String(err)); } catch {}
