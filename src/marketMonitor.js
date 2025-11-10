@@ -372,7 +372,7 @@ function buildMorningReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=nul
     risks:'Risk *¹³',
     plan:'Action plan',
     over24h:'over 24h',
-    updatesNote:'updates every 30 min'
+    updatesNote:'updates every 15 min'
   }:{
     report:'ОТЧЕТ',
     asof:'Данные на',
@@ -391,7 +391,7 @@ function buildMorningReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=nul
     risks:'Риск *¹³',
     plan:'План действий',
     over24h:'за 24 часа',
-    updatesNote:'обновляются каждые 30 мин'
+    updatesNote:'обновляются каждые 15 мин'
   };
 
   const when = formatKyiv(tsEpoch, tsIsoKyiv);
@@ -706,7 +706,7 @@ function buildShortReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=null,
     dom:'BTC.D',
     ratio:'BTC/ETH',
     asof:'As of',
-    updatesNote:'updates every 30 min'
+    updatesNote:'updates every 15 min'
   } : {
     short:'КРАТКИЙ ОТЧЕТ',
     market:'Рынок',
@@ -718,7 +718,7 @@ function buildShortReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=null,
     dom:'BTC.D',
     ratio:'BTC/ETH',
     asof:'Данные на',
-    updatesNote:'обновляются каждые 30 мин'
+    updatesNote:'обновляются каждые 15 мин'
   };
 
   const btc = snapshots.BTC || {};

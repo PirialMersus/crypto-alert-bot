@@ -31,6 +31,28 @@ if (!BOT_TOKEN) throw new Error('BOT_TOKEN не задан в окружении
 
 export const bot = new Telegraf(BOT_TOKEN);
 bot.command('interest', (ctx) => handleInterest(ctx, { size: 50 }));
+bot.command('oleg', async (ctx) => {
+  try {
+    const collName = process.env.WATCH_FLAG_COLL || 'flags';
+    const flagId = process.env.WATCH_FLAG_ID || 'collector_win';
+    const dbName = process.env.DB_NAME || 'crypto_alert_dev';
+    const { client } = await import('./db.js');
+    const db = client.db(dbName);
+    const token = `${Date.now()}_${Math.random().toString(36).slice(2,10)}`;
+
+    await ctx.reply('⏳ Запускаю обновление…');
+
+    await db.collection(collName).updateOne(
+      { _id: flagId },
+      { $set: { run: true, notifyChatId: ctx.from.id, requestedAt: new Date(), token } },
+      { upsert: true }
+    );
+
+    await ctx.reply('✅ Обновление данных запущено');
+  } catch {
+    try { await ctx.reply('⚠️ Не удалось запустить обновление.'); } catch {}
+  }
+});
 
 bot.catch(async (err, ctx) => {
   try { console.error('[telegraf.catch]', err?.stack || String(err)); } catch {}
