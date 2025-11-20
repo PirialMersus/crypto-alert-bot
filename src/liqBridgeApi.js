@@ -28,9 +28,3 @@ export async function getLiqMapInfo(symbol) {
   if (d && d.ok === false && d.error_text) throw new Error(String(d.error_text));
   throw new Error('service error');
 }
-
-// совместимость со старым кодом
-export async function getLiqMapFileId(symbol) {
-  const info = await getLiqMapInfo(symbol);
-  return info.file_id;
-}

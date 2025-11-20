@@ -6,13 +6,12 @@ import { createServer } from './server.js';
 import { startTickersRefresher, refreshAllTickers, getCachedPrice } from './prices.js';
 import { startAlertsChecker, renderAlertsList, buildDeleteInlineForUser, renderOldAlertsList } from './alerts.js';
 import { removeInactive } from './cleanup.js';
-import { getUserRecentSymbols, pushRecentSymbol, getUserAlertsOrder, setUserAlertsOrder, getUserAlertsCached, invalidateUserAlertsCache, statsCache, getUserAlertLimit, setUserAlertLimit, resolveUserLang } from './cache.js';
-import { fmtNum, safeSendTelegram } from './utils.js';
-import { sendDailyToUser, processDailyQuoteRetry, watchForNewQuotes, fetchAndStoreDailyMotivation, ensureDailyImageBuffer } from './daily.js';
+import { getUserRecentSymbols, pushRecentSymbol, getUserAlertsOrder, setUserAlertsOrder, getUserAlertsCached, invalidateUserAlertsCache, statsCache, getUserAlertLimit, resolveUserLang } from './cache.js';
+import { fmtNum } from './utils.js';
+import { sendDailyToUser, processDailyQuoteRetry, watchForNewQuotes, fetchAndStoreDailyMotivation } from './daily.js';
 import { CACHE_TTL, INACTIVE_DAYS, DAY_MS, IMAGE_FETCH_HOUR, PREPARE_SEND_HOUR, ENTRIES_PER_PAGE, KYIV_TZ, MARKET_SEND_HOUR, MARKET_SEND_MIN, MARKET_BATCH_SIZE, MARKET_BATCH_PAUSE_MS } from './constants.js';
 import { setLastHeartbeat } from './monitor.js';
 import {
-  startMarketMonitor,
   getMarketSnapshot,
   broadcastMarketSnapshot,
   sendMarketReportToUser,
@@ -30,7 +29,7 @@ const CREATOR_ID = process.env.CREATOR_ID ? parseInt(process.env.CREATOR_ID, 10)
 if (!BOT_TOKEN) throw new Error('BOT_TOKEN не задан в окружении');
 
 export const bot = new Telegraf(BOT_TOKEN);
-bot.command('interest', (ctx) => handleInterest(ctx, { size: 50 }));
+
 bot.command('oleg', async (ctx) => {
   try {
     const collName = process.env.WATCH_FLAG_COLL || 'flags';
@@ -65,11 +64,16 @@ bot.use(async (ctx, next) => {
   try {
     if (ctx.from?.id) {
       const { usersCollection } = await import('./db.js');
-      await usersCollection.updateOne(
-        { userId: ctx.from.id },
-        { $set: { userId: ctx.from.id, lastActive: new Date(), language_code: ctx.from.language_code || null } },
-        { upsert: true }
-      );
+      const u = await usersCollection.findOne({ userId: ctx.from.id }, { projection: { lastActive: 1 } });
+      const now = new Date();
+      const last = u?.lastActive ? new Date(u.lastActive) : null;
+      if (!last || now - last > 5 * 60 * 1000) {
+        await usersCollection.updateOne(
+          { userId: ctx.from.id },
+          { $set: { userId: ctx.from.id, lastActive: now, language_code: ctx.from.language_code || null } },
+          { upsert: true }
+        );
+      }
     }
   } catch (e) {}
   return next();
@@ -77,14 +81,12 @@ bot.use(async (ctx, next) => {
 
 const reportInFlight = new Map();
 
-// ⬇️ конвертация **...** / __...__ в <b>...</b> — для листингов/историй
 function mdBoldToHtml(s) {
   return String(s)
     .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
     .replace(/__(.+?)__/g, '<b>$1</b>');
 }
 
-// универсальная правка: безопасное редактирование текста с HTML или фолбэк на reply
 async function editHtmlOrReply(ctx, chatId, msgId, text, buttons) {
   const html = mdBoldToHtml(text);
   try {
@@ -136,41 +138,6 @@ function getMainMenuSync(userId, lang = 'ru') {
   return { reply_markup: { keyboard: kb, resize_keyboard: true } };
 }
 
-function getMainMenuBusy(userId, lang = 'ru') {
-  const isEn = String(lang).split('-')[0] === 'en';
-  const create   = isEn ? '➕ Create alert' : '➕ Создать алерт';
-  const my       = isEn ? '📋 My alerts' : '📋 Мои алерты';
-  const shortBtn = isEn ? '📈 Short market report' : '📈 Краткий отчёт';
-  const busy     = isEn ? '📊 ⏳ Building…' : '📊 ⏳ Формирую…';
-  const history  = isEn ? '📜 Alerts history' : '📜 История алертов';
-  const settings = isEn ? '⚙️ Settings' : '⚙️ Настройки';
-
-  const kb = [
-    [{ text: create }, { text: my }],
-    [{ text: shortBtn }, { text: busy }],
-    [{ text: history }],
-    [{ text: supportText(isEn) }, { text: settings }],
-  ];
-  if (CREATOR_ID && String(userId) === String(CREATOR_ID)) {
-    kb.push([{ text: isEn ? '🌅 Send motivation' : '🌅 Прислать мотивацию' }], [{ text: isEn ? '👥 Active users' : '👥 Количество активных пользователей' }]);
-  }
-  return { reply_markup: { keyboard: kb, resize_keyboard: true } };
-}
-
-async function showMainMenuSilently(ctx, lang) {
-  try {
-    const isEn = String(lang).startsWith('en');
-    const menu = getMainMenuSync(ctx.from.id, lang);
-    await ctx.telegram.sendMessage(
-      ctx.chat.id,
-      isEn ? 'Main menu' : 'Главное меню',
-      {
-        ...menu,
-        disable_notification: true
-      }
-    );
-  } catch {}
-}
 async function buildSettingsInlineForUser(userId, langOverride = null) {
   const order = await getUserAlertsOrder(userId).catch(()=> 'new_bottom');
   const lang = langOverride || await resolveUserLang(userId).catch(()=> 'ru');
@@ -204,28 +171,45 @@ function buildAskSlKeyboard(lang) {
   return { keyboard: [[{ text: isEn ? '🛑 Add SL' : '🛑 Добавить SL' }, { text: isEn ? '⏭️ Skip SL' : '⏭️ Без SL' }], [buildCancelButton(lang)]], resize_keyboard: true };
 }
 
-async function safeCtxReply(ctx, text, opts = {}) {
-  try { return await ctx.reply(text, opts); }
-  catch (e) {
-    try {
-      const chatId = ctx.chat?.id || ctx.from?.id;
-      return await safeSendTelegram(bot, 'sendMessage', [chatId, text, opts]);
-    } catch (err) { throw err; }
-  }
-}
-
 function startHeartbeat(intervalMs = 60_000) {
   try { setLastHeartbeat(new Date().toISOString()); } catch {}
   setInterval(() => { try { setLastHeartbeat(new Date().toISOString()); } catch {} }, intervalMs);
 }
-
 bot.start(async (ctx) => {
   ctx.session = {};
+
   const lang = await resolveUserLang(ctx.from?.id, null, ctx.from?.language_code);
   const isEn = String(lang).split('-')[0] === 'en';
-  const greet = isEn ? 'Hello! I am a crypto alert bot.' : 'Привет! Я бот-алерт для крипты.';
-  await ctx.reply(`${greet}\n${isEn ? '(Language: English)' : '(Язык: Русский)'}`, getMainMenuSync(ctx.from.id, lang));
+
+  const text = isEn
+    ? [
+      '👋 Hello! I am a crypto alert bot.',
+      'en/ru → ⚙️ Settings / Настройки',
+      '',
+      'What I can do:',
+      '• 📈 Create price alerts for your favorite coins',
+      '• 🌅 Send an auto morning market report + short & full reports on demand',
+      '• 🗺️ Show liquidation maps for popular coins',
+      '• 💫 Send a daily motivation image/quote',
+      '',
+      'You can enable or disable the morning market report and daily motivation at any time in ⚙️ Settings.'
+    ].join('\n')
+    : [
+      '👋 Привет! Я бот для крипто-уведомлений.',
+      'en/ru → ⚙️ Настройки / Settings',
+      '',
+      'Что я умею:',
+      '• 📈 Создавать ценовые уведомления по твоим монетам',
+      '• 🌅 Присылать авто-утренний отчёт по рынку + краткий и полный отчёт по запросу',
+      '• 🗺️ Показывать карты ликвидаций по популярным монетам',
+      '• 💫 Присылать ежедневную мотивационную картинку/цитату',
+      '',
+      'Утренний отчёт по рынку и ежедневную мотивацию можно в любой момент включить или отключить в ⚙️ Настройки.'
+    ].join('\n');
+
+  await ctx.reply(text, getMainMenuSync(ctx.from.id, lang));
 });
+
 
 bot.command('menu', async (ctx) => {
   const lang = await resolveUserLang(ctx.from?.id, null, ctx.from?.language_code);
@@ -330,8 +314,7 @@ async function handleActiveUsers(ctx) {
   } catch { await ctx.reply('Ошибка получения статистики.'); }
 }
 
-bot.hears('👥 Количество активных пользователей', async (ctx) => { await handleActiveUsers(ctx); });
-bot.hears('👥 Active users', async (ctx) => { await handleActiveUsers(ctx); });
+bot.hears(['👥 Количество активных пользователей', '👥 Active users'], async (ctx) => { await handleActiveUsers(ctx); });
 
 async function handleMotivationRequest(ctx) {
   try {
@@ -393,7 +376,7 @@ bot.hears(['📈 Краткий отчёт', '📈 Short market report'], async 
   catch (e) { try { await ctx.reply('⚠️ Не удалось сформировать краткий отчёт.'); } catch {} }
 });
 
-bot.hears(['📊 Полный отчёт', '📊 Full report', '📊 прислать данные мониторинга', '📊 Send market snapshot', '📊 ⏳ Формирую…', '📊 ⏳ Building…'], handleMarketSnapshotRequest);
+bot.hears(['📊 Полный отчёт', '📊 Full report'], handleMarketSnapshotRequest);
 
 bot.hears(['🌅 Прислать мотивацию', '🌅 Send motivation'], handleMotivationRequest);
 
@@ -670,20 +653,6 @@ bot.on('callback_query', async (ctx) => {
 
       try { await ctx.answerCbQuery(); } catch {}
       await editHtmlOrReply(ctx, chatId, msgId, page.text, page.buttons);
-      return;
-    }
-
-    const mSetLang = data.match(/^set_lang_(ru|en)$/);
-    if (mSetLang) {
-      const newLang = mSetLang[1];
-      try {
-        const { usersCollection } = await import('./db.js');
-        await usersCollection.updateOne({ userId: ctx.from.id }, { $set: { preferredLang: newLang } }, { upsert: true });
-        await ctx.reply(newLang === 'en' ? 'Language switched to English.' : 'Я переключился на русский.', getMainMenuSync(ctx.from.id, newLang));
-        const inline = await buildSettingsInlineForUser(ctx.from.id, newLang);
-        try { await ctx.editMessageReplyMarkup(inline); } catch {}
-      } catch {}
-      await ctx.answerCbQuery();
       return;
     }
 
@@ -1002,124 +971,6 @@ bot.on('text', async (ctx) => {
   }
 });
 
-bot.command('set_alert_limit', async (ctx) => {
-  try {
-    if (!CREATOR_ID || String(ctx.from.id) !== String(CREATOR_ID)) { return ctx.reply('У вас нет доступа к этой команде.'); }
-    const parts = (ctx.message.text || '').trim().split(/\s+/).slice(1);
-    if (parts.length < 2) return ctx.reply('Использование: /set_alert_limit <userId|@username> <limit>');
-    const ident = parts[0];
-    const lim = parseInt(parts[1], 10);
-    if (!Number.isFinite(lim) || lim < 0) return ctx.reply('Лимит должен быть неотрицательным числом.');
-
-    let targetId = parseInt(ident, 10);
-    if (!Number.isFinite(targetId)) {
-      let name = ident;
-      if (!name.startsWith('@')) name = `@${name}`;
-      try {
-        const chat = await bot.telegram.getChat(name);
-        targetId = chat.id;
-      } catch {
-        return ctx.reply('Не удалось найти пользователя по идентификатору/имени.');
-      }
-    }
-
-    const newLim = await setUserAlertLimit(targetId, lim);
-    if (newLim === null) return ctx.reply('Ошибка при установке лимита.');
-    await ctx.reply(`Лимит для пользователя ${targetId} установлен: ${newLim}`);
-    try { await bot.telegram.sendMessage(targetId, `Тебе установлен лимит алертов: ${newLim} (вручную от администратора)`); } catch {}
-  } catch { await ctx.reply('Ошибка при выполнении команды'); }
-});
-
-bot.command('get_alert_limit', async (ctx) => {
-  try {
-    if (!CREATOR_ID || String(ctx.from.id) !== String(CREATOR_ID)) { return ctx.reply('У вас нет доступа к этой команде.'); }
-    const parts = (ctx.message.text || '').trim().split(/\s+/).slice(1);
-    if (parts.length < 1) return ctx.reply('Использование: /get_alert_limit <userId|@username>');
-    const ident = parts[0];
-    let targetId = parseInt(ident, 10);
-    if (!Number.isFinite(targetId)) {
-      let name = ident;
-      if (!name.startsWith('@')) name = `@${name}`;
-      try {
-        const chat = await bot.telegram.getChat(name);
-        targetId = chat.id;
-      } catch {
-        return ctx.reply('Не удалось найти пользователя по идентификатору/имени.');
-      }
-    }
-    const lim = await getUserAlertLimit(targetId);
-    await ctx.reply(`Лимит для пользователя ${targetId}: ${lim}`);
-  } catch { await ctx.reply('Ошибка при выполнении команды'); }
-});
-
-bot.command('refresh_daily', async (ctx) => {
-  try {
-    if (!CREATOR_ID || String(ctx.from.id) !== String(CREATOR_ID)) return ctx.reply('У вас нет доступа.');
-    const dateStr = new Date().toLocaleDateString('sv-SE', { timeZone: KYIV_TZ });
-    await ctx.reply(`⏳ Начинаю принудительное обновление мотивации на ${dateStr}...`);
-
-    try {
-      const cacheMod = await import('./cache.js');
-      if (cacheMod && cacheMod.dailyCache) {
-        cacheMod.dailyCache.date = null;
-        cacheMod.dailyCache.doc = null;
-        cacheMod.dailyCache.imageBuffer = null;
-        await ctx.reply('Кэш dailyCache очищен.');
-      }
-    } catch { await ctx.reply('⚠️ Не удалось очистить кэш в памяти (см логи). Продолжаю.'); }
-
-    const daily = await import('./daily.js');
-    const { dailyMotivationCollection } = await import('./db.js');
-
-    try {
-      const previewQuote = await daily.fetchQuoteFromAny();
-      if (previewQuote && previewQuote.text) { await ctx.reply(`Превью цитаты:\n${previewQuote.text}${previewQuote.author ? `\n— ${previewQuote.author}` : ''}`); }
-      else { await ctx.reply('Превью цитаты: не удалось загрузить новую цитату (источники вернули пусто).'); }
-    } catch (e) { await ctx.reply(`Ошибка при получении превью цитаты: ${String(e?.message || e)}`); }
-
-    try {
-      if (typeof daily.fetchRandomImage === 'function') {
-        const img = await daily.fetchRandomImage();
-        if (img?.url) { await ctx.reply(`Превью картинки: ${img.url} (${img.source || 'unknown'})`); }
-        else { await ctx.reply('Превью картинки: не удалось получить картинку из источников.'); }
-      } else { await ctx.reply('Превью картинки: функция fetchRandomImage недоступна.'); }
-    } catch (e) { await ctx.reply(`Ошибка при получении превью картинки: ${String(e?.message || e)}`); }
-
-    try {
-      const stored = await daily.fetchAndStoreDailyMotivation(dateStr, { force: true });
-      await ctx.reply(stored ? '✅ Цитата и метаданные сохранены в БД (force).' : '⚠️ fetchAndStoreDailyMotivation вернул null/undefined.');
-    } catch (e) { await ctx.reply(`Ошибка при сохранении мотивации: ${String(e?.message || e)}`); }
-
-    try {
-      const doc = await dailyMotivationCollection.findOne({ date: dateStr });
-      if (doc) {
-        const q = doc.quote?.original || doc.quote?.translations?.ru || null;
-        await ctx.reply(`Текущий документ в БД:\nЦитата: ${q ? q : '—'}\nАвтор: ${doc.quote?.author || '—'}\nImage URL: ${doc.image?.url || '—'}`);
-      } else { await ctx.reply('В БД нет документа для сегодняшней даты после сохранения.'); }
-    } catch (e) { await ctx.reply(`Ошибка при чтении doc из БД: ${String(e?.message || e)}`); }
-
-    try {
-      const buf = await ensureDailyImageBuffer(dateStr);
-      await ctx.reply(buf?.length ? `Картинка загружена в память, размер ${buf.length} байт.` : 'Картинка не загружена (будет отправлён текст без изображения).');
-    } catch (e) { await ctx.reply(`Ошибка при загрузке изображения: ${String(e?.message || e)}`); }
-
-    try {
-      const ok = await daily.sendDailyToUser(bot, ctx.from.id, dateStr, { disableNotification: false, forceRefresh: true });
-      await ctx.reply(ok ? 'Готово — мотивация обновлена и отправлена тебе.' : 'Мотивация сохранена, но отправка не удалась (см логи).');
-    } catch (e) { await ctx.reply(`Ошибка при отправке мотивации: ${String(e?.message || e)}`); }
-
-  } catch (e) { await ctx.reply('Внутренняя ошибка: ' + String(e?.message || e)); }
-});
-
-bot.command('broadcast_market_now', async (ctx) => {
-  if (!CREATOR_ID || String(ctx.from.id) !== String(CREATOR_ID)) return ctx.reply('У вас нет доступа.');
-  await ctx.reply('Запускаю рассылку мониторинга (тест)...');
-  try {
-    const res = await broadcastMarketSnapshot(bot, { batchSize: MARKET_BATCH_SIZE, pauseMs: MARKET_BATCH_PAUSE_MS });
-    await ctx.reply('Done: ' + JSON.stringify(res));
-  } catch (e) { await ctx.reply('Ошибка при рассылке: ' + String(e?.message || e)); }
-});
-
 export async function startBot() {
   await connectToMongo();
   startTickersRefresher();
@@ -1130,8 +981,6 @@ export async function startBot() {
       if (isDbConnected()) { try { startAlertsChecker(bot); } catch {} clearInterval(tryStartChecker); }
     }, 10000);
   }
-
-  try { if (typeof startMarketMonitor === 'function') startMarketMonitor(bot); } catch {}
 
   await removeInactive();
   startHeartbeat(60000);

@@ -2,6 +2,7 @@
 import { resolveUserLang } from './cache.js';
 import { usersCollection, client } from './db.js';
 import { MARKET_BATCH_SIZE, MARKET_BATCH_PAUSE_MS } from './constants.js';
+import { buildPorNetflowsBlock } from './porNetflows.js';
 
 const SNAPSHOT_CACHE_MS = Number(process.env.SNAPSHOT_CACHE_MS ?? 60_000);
 const _snapCache = new Map();
@@ -20,6 +21,7 @@ function humanFmt(n) {
     return Number(n).toPrecision(6).replace(/(?:\.0+$|(?<=\.[0-9]*?)0+)$/,'');
   } catch { return String(n); }
 }
+
 function humanFmtEN(n) {
   if (!Number.isFinite(n)) return '—';
   try {
@@ -28,6 +30,7 @@ function humanFmtEN(n) {
     return Number(n).toPrecision(6).replace(/(?:\.0+$|(?<=\.[0-9]*?)0+)$/,'');
   } catch { return String(n); }
 }
+
 function abbrevWithUnit(n, isEn=false) {
   if(!Number.isFinite(n)) return '';
   const v = Math.abs(n);
@@ -37,8 +40,16 @@ function abbrevWithUnit(n, isEn=false) {
   if (v >= 1_000)             return `${(v/1_000).toFixed(2)} ${isEn?'K':'тыс.'}`;
   return `${v.toFixed(2)}`;
 }
-function fmtFunding(v) { if(!Number.isFinite(v)) return '—'; return Number(v).toFixed(8).replace(/\.0+$|0+$/,''); }
-function circleByDelta(x) { if(!Number.isFinite(x) || x===0) return '⚪'; return x>0?'🟢':'🔴'; }
+
+function fmtFunding(v) {
+  if(!Number.isFinite(v)) return '—';
+  return Number(v).toFixed(8).replace(/\.0+$|0+$/,'');
+}
+
+function circleByDelta(x) {
+  if(!Number.isFinite(x) || x===0) return '⚪';
+  return x>0?'🟢':'🔴';
+}
 
 function verdictLabelFromEmoji(emoji, isEn){
   switch (emoji) {
@@ -53,21 +64,25 @@ function riskBar(score){
   const n=Math.max(0,Math.min(10,Math.round((score||0)*10)));
   return '🟥'.repeat(n)+'⬜'.repeat(10-n);
 }
+
 function priceChangeRisk(pct24h){
   if(!Number.isFinite(pct24h)) return 0;
   const mag = Math.min(1, Math.abs(pct24h)/8);
   return mag;
 }
+
 function fundingRiskFromNow(f){
   if(!Number.isFinite(f)) return 0;
   return Math.min(1, Math.abs(f)*10000/30);
 }
+
 function sentimentRiskFromLS(longPct){
   if(!Number.isFinite(longPct)) return 0;
   if(longPct>=60) return Math.min(1, (longPct-60)/15);
   if(longPct<=40) return Math.min(1, (40-longPct)/15);
   return 0;
 }
+
 function riskFromOiCvd(verdictEmoji){
   switch (verdictEmoji) {
     case '🟢': return 0.45;
@@ -76,6 +91,7 @@ function riskFromOiCvd(verdictEmoji){
     default:   return 0.35;
   }
 }
+
 function riskFromFgi(v){
   if(!Number.isFinite(v)) return 0.35;
   if (v <= 24) return 0.55;
@@ -84,6 +100,7 @@ function riskFromFgi(v){
   if (v <= 74) return 0.50;
   return 0.60;
 }
+
 function riskFromBreadth(tot){
   if (!tot || !Number.isFinite(tot.d1) || !Number.isFinite(tot.d2) || !Number.isFinite(tot.d3)) return 0.35;
   const mean = (tot.d1 + tot.d2 + tot.d3)/3;
@@ -93,6 +110,7 @@ function riskFromBreadth(tot){
   if (mean >= -2) return 0.50;
   return 0.60;
 }
+
 function riskFromSpx(pct){
   if(!Number.isFinite(pct)) return 0.35;
   if (pct >= 1.0) return 0.30;
@@ -101,6 +119,7 @@ function riskFromSpx(pct){
   if (pct >= -1.0) return 0.48;
   return 0.58;
 }
+
 function computeRiskV2(symSnap, extras, symbol){
   const priceRisk = priceChangeRisk(symSnap?.pct24);
   const fundingRisk = fundingRiskFromNow(symSnap?.fundingNow);
@@ -133,6 +152,7 @@ function fearGreedBarColorized(v){
   else color = '🟩';
   return color.repeat(filled) + '⬜'.repeat(10 - filled);
 }
+
 function fgiClassFromValue(v, isEn){
   const val = Number(v);
   let key = null;
@@ -163,6 +183,7 @@ function renderLsBlock(ls, isEn, label){
   const S = B(isEn ? 'Shorts' : 'Шорты');
   return `${esc(lbl)}:\n• ${L} ${B(`${ls.longPct}%`)} | ${S} ${B(`${ls.shortPct}%`)}\n${bar}`;
 }
+
 function formatKyiv(tsEpoch, tsIso) {
   try {
     const d = Number.isFinite(Number(tsEpoch)) && Number(tsEpoch) > 0
@@ -185,12 +206,14 @@ function conciseRsiAdvice(v,isEn){
   if (v <= 30) return isEn?'Oversold — wait for reversal; avoid naked shorts.':'Перепроданность — ждать разворота, не шортить без подтверждения.';
   return isEn?'Momentum neutral — trade trend with stops.':'Импульс нейтрален — работать по тренду и стопам.';
 }
+
 function conciseFlowsAdvice(usd,isEn){
   if (!Number.isFinite(usd)) return isEn?'Don’t rely on flows alone; decide by confluence.':'Не полагайся на потоки отдельно; решения по совокупности сигналов.';
   if (usd > 0) return isEn?'Inflow — potential sell pressure; avoid all-in on pumps.':'Приток — возможные продажи; не входить all-in на росте.';
   if (usd < 0) return isEn?'Outflow — supportive; longs only on confirmation.':'Отток — поддержка; лонги только по подтверждению.';
   return isEn?'Flat — stick to plan.':'Ровно — держать план.';
 }
+
 function conciseFundingAdvice(f,isEn){
   if (!Number.isFinite(f)) return isEn?'Evaluate without funding; don’t overrate it.':'Оценивай без funding; не переоценивать метрику.';
   if (Math.abs(f) > 0.0003) return isEn?'Elevated funding — cut leverage, be ready for squeezes.':'Повышенный funding — резать плечо, готовность к сквизам.';
@@ -217,7 +240,11 @@ function flowsHeaderLine(sym, isEn){
 
 function pickSubsetBySymbols(snapshots, symbols){
   const out={};
-  for(const s of symbols){ if (snapshots?.[s]) out[s]=snapshots[s]; }
+  for(const s of symbols){
+    if (snapshots?.[s]) {
+      out[s]=snapshots[s];
+    }
+  }
   return out;
 }
 
@@ -232,17 +259,24 @@ async function findClosestWith(db, collection, target, hasValue, windowMs=48*360
     const d = await cur.next();
     if (hasValue(d)) {
       const dist = Math.abs(Number(d.at) - target);
-      if (dist < bestDist) { best = d; bestDist = dist; }
+      if (dist < bestDist) {
+        best = d;
+        bestDist = dist;
+      }
     }
   }
   if (best) return best;
   const cur2 = db.collection(collection).find({}, { projection: proj }).sort({ at: -1 }).limit(500);
-  best=null; bestDist=Infinity;
+  best=null;
+  bestDist=Infinity;
   while (await cur2.hasNext()) {
     const d = await cur2.next();
     if (hasValue(d)) {
       const dist = Math.abs(Number(d.at) - target);
-      if (dist < bestDist) { best = d; bestDist = dist; }
+      if (dist < bestDist) {
+        best = d;
+        bestDist = dist;
+      }
     }
   }
   return best;
@@ -250,21 +284,40 @@ async function findClosestWith(db, collection, target, hasValue, windowMs=48*360
 
 async function findLatestDocWith(db, collection, hasValue){
   const cur = db.collection(collection).find({}, { projection: { at:1, snapshots:1, btcDominancePct:1, spx:1, totals:1, oiCvd:1 } }).sort({ at: -1 }).limit(500);
-  while (await cur.hasNext()) { const d = await cur.next(); if (hasValue(d)) return d; }
+  while (await cur.hasNext()) {
+    const d = await cur.next();
+    if (hasValue(d)) return d;
+  }
   return null;
 }
 
 export async function getMarketSnapshot(symbols=['BTC','ETH','PAXG']){
   const dbName = process.env.DB_NAME || 'crypto_alert_dev';
-  const collection = process.env.COLLLECTION || process.env.COLLECTION || 'marketSnapshots';
+  const collection = process.env.COLLECTION || 'marketSnapshots';
   const db = client.db(dbName);
 
   const cacheKey = symbols.slice().sort().join(',');
-  const hit = _snapCache.get(cacheKey);
   const now = Date.now();
+  const hit = _snapCache.get(cacheKey);
   if (hit && now - hit.ts < SNAPSHOT_CACHE_MS) return hit.data;
 
-  const freshest = await db.collection(collection).find({}, { projection: { snapshots:1, at:1, atIsoKyiv:1, btcDominancePct:1, spx:1, totals:1, oiCvd:1, capTop:1 } }).sort({ at: -1 }).limit(1).next();
+  const freshest = await db.collection(collection).find(
+    {},
+    {
+      projection: {
+        snapshots: 1,
+        at: 1,
+        atIsoKyiv: 1,
+        btcDominancePct: 1,
+        spx: 1,
+        totals: 1,
+        oiCvd: 1,
+        capTop: 1,
+        cryptoquant: 1
+      }
+    }
+  ).sort({ at: -1 }).limit(1).next();
+
   if (process.env.DEBUG_OICVD === '1') {
     const atLabel = freshest?.atIsoKyiv || new Date(freshest?.at || Date.now()).toISOString();
     console.log('[OI/CVD DEBUG] at:', atLabel);
@@ -326,7 +379,8 @@ export async function getMarketSnapshot(symbols=['BTC','ETH','PAXG']){
     fgiDelta: isNum(fgiDelta) ? fgiDelta : null,
     oiCvdBTC: freshest?.oiCvd?.BTC || null,
     oiCvdETH: freshest?.oiCvd?.ETH || null,
-    leadersTop
+    leadersTop,
+    cryptoquant: freshest.cryptoquant || null
   };
 
   _snapCache.set(cacheKey, { ts: now, data: result });
@@ -352,7 +406,7 @@ function oiCvdLine(symbol, snap, isEn, priceNow){
   return `${symbol}: ${oiLabel}: ${B(oiTxt)} | ${cvdLabel}: ${B(cvdUsdTxt)} — ${circ} ${verdictTxt}`;
 }
 
-function buildMorningReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=null, extras={}){
+async function buildMorningReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=null, extras={}){
   const isEn=String(lang).toLowerCase().startsWith('en');
   const T=isEn?{
     report:'REPORT',
@@ -410,6 +464,7 @@ function buildMorningReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=nul
     const p = Number.isFinite(sym?.price) ? `$${isEn?humanFmtEN(sym.price):humanFmt(sym.price)}` : '—';
     return `${B(p)} ${pctTxt}`;
   };
+
   const fgiLine = (sym) => {
     const v = Number(sym?.fgiValue);
     if (!Number.isFinite(v)) return '—';
@@ -417,6 +472,7 @@ function buildMorningReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=nul
     const bar = fearGreedBarColorized(v);
     return `${B(String(v))}${cls ? ` (${B(cls)})` : ''}\n${bar}`;
   };
+
   const volumeLine = (sym) => {
     const vol = Number(sym?.vol24);
     const deltaPct = Number(sym?.volDeltaPct);
@@ -426,6 +482,7 @@ function buildMorningReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=nul
     const pctTxt = Number.isFinite(deltaPct) ? `${circ}(${B(`${deltaPct>0?'+':''}${deltaPct.toFixed(2)}%`)} ${T.over24h})` : '';
     return [abbr, pctTxt].filter(Boolean).join(' ');
   };
+
   const rsiLine = (sym) => {
     const now = Number(sym?.rsi14), prev = Number(sym?.rsi14Prev);
     if(!Number.isFinite(now)) return '—';
@@ -438,6 +495,7 @@ function buildMorningReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=nul
     }
     return base;
   };
+
   const fundingLine = (sym) => {
     const now = Number(sym?.fundingNow);
     const prev = Number(sym?.fundingPrev);
@@ -557,10 +615,33 @@ function buildMorningReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=nul
     head.push('');
   }
 
-  head.push(BU(T.flows));
-  if (snapshots.BTC) head.push(`• BTC: ${flowsHeaderLine((snapshots.BTC)||{}, isEn)}`);
-  if (snapshots.ETH) head.push(`• ETH: ${flowsHeaderLine((snapshots.ETH)||{}, isEn)}`);
-  head.push('');
+  try {
+    const porBlock = await buildPorNetflowsBlock(lang, {
+      btcPrice: snapshots.BTC?.price ?? null,
+      ethPrice: snapshots.ETH?.price ?? null,
+      cryptoquant: extras?.cryptoquant || null
+    });
+
+    head.push(BU(T.flows));
+
+    if (porBlock && typeof porBlock === 'string' && porBlock.trim()) {
+      head.push(porBlock.trim());
+    } else {
+      head.push(isEn
+        ? '• BTC / ETH: данных по потокам пока нет'
+        : '• BTC / ETH: данных по потокам пока нет'
+      );
+    }
+    head.push('');
+  } catch (err) {
+    head.push(BU(T.flows));
+    head.push(isEn
+      ? '• BTC / ETH: ошибка загрузки потоков'
+      : '• BTC / ETH: ошибка загрузки потоков'
+    );
+    head.push('');
+  }
+
   head.push(BU(T.funding));
   if (snapshots.BTC) head.push(`• BTC: ${fundingLine((snapshots.BTC)||{})}`);
   if (snapshots.ETH) head.push(`• ETH: ${fundingLine((snapshots.ETH)||{})}`);
@@ -645,9 +726,13 @@ function buildMorningReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=nul
 
   help.push('');
 
-  help.push(`${B(isEn?'¹¹ Net flows':'¹¹ Притоки/оттоки')} ${isEn?'— inflow = potential sell pressure; outflow = support.':'— приток = возможное давление продаж; отток = поддержка.'}`);
-  if (snapshots.BTC) help.push(`• ${B('BTC')}: ${conciseFlowsAdvice((snapshots.BTC||{}).netFlowsUSDNow,isEn)}`);
-  if (snapshots.ETH) help.push(`• ${B('ETH')}: ${conciseFlowsAdvice((snapshots.ETH)||{}.netFlowsUSDNow,isEn)}`);
+  help.push(
+    `${B(isEn ? '¹¹ Net flows (CryptoQuant CEX)' : '¹¹ Притоки/оттоки (CryptoQuant CEX)')} ` +
+    (isEn
+        ? '— aggregated BTC/ETH net flows across major centralized exchanges over the last 24h: inflow = potential sell pressure; outflow = coins leaving exchanges (support).'
+        : '— агрегированные притоки/оттоки BTC/ETH по основным централизованным биржам за последние 24ч: приток = возможное давление продаж; отток = вывод монет с бирж (поддержка).'
+    )
+  );
 
   help.push('');
 
@@ -792,11 +877,9 @@ function buildShortReportParts(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=null,
 }
 
 export async function buildMorningReportHtml(snapshots, lang='ru', tsIsoKyiv='', tsEpoch=null, extras={}){
-  const { fullHtml } = buildMorningReportParts(snapshots, lang, tsIsoKyiv, tsEpoch, extras);
+  const { fullHtml } = await buildMorningReportParts(snapshots, lang, tsIsoKyiv, tsEpoch, extras);
   return fullHtml;
 }
-
-export async function startMarketMonitor(){ return { ok:true }; }
 
 export async function broadcastMarketSnapshot(bot, { batchSize=MARKET_BATCH_SIZE || 25, pauseMs=MARKET_BATCH_PAUSE_MS || 400 } = {}){
   if (!usersCollection) return { ok:false, reason:'mongo_not_connected' };
@@ -811,7 +894,7 @@ export async function broadcastMarketSnapshot(bot, { batchSize=MARKET_BATCH_SIZE
   const snap = await getMarketSnapshot(['BTC','ETH','PAXG']).catch(()=>null);
   if (!snap?.ok) return { ok:false, reason:'snapshot_failed', delivered:0, users:recipients.length };
 
-  const { snapshots, atIsoKyiv, fetchedAt, btcDominancePct, btcDominanceDelta, spx, totals, fgiNow, fgiDelta, oiCvdBTC, oiCvdETH, leadersTop } = snap;
+  const { snapshots, atIsoKyiv, fetchedAt, btcDominancePct, btcDominanceDelta, spx, totals, fgiNow, fgiDelta, oiCvdBTC, oiCvdETH, leadersTop, cryptoquant } = snap;
 
   let delivered = 0;
   for (let i = 0; i < recipients.length; i += batchSize) {
@@ -819,12 +902,12 @@ export async function broadcastMarketSnapshot(bot, { batchSize=MARKET_BATCH_SIZE
     await Promise.all(chunk.map(async (u) => {
       try {
         const lang = await resolveUserLang(u.userId).catch(() => u.lang || 'ru');
-        const parts = buildMorningReportParts(
+        const parts = await buildMorningReportParts(
           snapshots,
           lang,
           atIsoKyiv,
           fetchedAt,
-          { btcDominancePct, btcDominanceDelta, spx, totals, fgiNow, fgiDelta, oiCvdBTC, oiCvdETH, leadersTop }
+          { btcDominancePct, btcDominanceDelta, spx, totals, fgiNow, fgiDelta, oiCvdBTC, oiCvdETH, leadersTop, cryptoquant }
         );
         const isEn = String(lang).toLowerCase().startsWith('en');
         const kb = { inline_keyboard: [[
@@ -859,12 +942,23 @@ export async function sendMarketReportToUser(bot, userId){
   const snap=await getMarketSnapshot(['BTC','ETH','PAXG']);
   if(!snap?.ok) return { ok:false };
   const lang=await resolveUserLang(userId).catch(()=> 'ru');
-  const parts = buildMorningReportParts(
+  const parts = await buildMorningReportParts(
     snap.snapshots,
     lang,
     snap.atIsoKyiv || '',
     snap.fetchedAt ?? null,
-    { btcDominancePct: snap.btcDominancePct, btcDominanceDelta: snap.btcDominanceDelta, spx: snap.spx, totals: snap.totals, fgiNow: snap.fgiNow, fgiDelta: snap.fgiDelta, oiCvdBTC: snap.oiCvdBTC, oiCvdETH: snap.oiCvdETH, leadersTop: snap.leadersTop }
+    {
+      btcDominancePct: snap.btcDominancePct,
+      btcDominanceDelta: snap.btcDominanceDelta,
+      spx: snap.spx,
+      totals: snap.totals,
+      fgiNow: snap.fgiNow,
+      fgiDelta: snap.fgiDelta,
+      oiCvdBTC: snap.oiCvdBTC,
+      oiCvdETH: snap.oiCvdETH,
+      leadersTop: snap.leadersTop,
+      cryptoquant: snap.cryptoquant
+    }
   );
   const isEn = String(lang).toLowerCase().startsWith('en');
   const kb = { inline_keyboard: [[
@@ -902,13 +996,27 @@ export async function editReportMessageWithHelp(ctx){
     const isEn = String(lang).toLowerCase().startsWith('en');
     const okText = isEn ? 'Done.' : 'Готово.';
     const snap=await getMarketSnapshot(['BTC','ETH','PAXG']);
-    if(!snap?.ok) { await ctx.answerCbQuery(isEn?'Error':'Ошибка'); return; }
-    const parts = buildMorningReportParts(
+    if(!snap?.ok) {
+      await ctx.answerCbQuery(isEn?'Error':'Ошибка');
+      return;
+    }
+    const parts = await buildMorningReportParts(
       snap.snapshots,
       lang,
       snap.atIsoKyiv || '',
       snap.fetchedAt ?? null,
-      { btcDominancePct: snap.btcDominancePct, btcDominanceDelta: snap.btcDominanceDelta, spx: snap.spx, totals: snap.totals, fgiNow: snap.fgiNow, fgiDelta: snap.fgiDelta, oiCvdBTC: snap.oiCvdBTC, oiCvdETH: snap.oiCvdETH, leadersTop: snap.leadersTop }
+      {
+        btcDominancePct: snap.btcDominancePct,
+        btcDominanceDelta: snap.btcDominanceDelta,
+        spx: snap.spx,
+        totals: snap.totals,
+        fgiNow: snap.fgiNow,
+        fgiDelta: snap.fgiDelta,
+        oiCvdBTC: snap.oiCvdBTC,
+        oiCvdETH: snap.oiCvdETH,
+        leadersTop: snap.leadersTop,
+        cryptoquant: snap.cryptoquant
+      }
     );
     const kb = { inline_keyboard: [[
         { text: isEn ? 'Short report' : 'Краткий отчёт', callback_data: 'market_short' },
@@ -916,7 +1024,9 @@ export async function editReportMessageWithHelp(ctx){
       ]] };
     await ctx.reply(parts.helpHtml + '\n' + parts.footerHtml, { parse_mode:'HTML', reply_markup: kb });
     await ctx.answerCbQuery(okText);
-  } catch { try { await ctx.answerCbQuery('Ошибка'); } catch {} }
+  } catch {
+    try { await ctx.answerCbQuery('Ошибка'); } catch {}
+  }
 }
 
 export async function editReportMessageToShort(ctx){
@@ -925,7 +1035,10 @@ export async function editReportMessageToShort(ctx){
     const lang = await resolveUserLang(userId).catch(()=> 'ru');
     const isEn = String(lang).toLowerCase().startsWith('en');
     const snap=await getMarketSnapshot(['BTC','ETH','PAXG']);
-    if(!snap?.ok) { await ctx.answerCbQuery(isEn?'Error':'Ошибка'); return; }
+    if(!snap?.ok) {
+      await ctx.answerCbQuery(isEn?'Error':'Ошибка');
+      return;
+    }
     const { shortHtml, footerHtml } = buildShortReportParts(
       snap.snapshots,
       lang,
@@ -939,7 +1052,9 @@ export async function editReportMessageToShort(ctx){
       ]] };
     await ctx.editMessageText(shortHtml + '\n' + footerHtml, { parse_mode:'HTML', reply_markup: kb });
     await ctx.answerCbQuery(isEn?'Done.':'Готово.');
-  } catch { try { await ctx.answerCbQuery('Ошибка'); } catch {} }
+  } catch {
+    try { await ctx.answerCbQuery('Ошибка'); } catch {}
+  }
 }
 
 export async function editReportMessageToFull(ctx){
@@ -948,10 +1063,27 @@ export async function editReportMessageToFull(ctx){
     const lang = await resolveUserLang(userId).catch(()=> 'ru');
     const isEn = String(lang).toLowerCase().startsWith('en');
     const snap=await getMarketSnapshot(['BTC','ETH','PAXG']);
-    if(!snap?.ok) { await ctx.answerCbQuery(isEn?'Error':'Ошибка'); return; }
-    const parts = buildMorningReportParts(
-      snap.snapshots, lang, snap.atIsoKyiv || '', snap.fetchedAt ?? null,
-      { btcDominancePct: snap.btcDominancePct, btcDominanceDelta: snap.btcDominanceDelta, spx: snap.spx, totals: snap.totals, fgiNow: snap.fgiNow, fgiDelta: snap.fgiDelta, oiCvdBTC: snap.oiCvdBTC, oiCvdETH: snap.oiCvdETH, leadersTop: snap.leadersTop }
+    if(!snap?.ok) {
+      await ctx.answerCbQuery(isEn?'Error':'Ошибка');
+      return;
+    }
+    const parts = await buildMorningReportParts(
+      snap.snapshots,
+      lang,
+      snap.atIsoKyiv || '',
+      snap.fetchedAt ?? null,
+      {
+        btcDominancePct: snap.btcDominancePct,
+        btcDominanceDelta: snap.btcDominanceDelta,
+        spx: snap.spx,
+        totals: snap.totals,
+        fgiNow: snap.fgiNow,
+        fgiDelta: snap.fgiDelta,
+        oiCvdBTC: snap.oiCvdBTC,
+        oiCvdETH: snap.oiCvdETH,
+        leadersTop: snap.leadersTop,
+        cryptoquant: snap.cryptoquant
+      }
     );
     const kb = { inline_keyboard: [[
         { text: isEn ? 'Short report' : 'Краткий отчёт', callback_data: 'market_short' },
@@ -959,5 +1091,7 @@ export async function editReportMessageToFull(ctx){
       ]] };
     await ctx.editMessageText(parts.headHtml + '\n' + parts.footerHtml, { parse_mode:'HTML', reply_markup: kb });
     await ctx.answerCbQuery(isEn?'Done.':'Готово.');
-  } catch { try { await ctx.answerCbQuery('Ошибка'); } catch {} }
+  } catch {
+    try { await ctx.answerCbQuery('Ошибка'); } catch {}
+  }
 }

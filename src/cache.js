@@ -162,15 +162,3 @@ export async function getUserAlertLimit(userId) {
   } catch (e) { /* ignore */ }
   return DEFAULT_ALERT_LIMIT;
 }
-
-export async function setUserAlertLimit(userId, limit) {
-  try {
-    if (!usersCollection) return null;
-    const lim = (typeof limit === 'number' && Number.isFinite(limit)) ? Math.max(0, Math.floor(limit)) : DEFAULT_ALERT_LIMIT;
-    await usersCollection.updateOne({ userId }, { $set: { alertLimit: lim } }, { upsert: true });
-    return lim;
-  } catch (e) {
-    console.error('setUserAlertLimit error', e);
-    return null;
-  }
-}

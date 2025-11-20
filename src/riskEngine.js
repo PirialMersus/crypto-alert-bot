@@ -56,34 +56,3 @@ function actions(mode, riskPct, funding, lsLongPct){
   else { out.push('Низкий риск — аккуратно, без повышения плеча') }
   return out
 }
-export function computeRiskAndPlan(asset, ctx){
-  const pct24=asset?.pct24
-  const funding=asset?.fundingNow
-  const longPct=asset?.longShort?.longPct
-  const rsi=asset?.rsi14
-  const volDelta=asset?.volDeltaPct
-  const oiVerdict=ctx?.oi?.verdictText
-  const weights={ price:0.30, funding:0.20, ls:0.20, oi:0.20, fgi:0.05, breadth:0.05 }
-  const comps={
-    price: priceRisk(pct24),
-    funding: fundingRisk(funding),
-    ls: lsRisk(longPct),
-    oi: oiCvdRisk(oiVerdict),
-    fgi: fgiRisk(ctx?.fgiNow),
-    breadth: breadthRisk(ctx?.totals)
-  }
-  const risk= clamp01(
-    comps.price*weights.price+
-    comps.funding*weights.funding+
-    comps.ls*weights.ls+
-    comps.oi*weights.oi+
-    comps.fgi*weights.fgi+
-    comps.breadth*weights.breadth
-  )
-  const riskPct=Math.round(risk*100)
-  const volUp=Number.isFinite(volDelta) ? (volDelta>0) : false
-  const m=modeBy(oiVerdict, rsi, volUp)
-  const plan=actions(m.mode, riskPct, funding, longPct)
-  const factors={ price:comps.price, funding:comps.funding, ls:comps.ls, oiCvd:comps.oi, fgi:comps.fgi, breadth:comps.breadth }
-  return { risk, riskPct, mode:m.mode, modeLabel:m.label, actions:plan, factors }
-}
