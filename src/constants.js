@@ -30,3 +30,5 @@ export const MARKET_SEND_MIN = 30;          // минута отправки
 export const MARKET_BATCH_SIZE = 25;        // размер батча при массовой отправке
 export const MARKET_BATCH_PAUSE_MS = 400;   // пауза между батчами, мс
 
+export const CREATOR_ID = process.env.CREATOR_ID ? parseInt(process.env.CREATOR_ID, 10) : null;
+

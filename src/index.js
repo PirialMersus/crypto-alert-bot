@@ -2,7 +2,8 @@
 import dotenv from 'dotenv'
 dotenv.config()
 
-import { startBot, bot } from './bot.js'
+import { bot } from './bot.js'
+import {startBot} from "./utils.js";
 
 let serverRef = null
 

@@ -313,7 +313,8 @@ export async function getMarketSnapshot(symbols=['BTC','ETH','PAXG']){
         totals: 1,
         oiCvd: 1,
         capTop: 1,
-        cryptoquant: 1
+        cryptoquant: 1,
+        gemini: 1
       }
     }
   ).sort({ at: -1 }).limit(1).next();
@@ -380,7 +381,8 @@ export async function getMarketSnapshot(symbols=['BTC','ETH','PAXG']){
     oiCvdBTC: freshest?.oiCvd?.BTC || null,
     oiCvdETH: freshest?.oiCvd?.ETH || null,
     leadersTop,
-    cryptoquant: freshest.cryptoquant || null
+    cryptoquant: freshest.cryptoquant || null,
+    gemini: freshest.gemini || null
   };
 
   _snapCache.set(cacheKey, { ts: now, data: result });
@@ -911,7 +913,7 @@ export async function broadcastMarketSnapshot(bot, { batchSize=MARKET_BATCH_SIZE
         );
         const isEn = String(lang).toLowerCase().startsWith('en');
         const kb = { inline_keyboard: [[
-            { text: isEn ? 'Short report' : 'Краткий отчёт', callback_data: 'market_short' },
+            { text: isEn ? 'AI recommendations' : 'Рекомендации от ИИ', callback_data: 'market_ai' },
             { text: isEn ? 'Guide' : 'Справка', callback_data: 'market_help' }
           ]] };
         await bot.telegram.sendMessage(u.userId, parts.headHtml + '\n' + parts.footerHtml, { parse_mode:'HTML', reply_markup: kb });
@@ -962,7 +964,7 @@ export async function sendMarketReportToUser(bot, userId){
   );
   const isEn = String(lang).toLowerCase().startsWith('en');
   const kb = { inline_keyboard: [[
-      { text: isEn ? 'Short report' : 'Краткий отчёт', callback_data: 'market_short' },
+      { text: isEn ? 'AI recommendations' : 'Рекомендации от ИИ', callback_data: 'market_ai' },
       { text: isEn ? 'Guide' : 'Справка', callback_data: 'market_help' }
     ]] };
   await bot.telegram.sendMessage(userId, parts.headHtml + '\n' + parts.footerHtml, { parse_mode:'HTML', reply_markup: kb });
@@ -982,7 +984,7 @@ export async function sendShortReportToUser(bot, userId){
   );
   const isEn = String(lang).toLowerCase().startsWith('en');
   const kb = { inline_keyboard: [[
-      { text: isEn ? 'Full report' : 'Полный отчёт', callback_data: 'market_full' },
+      { text: isEn ? 'AI recommendations' : 'Рекомендации от ИИ', callback_data: 'market_ai' },
       { text: isEn ? 'Guide' : 'Справка', callback_data: 'market_help' }
     ]] };
   await bot.telegram.sendMessage(userId, shortHtml + '\n' + footerHtml, { parse_mode:'HTML', reply_markup: kb });
@@ -1019,7 +1021,7 @@ export async function editReportMessageWithHelp(ctx){
       }
     );
     const kb = { inline_keyboard: [[
-        { text: isEn ? 'Short report' : 'Краткий отчёт', callback_data: 'market_short' },
+        { text: isEn ? 'AI recommendations' : 'Рекомендации от ИИ', callback_data: 'market_ai' },
         { text: isEn ? 'Full report'  : 'Полный отчёт',   callback_data: 'market_full'  }
       ]] };
     await ctx.reply(parts.helpHtml + '\n' + parts.footerHtml, { parse_mode:'HTML', reply_markup: kb });
@@ -1047,7 +1049,7 @@ export async function editReportMessageToShort(ctx){
       { btcDominancePct: snap.btcDominancePct, btcDominanceDelta: snap.btcDominanceDelta, totals: snap.totals, fgiNow: snap.fgiNow, fgiDelta: snap.fgiDelta }
     );
     const kb = { inline_keyboard: [[
-        { text: isEn ? 'Full report' : 'Полный отчёт', callback_data: 'market_full' },
+        { text: isEn ? 'AI recommendations' : 'Рекомендации от ИИ', callback_data: 'market_ai' },
         { text: isEn ? 'Guide' : 'Справка', callback_data: 'market_help' }
       ]] };
     await ctx.editMessageText(shortHtml + '\n' + footerHtml, { parse_mode:'HTML', reply_markup: kb });
@@ -1086,7 +1088,7 @@ export async function editReportMessageToFull(ctx){
       }
     );
     const kb = { inline_keyboard: [[
-        { text: isEn ? 'Short report' : 'Краткий отчёт', callback_data: 'market_short' },
+        { text: isEn ? 'AI recommendations' : 'Рекомендации от ИИ', callback_data: 'market_ai' },
         { text: isEn ? 'Guide' : 'Справка', callback_data: 'market_help' }
       ]] };
     await ctx.editMessageText(parts.headHtml + '\n' + parts.footerHtml, { parse_mode:'HTML', reply_markup: kb });
