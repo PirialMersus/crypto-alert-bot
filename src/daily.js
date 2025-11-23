@@ -352,6 +352,42 @@ export async function sendDailyToUser(bot, userId, dateStr, opts = { disableNoti
   }
 }
 
+export async function ensureDailyImageBuffer(dateStr) {
+  if (dailyCache.date !== dateStr) {
+    const doc = await dailyMotivationCollection.findOne({ date: dateStr }).catch(()=>null);
+    if (!doc) return null;
+    dailyCache.date = dateStr;
+    dailyCache.doc = doc;
+    dailyCache.imageBuffer = null;
+  }
+  if (dailyCache.imageBuffer) return dailyCache.imageBuffer;
+
+  const doc = dailyCache.doc;
+  if (doc?.image?.url) {
+    try {
+      const r = await httpClient.get(doc.image.url, { responseType: 'arraybuffer', maxRedirects: 10, timeout: 8000 });
+      if (r && r.data) {
+        dailyCache.imageBuffer = Buffer.from(r.data);
+        return dailyCache.imageBuffer;
+      }
+    } catch (e) { console.warn('ensureDailyImageBuffer fetch stored url failed', e?.message || e); }
+  }
+
+  const got = await fetchRandomImage().catch(()=>null);
+  if (got && got.buffer) {
+    dailyCache.imageBuffer = got.buffer;
+    try {
+      if (got.url) {
+        await dailyMotivationCollection.updateOne({ date: dateStr }, { $set: { 'image.url': got.url, 'image.source': got.source } });
+        dailyCache.doc.image = { url: got.url, source: got.source };
+      }
+    } catch (e) { /* ignore */ }
+    return dailyCache.imageBuffer;
+  }
+
+  return null;
+}
+
 export async function processDailyQuoteRetry(bot) {
   try {
     if (!dailyQuoteRetryCollection) return;

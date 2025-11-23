@@ -913,7 +913,7 @@ export async function broadcastMarketSnapshot(bot, { batchSize=MARKET_BATCH_SIZE
         );
         const isEn = String(lang).toLowerCase().startsWith('en');
         const kb = { inline_keyboard: [[
-            { text: isEn ? 'AI recommendations' : 'Рекомендации от ИИ', callback_data: 'market_ai' },
+            { text: isEn ? 'AI recommendations' : 'Рекомендации ИИ', callback_data: 'market_ai' },
             { text: isEn ? 'Guide' : 'Справка', callback_data: 'market_help' }
           ]] };
         await bot.telegram.sendMessage(u.userId, parts.headHtml + '\n' + parts.footerHtml, { parse_mode:'HTML', reply_markup: kb });
@@ -964,7 +964,7 @@ export async function sendMarketReportToUser(bot, userId){
   );
   const isEn = String(lang).toLowerCase().startsWith('en');
   const kb = { inline_keyboard: [[
-      { text: isEn ? 'AI recommendations' : 'Рекомендации от ИИ', callback_data: 'market_ai' },
+      { text: isEn ? 'AI recommendations' : 'Рекомендации ИИ', callback_data: 'market_ai' },
       { text: isEn ? 'Guide' : 'Справка', callback_data: 'market_help' }
     ]] };
   await bot.telegram.sendMessage(userId, parts.headHtml + '\n' + parts.footerHtml, { parse_mode:'HTML', reply_markup: kb });
@@ -984,7 +984,7 @@ export async function sendShortReportToUser(bot, userId){
   );
   const isEn = String(lang).toLowerCase().startsWith('en');
   const kb = { inline_keyboard: [[
-      { text: isEn ? 'AI recommendations' : 'Рекомендации от ИИ', callback_data: 'market_ai' },
+      { text: isEn ? 'AI recommendations' : 'Рекомендации ИИ', callback_data: 'market_ai' },
       { text: isEn ? 'Guide' : 'Справка', callback_data: 'market_help' }
     ]] };
   await bot.telegram.sendMessage(userId, shortHtml + '\n' + footerHtml, { parse_mode:'HTML', reply_markup: kb });
@@ -1021,7 +1021,7 @@ export async function editReportMessageWithHelp(ctx){
       }
     );
     const kb = { inline_keyboard: [[
-        { text: isEn ? 'AI recommendations' : 'Рекомендации от ИИ', callback_data: 'market_ai' },
+        { text: isEn ? 'AI recommendations' : 'Рекомендации ИИ', callback_data: 'market_ai' },
         { text: isEn ? 'Full report'  : 'Полный отчёт',   callback_data: 'market_full'  }
       ]] };
     await ctx.reply(parts.helpHtml + '\n' + parts.footerHtml, { parse_mode:'HTML', reply_markup: kb });
@@ -1049,7 +1049,7 @@ export async function editReportMessageToShort(ctx){
       { btcDominancePct: snap.btcDominancePct, btcDominanceDelta: snap.btcDominanceDelta, totals: snap.totals, fgiNow: snap.fgiNow, fgiDelta: snap.fgiDelta }
     );
     const kb = { inline_keyboard: [[
-        { text: isEn ? 'AI recommendations' : 'Рекомендации от ИИ', callback_data: 'market_ai' },
+        { text: isEn ? 'AI recommendations' : 'Рекомендации ИИ', callback_data: 'market_ai' },
         { text: isEn ? 'Guide' : 'Справка', callback_data: 'market_help' }
       ]] };
     await ctx.editMessageText(shortHtml + '\n' + footerHtml, { parse_mode:'HTML', reply_markup: kb });
@@ -1088,7 +1088,7 @@ export async function editReportMessageToFull(ctx){
       }
     );
     const kb = { inline_keyboard: [[
-        { text: isEn ? 'AI recommendations' : 'Рекомендации от ИИ', callback_data: 'market_ai' },
+        { text: isEn ? 'AI recommendations' : 'Рекомендации ИИ', callback_data: 'market_ai' },
         { text: isEn ? 'Guide' : 'Справка', callback_data: 'market_help' }
       ]] };
     await ctx.editMessageText(parts.headHtml + '\n' + parts.footerHtml, { parse_mode:'HTML', reply_markup: kb });
