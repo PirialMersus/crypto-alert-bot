@@ -3,7 +3,7 @@ import dotenv from 'dotenv'
 dotenv.config()
 
 import { bot } from './bot.js'
-import {startBot} from "./utils.js";
+import {startBot} from "./utils/utils.js";
 
 let serverRef = null
 

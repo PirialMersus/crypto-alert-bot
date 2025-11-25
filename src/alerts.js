@@ -3,7 +3,7 @@ import { ENTRIES_PER_PAGE, BG_CHECK_INTERVAL, DELETE_LABEL_TARGET_LEN } from './
 import { alertsCollection, usersCollection, alertsArchiveCollection } from './db.js';
 import { tickersCache, pricesCache, allAlertsCache, getUserAlertsCached, getAllAlertsCached, getUserLastViews, setUserLastViews, invalidateUserAlertsCache, getUserAlertsOrder } from './cache.js';
 import { getPriceLevel1 } from './prices.js';
-import { fmtNum, formatChangeWithIcons, padLabel } from './utils.js';
+import { fmtNum, formatChangeWithIcons, padLabel } from './utils/utils.js';
 import { resolveUserLang } from './cache.js';
 
 function t(lang, key, ...vars) {

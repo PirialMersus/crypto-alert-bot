@@ -1,5 +1,5 @@
-// src/utils.js
-import {getUserAlertsOrder, resolveUserLang, statsCache} from "./cache.js";
+// src/utils/utils.js
+import {getUserAlertsOrder, resolveUserLang, statsCache} from "../cache.js";
 import {
   CACHE_TTL, CREATOR_ID,
   DAY_MS,
@@ -8,21 +8,21 @@ import {
   KYIV_TZ, MARKET_BATCH_PAUSE_MS, MARKET_BATCH_SIZE,
   MARKET_SEND_HOUR, MARKET_SEND_MIN,
   PREPARE_SEND_HOUR
-} from "./constants.js";
+} from "../constants.js";
 import {
   broadcastMarketSnapshot,
-  buildMorningReportHtml,
+  buildMorningReportHtml, buildMorningReportParts,
   getMarketSnapshot,
   sendMarketReportToUser
 } from "./marketMonitor.js";
-import {bot} from "./bot.js";
-import {setLastHeartbeat} from "./monitor.js";
-import {connectToMongo, countDocumentsWithTimeout, isDbConnected} from "./db.js";
-import {fetchAndStoreDailyMotivation, processDailyQuoteRetry, sendDailyToUser, watchForNewQuotes} from "./daily.js";
-import {startTickersRefresher} from "./prices.js";
-import {startAlertsChecker} from "./alerts.js";
-import {removeInactive} from "./cleanup.js";
-import {createServer} from "./server.js";
+import {bot} from "../bot.js";
+import {setLastHeartbeat} from "../monitor.js";
+import {connectToMongo, countDocumentsWithTimeout, isDbConnected} from "../db.js";
+import {fetchAndStoreDailyMotivation, processDailyQuoteRetry, sendDailyToUser, watchForNewQuotes} from "../daily.js";
+import {startTickersRefresher} from "../prices.js";
+import {startAlertsChecker} from "../alerts.js";
+import {removeInactive} from "../cleanup.js";
+import {createServer} from "../server.js";
 
 export function fmtNum(n) {
   if (!Number.isFinite(n)) return '—';
@@ -79,97 +79,6 @@ export function geminiToHtml(s) {
 
   return t;
 }
-
-
-export function buildAiPrompt(lang, reportText) {
-  const isEn = String(lang).toLowerCase().startsWith('en');
-  const reportBlock = String(reportText || '');
-  if (isEn) {
-    return (
-      'You are a professional crypto market analyst and educator for beginner–intermediate traders and investors.\n\n' +
-      'User addressing rules:\n' +
-      '- Address the user directly as a single person.\n' +
-      '- Use a friendly, confident, mentor-like tone, as if guiding a future pro trader.\n' +
-      '- Always address the user as "Future millionaire", but no more than once in the whole answer.\n' +
-      '- Do NOT use: "colleagues", "everyone", "dear friends", "ladies and gentlemen".\n\n' +
-      'You are given a fresh market report below. Based ONLY on that report, you must:\n' +
-      '1) Describe the overall market state: who is in control (buyers vs sellers), whether there is panic, oversold/overbought conditions, etc.\n' +
-      '2) Highlight key risks and threats (liquidations, long/short imbalance, extreme fear, funding, flows, etc.).\n' +
-      '3) Describe two main scenarios:\n' +
-      '   • short term (hours / couple of days),\n' +
-      '   • medium term (several days to weeks).\n' +
-      '4) Provide concrete recommendations for a TRADER:\n' +
-      '   • separate block "✅ What a trader SHOULD do",\n' +
-      '   • separate block "❌ What a trader SHOULD NOT do".\n' +
-      '5) Provide recommendations for a LONG-TERM INVESTOR:\n' +
-      '   • block "✅ What an investor SHOULD do",\n' +
-      '   • block "❌ What an investor SHOULD NOT do".\n' +
-      '6) List which metrics are important to monitor in the near future (RSI, funding, long/short ratio, OI, CVD, flows, etc.).\n' +
-      '7) End with a short 2–3 sentence summary: your overall verdict on the market.\n\n' +
-      'Important:\n' +
-      '- Rely ONLY on the data from the report below. Do NOT invent your own prices or indicators.\n' +
-      '- Answer in English, clearly and structurally, as if explaining to a thinking but not very advanced trader.\n' +
-      '- Avoid vague statements like "the market is volatile, be careful". Be specific and scenario-based.\n' +
-      '- Use a few emojis to structure the answer (in section titles and key bullet points: 📊, ⚠️, 📈, 📉, 🧠, 🧘, 🔍, ✅, ❌).\n\n' +
-      'Response format (Markdown, no links, no tables):\n' +
-      '1. Short headline with the main takeaway.\n' +
-      '2. Section 📊 "Overall market picture".\n' +
-      '3. Section ⚠️ "Main risks".\n' +
-      '4. Section 🧠 "Price scenarios".\n' +
-      '5. Section 📈 "Trader recommendations" (with "✅ What to do" / "❌ What NOT to do").\n' +
-      '6. Section 🧘 "Investor recommendations" (with "✅" / "❌").\n' +
-      '7. Section 🔍 "What to watch next".\n' +
-      '8. Short final summary.\n\n' +
-      'Here is the report data you must base your analysis on:\n' +
-      '```\n' +
-      reportBlock +
-      '\n```'
-    );
-  }
-  return (
-    'Ты — профессиональный аналитик криптовалютного рынка и преподаватель для начинающих трейдеров и инвесторов.\n\n' +
-    'Правила обращения к пользователю:\n' +
-    '- Обращайся к пользователю на "ты".\n' +
-    '- Используй дружеский, уверенный и наставнический тон, как будто ты опытный трейдер-наставник.\n' +
-    '- Всегда обращайся к пользователю как к "Будущий миллионер". Но не более одного раза за весь текст\n' +
-    '- Не используй слова: "коллеги", "друзья", "вы", "уважаемые", "господа".\n\n' +
-    'У тебя есть свежий рыночный отчёт внизу. По нему нужно:\n' +
-    '1) Дать общую картину рынка: кто сейчас доминирует — покупатели или продавцы, есть ли паника, перепроданность/перекупленность.\n' +
-    '2) Выделить ключевые риски и угрозы (ликвидации, перекос лонги/шорты, экстремальный страх и т.п.).\n' +
-    '3) Описать два основных сценария:\n' +
-    '   • краткосрочный (часы/пара дней),\n' +
-    '   • среднесрочный (несколько дней–недели).\n' +
-    '4) Дать конкретные рекомендации для ТРЕЙДЕРА:\n' +
-    '   • отдельный блок "✅ Что делать трейдеру",\n' +
-    '   • отдельный блок "❌ Чего НЕ делать трейдеру".\n' +
-    '5) Дать рекомендации для ДОЛГОСРОЧНОГО ИНВЕСТОРА:\n' +
-    '   • отдельный блок "✅ Что делать инвестору",\n' +
-    '   • отдельный блок "❌ Чего НЕ делать инвестору".\n' +
-    '6) Указать, какие метрики важно отслеживать в ближайшее время (RSI, фандинг, лонги/шорты, OI, CVD, притоки/оттоки и т.п.).\n' +
-    '7) В конце дать короткое резюме в 2–3 предложения: общий вердикт по рынку.\n\n' +
-    'Очень важно:\n' +
-    '- Опираться ТОЛЬКО на данные отчёта ниже. Не придумывай свои цены или показатели.\n' +
-    '- Пиши по-русски, структурно и понятно, как для думающего, но не супер-опытного трейдера.\n' +
-    '- Избегай воды и общих фраз вроде "рынок волатилен, будьте осторожны".\n' +
-    '- Используй немного эмодзи, чтобы структурировать ответ:\n' +
-    '  • заголовки разделов можно помечать: 📊, ⚠️, 📈, 📉, 🧠, 🧘, 🔍, ✅, ❌\n' +
-    'Формат ответа (Markdown, но без ссылок и без таблиц):\n' +
-    '1. Короткий заголовок с общим выводом.\n' +
-    '2. Раздел 📊 "Общая картина рынка".\n' +
-    '3. Раздел ⚠️ "Основные риски".\n' +
-    '4. Раздел 🧠 "Сценарии движения цены".\n' +
-    '5. Раздел 📈 "Рекомендации для трейдера" (с подпунктами "✅ Что делать" и "❌ Чего не делать").\n' +
-    '6. Раздел 🧘 "Рекомендации для инвестора" (также с "✅" и "❌").\n' +
-    '7. Раздел 🔍 "Что смотреть дальше".\n' +
-    '8. Короткое итоговое резюме.\n\n' +
-    'Ниже данные отчёта, на которых нужно основать анализ:\n' +
-    '```\n' +
-    reportBlock +
-    '\n```'
-  );
-}
-
-
 
 export function mdBoldToHtml(s) {
   return String(s)
@@ -279,7 +188,7 @@ export async function buildSettingsInlineForUser(userId, langOverride = null) {
   let sendMotivation = true;
   let sendMarketReport = true;
   try {
-    const {usersCollection} = await import('./db.js');
+    const {usersCollection} = await import('../db.js');
     const u = await usersCollection.findOne({userId});
     if (typeof u?.sendMotivation === 'boolean') sendMotivation = u.sendMotivation;
     if (typeof u?.sendMarketReport === 'boolean') sendMarketReport = u.sendMarketReport;
@@ -384,8 +293,8 @@ function supportText(isEn) {
 
 export function getMainMenuSync(userId, lang = 'ru') {
   const isEn = String(lang).split('-')[0] === 'en';
-  const create = isEn ? '➕ Create alert' : '➕ Создать алерт';
-  const my = isEn ? '📋 My alerts' : '📋 Мои алерты';
+  const create = isEn ? '➕ Create alert' : '➕ Создать';
+  const my = isEn ? '📋 My alerts' : '📋 Мои уведомления';
   const shortBtn = isEn ? '📈 Short market report' : '📈 Краткий отчёт';
   const fullBtn = isEn ? '📊 Full report' : '📊 Полный отчёт';
   const history = isEn ? '📜 Alerts history' : '📜 История алертов';
@@ -520,7 +429,7 @@ export async function startBot() {
 
         try {
           const dateStr = day;
-          const {usersCollection, pendingDailySendsCollection} = await import('./db.js');
+          const {usersCollection, pendingDailySendsCollection} = await import('../db.js');
           const already = await pendingDailySendsCollection.find({
             date: dateStr,
             sent: true
@@ -615,3 +524,74 @@ export function extractReportTimeLine(reportHtml) {
   const m = text.match(/(Данные на:[^\n]+|Data as of:[^\n]+)/);
   return m ? m[1].trim() : null;
 }
+
+export async function editReportMessageToFull(ctx){
+  try{
+    const userId = ctx.from?.id;
+    const lang = await resolveUserLang(userId).catch(()=> 'ru');
+    const isEn = String(lang).toLowerCase().startsWith('en');
+    const snap=await getMarketSnapshot(['BTC','ETH','PAXG']);
+    console.log("📥 RAW SNAP FROM DB:", JSON.stringify(snap, null, 2));
+    if(!snap?.ok) {
+      await ctx.answerCbQuery(isEn?'Error':'Ошибка');
+      return;
+    }
+    const parts = await buildMorningReportParts(
+      snap.snapshots,
+      lang,
+      snap.atIsoKyiv || '',
+      snap.fetchedAt ?? null,
+      {
+        btcDominancePct: snap.btcDominancePct,
+        btcDominanceDelta: snap.btcDominanceDelta,
+        spx: snap.spx,
+        totals: snap.totals,
+        fgiNow: snap.fgiNow,
+        fgiDelta: snap.fgiDelta,
+        oiCvdBTC: snap.oiCvdBTC,
+        oiCvdETH: snap.oiCvdETH,
+        leadersTop: snap.leadersTop,
+        cryptoquant: snap.cryptoquant,
+        macro: snap.macro || null,
+      }
+    );
+    const kb = { inline_keyboard: [[
+        { text: isEn ? 'AI recommendations' : 'Рекомендации ИИ', callback_data: 'market_ai' },
+        { text: isEn ? 'Guide' : 'Справка', callback_data: 'market_help' }
+      ]] };
+    await ctx.editMessageText(parts.headHtml + '\n' + parts.footerHtml, { parse_mode:'HTML', reply_markup: kb });
+    await ctx.answerCbQuery(isEn?'Done.':'Готово.');
+  } catch {
+    try { await ctx.answerCbQuery('Ошибка'); } catch {}
+  }
+}
+
+
+export async function editReportMessageToShort(ctx){
+  try{
+    const userId = ctx.from?.id;
+    const lang = await resolveUserLang(userId).catch(()=> 'ru');
+    const isEn = String(lang).toLowerCase().startsWith('en');
+    const snap=await getMarketSnapshot(['BTC','ETH','PAXG']);
+    if(!snap?.ok) {
+      await ctx.answerCbQuery(isEn?'Error':'Ошибка');
+      return;
+    }
+    const { shortHtml, footerHtml } = buildShortReportParts(
+      snap.snapshots,
+      lang,
+      snap.atIsoKyiv || '',
+      snap.fetchedAt ?? null,
+      { btcDominancePct: snap.btcDominancePct, btcDominanceDelta: snap.btcDominanceDelta, totals: snap.totals, fgiNow: snap.fgiNow, fgiDelta: snap.fgiDelta }
+    );
+    const kb = { inline_keyboard: [[
+        { text: isEn ? 'AI recommendations' : 'Рекомендации ИИ', callback_data: 'market_ai' },
+        { text: isEn ? 'Guide' : 'Справка', callback_data: 'market_help' }
+      ]] };
+    await ctx.editMessageText(shortHtml + '\n' + footerHtml, { parse_mode:'HTML', reply_markup: kb });
+    await ctx.answerCbQuery(isEn?'Done.':'Готово.');
+  } catch {
+    try { await ctx.answerCbQuery('Ошибка'); } catch {}
+  }
+}
+

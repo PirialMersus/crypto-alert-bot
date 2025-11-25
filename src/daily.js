@@ -302,7 +302,7 @@ export async function sendDailyToUser(bot, userId, dateStr, opts = { disableNoti
     }
 
     if (!quoteText) {
-      const fallback = String((await import('./utils.js').then(m=>m.buildWish()).catch(()=> 'Хорошего дня!'))).slice(0, QUOTE_CAPTION_MAX);
+      const fallback = String((await import('./utils/utils.js').then(m=>m.buildWish()).catch(()=> 'Хорошего дня!'))).slice(0, QUOTE_CAPTION_MAX);
       if (buf) {
         try { await bot.telegram.sendPhoto(userId, { source: buf }, { caption: fallback, disable_notification: !!opts.disableNotification }); } catch (e) { console.warn('sendDailyToUser sendPhoto failed fallback', e); await recordSendStatus(false, false); return false; }
       } else {

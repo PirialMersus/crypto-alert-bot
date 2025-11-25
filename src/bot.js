@@ -1,56 +1,45 @@
 // src/bot.js
-import {Telegraf, session} from 'telegraf';
+import {session, Telegraf} from 'telegraf';
 import dotenv from 'dotenv';
-import {connectToMongo, ObjectId, countDocumentsWithTimeout, isDbConnected} from './db.js';
-import {createServer} from './server.js';
-import {startTickersRefresher, refreshAllTickers, getCachedPrice} from './prices.js';
-import {startAlertsChecker, renderAlertsList, buildDeleteInlineForUser, renderOldAlertsList} from './alerts.js';
-import {removeInactive} from './cleanup.js';
+import {ObjectId} from './db.js';
+import {getCachedPrice, refreshAllTickers} from './prices.js';
+import {buildDeleteInlineForUser, renderAlertsList, renderOldAlertsList} from './alerts.js';
 import {
-  getUserRecentSymbols,
-  pushRecentSymbol,
-  getUserAlertsOrder,
-  setUserAlertsOrder,
-  getUserAlertsCached,
-  invalidateUserAlertsCache,
-  statsCache,
   getUserAlertLimit,
-  resolveUserLang
+  getUserAlertsCached,
+  getUserAlertsOrder,
+  getUserRecentSymbols,
+  invalidateUserAlertsCache,
+  pushRecentSymbol,
+  resolveUserLang,
+  setUserAlertsOrder
 } from './cache.js';
 import {
-  buildAiPrompt, buildAskSlKeyboard,
-  buildCancelButton, buildDirectionKeyboard,
+  buildAskSlKeyboard,
+  buildCancelButton,
+  buildDirectionKeyboard,
   buildSettingsInlineForUser,
-  editHtmlOrReply, extractReportTimeLine,
+  editHtmlOrReply, editReportMessageToFull, editReportMessageToShort,
+  extractReportTimeLine,
   fmtNum,
   geminiToHtml,
-  getMainMenuSync, handleActiveUsers, handleMarketSnapshotRequest, handleMotivationRequest,
+  getMainMenuSync,
+  handleActiveUsers,
+  handleMarketSnapshotRequest,
+  handleMotivationRequest,
   mdBoldToHtml,
-  splitMessage, startHeartbeat, startTyping, stopTyping
-} from './utils.js';
-import {sendDailyToUser, processDailyQuoteRetry, watchForNewQuotes, fetchAndStoreDailyMotivation} from './daily.js';
-import {
-  CACHE_TTL,
-  INACTIVE_DAYS,
-  DAY_MS,
-  IMAGE_FETCH_HOUR,
-  PREPARE_SEND_HOUR,
-  ENTRIES_PER_PAGE,
-  KYIV_TZ,
-  MARKET_SEND_HOUR,
-  MARKET_SEND_MIN,
-  MARKET_BATCH_SIZE,
-  MARKET_BATCH_PAUSE_MS
-} from './constants.js';
+  splitMessage,
+  startTyping,
+  stopTyping
+} from './utils/utils.js';
+import {ENTRIES_PER_PAGE, KYIV_TZ} from './constants.js';
 
 import {
-  broadcastMarketSnapshot, buildMorningReportHtml,
-  editReportMessageToFull,
-  editReportMessageToShort, getMarketSnapshot,
+  buildMorningReportHtml,
+  getMarketSnapshot,
   sendShortReportToUser
-} from './marketMonitor.js';
+} from './utils/marketMonitor.js';
 import {getLiqMapInfo} from './liqBridgeApi.js';
-import {askGemini} from './gemini.js';
 
 dotenv.config();
 
@@ -180,7 +169,7 @@ bot.hears(['🛠️ Техподдержка/пожелания', 'Пожела�
   await ctx.reply(msg, getMainMenuSync(ctx.from.id, lang));
 });
 
-bot.hears(['➕ Создать алерт', '➕ Create alert'], async (ctx) => {
+bot.hears(['➕ Создать', '➕ Create alert'], async (ctx) => {
   try {
     ctx.session = {step: 'symbol'};
     refreshAllTickers().catch(() => {
@@ -208,7 +197,7 @@ bot.hears(['↩️ Отмена', '↩️ Cancel'], async (ctx) => {
   await ctx.reply(isEn ? 'Cancelled ✅' : 'Отмена ✅', getMainMenuSync(ctx.from.id, lang));
 });
 
-bot.hears(['📋 Мои алерты', '📋 My alerts'], async (ctx) => {
+bot.hears(['📋 Мои уведомления', '📋 My alerts'], async (ctx) => {
   try {
     try {
       await bot.telegram.sendChatAction(ctx.chat.id, 'typing');
@@ -374,11 +363,6 @@ bot.on('callback_query', async (ctx) => {
           }
         }
 
-        if (!answer) {
-          const prompt = buildAiPrompt(lang, fullHtml);
-          answer = await askGemini(prompt);
-        }
-
         const timeLine2 = extractReportTimeLine(fullHtml);
 
         if (timeLine2) {
@@ -457,7 +441,7 @@ bot.on('callback_query', async (ctx) => {
     }
 
     if (data === 'market_help') {
-      const mm = await import('./marketMonitor.js');
+      const mm = await import('./utils/marketMonitor.js');
       try {
         await mm.editReportMessageWithHelp(ctx);
         await ctx.answerCbQuery();
@@ -932,91 +916,7 @@ bot.on('text', async (ctx) => {
   if (ctx.session?.liqAwait) return;
   try {
     const step = ctx.session.step;
-    const textRaw = (ctx.message.text || '').trim();
-    const text = textRaw;
-
-    if (step === 'gemini_prompt') {
-      const userId = ctx.from?.id;
-      const lang = await resolveUserLang(userId);
-      const isEn = String(lang).startsWith('en');
-      const question = textRaw;
-
-      ctx.session = {...(ctx.session || {}), step: null};
-
-      console.log('[gemini] step=gemini_prompt received text', {
-        userId,
-        questionPreview: question.slice(0, 200),
-        questionLength: question.length
-      });
-
-      let typingTimer = null;
-      try {
-        if (typeof startTyping === 'function') {
-          typingTimer = startTyping(ctx);
-          console.log('[gemini] typing started', {userId});
-        }
-      } catch (e) {
-        console.error('[gemini] startTyping error', {userId, message: e?.message});
-      }
-
-      try {
-        console.log('[gemini] calling askGemini');
-        const answer = await askGemini(question);
-        console.log('[gemini] askGemini success', {
-          userId,
-          answerPreview: answer.slice(0, 200),
-          answerLength: answer.length
-        });
-
-        const chunks = splitMessage(answer, 3500);
-        console.log('[gemini] split answer', {
-          userId,
-          chunks: chunks.length,
-          firstChunkLen: chunks[0]?.length || 0
-        });
-
-        for (let i = 0; i < chunks.length; i++) {
-          const html = geminiToHtml(chunks[i]);
-          const extraBase = {
-            parse_mode: 'HTML',
-            disable_web_page_preview: true
-          };
-          const extraMenu = i === chunks.length - 1 ? getMainMenuSync(userId, lang) : {};
-          await ctx.reply(html, {...extraBase, ...extraMenu});
-        }
-
-        console.log('[gemini] all chunks sent', {userId});
-      } catch (e) {
-        console.error('[gemini] askGemini failed or reply failed', {
-          userId,
-          message: e?.message
-        });
-
-        const errText = isEn
-          ? 'Ошибка при обращении к Gemini. Попробуй позже.'
-          : 'Ошибка при обращении к Gemini. Попробуй позже.';
-
-        try {
-          await ctx.reply(errText, getMainMenuSync(userId, lang));
-        } catch (e2) {
-          console.error('[gemini] failed to send error message', {
-            userId,
-            message: e2?.message
-          });
-        }
-      } finally {
-        if (typingTimer && typeof stopTyping === 'function') {
-          try {
-            stopTyping(typingTimer);
-            console.log('[gemini] typing stopped', {userId});
-          } catch (e) {
-            console.error('[gemini] stopTyping error', {userId, message: e?.message});
-          }
-        }
-      }
-
-      return;
-    }
+    const text = (ctx.message.text || '').trim();
 
     const daysMap = {'7 дней': 7, '30 дней': 30, '90 дней': 90, '7 days': 7, '30 days': 30, '90 days': 90};
     const numeric = parseInt(text.replace(/\D/g, ''), 10);
