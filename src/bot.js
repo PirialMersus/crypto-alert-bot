@@ -1,7 +1,7 @@
 // src/bot.js
 import {session, Telegraf} from 'telegraf';
 import dotenv from 'dotenv';
-import {ObjectId} from './db.js';
+import {ObjectId} from './db/db.js';
 import {getCachedPrice, refreshAllTickers} from './prices.js';
 import {buildDeleteInlineForUser, renderAlertsList, renderOldAlertsList} from './alerts.js';
 import {
@@ -53,7 +53,7 @@ bot.command('oleg', async (ctx) => {
     const collName = process.env.WATCH_FLAG_COLL || 'flags';
     const flagId = process.env.WATCH_FLAG_ID || 'collector_win';
     const dbName = process.env.DB_NAME || 'crypto_alert_dev';
-    const {client} = await import('./db.js');
+    const {client} = await import('./db/db.js');
     const db = client.db(dbName);
     const token = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
@@ -93,7 +93,7 @@ bot.use((ctx, next) => {
 bot.use(async (ctx, next) => {
   try {
     if (ctx.from?.id) {
-      const {usersCollection} = await import('./db.js');
+      const {usersCollection} = await import('./db/db.js');
       const u = await usersCollection.findOne({userId: ctx.from.id}, {projection: {lastActive: 1}});
       const now = new Date();
       const last = u?.lastActive ? new Date(u.lastActive) : null;
@@ -227,7 +227,7 @@ bot.hears(['🗺️ Карты ликвидаций', '🗺️ Liquidation maps'
   await ctx.reply(msg, {reply_markup: {keyboard: kb, resize_keyboard: true}});
 });
 
-bot.hears(['📜 История алертов', '📜 Alerts history'], async (ctx) => {
+bot.hears(['📜 История уведомлений', '📜 Alerts history'], async (ctx) => {
   const lang = await resolveUserLang(ctx.from.id);
   const isEn = String(lang).startsWith('en');
   try {
@@ -245,7 +245,7 @@ bot.hears(['📜 История алертов', '📜 Alerts history'], async (
     } catch {
     }
   }
-  const header = isEn ? '📜 Alerts history' : '📜 История алертов';
+  const header = isEn ? '📜 Alerts history' : '📜 История уведомлений';
   const inline = {
     inline_keyboard: [
       [{text: isEn ? 'Old alerts' : 'Старые алерты', callback_data: 'history_old'}],
@@ -514,7 +514,7 @@ bot.on('callback_query', async (ctx) => {
       const cur = await resolveUserLang(ctx.from.id).catch(() => 'ru');
       const next = String(cur).startsWith('en') ? 'ru' : 'en';
       try {
-        const {usersCollection} = await import('./db.js');
+        const {usersCollection} = await import('./db/db.js');
         await usersCollection.updateOne({userId: ctx.from.id}, {$set: {preferredLang: next}}, {upsert: true});
       } catch {
       }
@@ -540,7 +540,7 @@ bot.on('callback_query', async (ctx) => {
 
     if (data === 'toggle_motivation') {
       try {
-        const {usersCollection} = await import('./db.js');
+        const {usersCollection} = await import('./db/db.js');
         const u = await usersCollection.findOne({userId: ctx.from.id}) || {};
         const next = !(u.sendMotivation !== false);
         await usersCollection.updateOne({userId: ctx.from.id}, {$set: {sendMotivation: next}}, {upsert: true});
@@ -557,7 +557,7 @@ bot.on('callback_query', async (ctx) => {
 
     if (data === 'toggle_market') {
       try {
-        const {usersCollection} = await import('./db.js');
+        const {usersCollection} = await import('./db/db.js');
         const u = await usersCollection.findOne({userId: ctx.from.id}) || {};
         const next = !(u.sendMarketReport !== false);
         await usersCollection.updateOne({userId: ctx.from.id}, {$set: {sendMarketReport: next}}, {upsert: true});
@@ -651,7 +651,7 @@ bot.on('callback_query', async (ctx) => {
       const id = (mDel ? mDel[1] : mLegacy[1]);
       const token = mDel ? mDel[2] : null;
 
-      const {alertsCollection} = await import('./db.js');
+      const {alertsCollection} = await import('./db/db.js');
       const doc = await alertsCollection.findOne({_id: new ObjectId(id)});
       if (!doc) {
         await ctx.answerCbQuery('Алерт не найден');
@@ -677,7 +677,7 @@ bot.on('callback_query', async (ctx) => {
       }
 
       try {
-        const {alertsArchiveCollection} = await import('./db.js');
+        const {alertsArchiveCollection} = await import('./db/db.js');
         await alertsArchiveCollection.insertOne({
           ...doc,
           deletedAt: new Date(),
@@ -687,7 +687,7 @@ bot.on('callback_query', async (ctx) => {
       } catch {
       }
 
-      const {alertsCollection: ac} = await import('./db.js');
+      const {alertsCollection: ac} = await import('./db/db.js');
       await ac.deleteOne({_id: new ObjectId(id)});
       invalidateUserAlertsCache(ctx.from.id);
 
@@ -1004,7 +1004,7 @@ bot.on('text', async (ctx) => {
     }
 
     if (ctx.session.step === 'ask_sl') {
-      const {alertsCollection} = await import('./db.js');
+      const {alertsCollection} = await import('./db/db.js');
       const limit = await getUserAlertLimit(ctx.from.id).catch(() => 1000000000);
       let currentCount = 0;
       try {
@@ -1024,7 +1024,7 @@ bot.on('text', async (ctx) => {
       const lang = await resolveUserLang(ctx.from.id);
       if (text === (String(lang).startsWith('en') ? '⏭️ Skip SL' : '⏭️ Без SL')) {
         try {
-          const {alertsCollection: ac} = await import('./db.js');
+          const {alertsCollection: ac} = await import('./db/db.js');
           const beforeInsertCount = await ac.countDocuments({userId: ctx.from.id}).catch(() => currentCount);
           if (beforeInsertCount >= limit) {
             await ctx.reply(String(lang).startsWith('en') ? `You already have ${beforeInsertCount} alerts — limit ${limit}.` : `У тебя уже ${beforeInsertCount} алертов — достигнут лимит ${limit}. Если нужно увеличить лимит, напиши мне: @pirial_gena`, getMainMenuSync(ctx.from.id, lang));
@@ -1082,7 +1082,7 @@ bot.on('text', async (ctx) => {
         return;
       }
 
-      const {alertsCollection} = await import('./db.js');
+      const {alertsCollection} = await import('./db/db.js');
       const limit = await getUserAlertLimit(ctx.from.id).catch(() => 1000000000);
       let currentCount = 0;
       try {
@@ -1110,7 +1110,7 @@ bot.on('text', async (ctx) => {
         }
 
         const slDir = ctx.session.alertCondition === '<' ? (await resolveUserLang(ctx.from.id)) === 'en' ? 'lower' : 'ниже' : (await resolveUserLang(ctx.from.id)) === 'en' ? 'higher' : 'выше';
-        const {alertsCollection: ac} = await import('./db.js');
+        const {alertsCollection: ac} = await import('./db/db.js');
         await ac.insertMany([
           {
             userId: ctx.from.id,

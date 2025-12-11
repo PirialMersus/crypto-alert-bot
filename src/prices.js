@@ -3,7 +3,7 @@ import { httpGetWithRetry } from './httpClient.js';
 import { tickersCache, pricesCache } from './cache.js';
 import { TICKERS_TTL, TICKERS_REFRESH_INTERVAL } from './constants.js';
 import { pingHealthchecksOnce } from './healthchecks-pinger.js';
-import { isDbConnected } from './db.js';
+import { isDbConnected } from './db/db.js';
 const pricePromises = new Map();
 export async function refreshAllTickers() {
   const now = Date.now();

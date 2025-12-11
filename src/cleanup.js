@@ -1,5 +1,5 @@
 // src/cleanup.js
-import { usersCollection, alertsCollection, lastViewsCollection, pendingDailySendsCollection, dailyQuoteRetryCollection, alertsArchiveCollection } from './db.js';
+import { usersCollection, alertsCollection, lastViewsCollection, pendingDailySendsCollection, dailyQuoteRetryCollection, alertsArchiveCollection } from './db/db.js';
 import { INACTIVE_DAYS, DAY_MS } from './constants.js';
 import { invalidateUserAlertsCache } from './cache.js';
 

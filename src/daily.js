@@ -1,7 +1,7 @@
 // src/daily.js
 import { httpGetWithRetry, httpClient } from './httpClient.js';
 import { dailyCache } from './cache.js';
-import { dailyMotivationCollection, dailyQuoteRetryCollection, pendingDailySendsCollection, client } from './db.js';
+import { dailyMotivationCollection, dailyQuoteRetryCollection, pendingDailySendsCollection, client } from './db/db.js';
 import { RETRY_INTERVAL_MS, QUOTE_CAPTION_MAX, MESSAGE_TEXT_MAX, KYIV_TZ } from './constants.js';
 import { translateOrNull } from './translate.js';
 

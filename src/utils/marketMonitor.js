@@ -1,6 +1,6 @@
 // src/utils/marketMonitor.js
 import { resolveUserLang } from '../cache.js';
-import { usersCollection, client } from '../db.js';
+import { usersCollection, client } from '../db/db.js';
 import { MARKET_BATCH_SIZE, MARKET_BATCH_PAUSE_MS } from '../constants.js';
 import { buildPorNetflowsBlock } from '../porNetflows.js';
 
@@ -1144,12 +1144,4 @@ export async function editReportMessageWithHelp(ctx){
   } catch {
     try { await ctx.answerCbQuery('Ошибка'); } catch {}
   }
-}
-
-async function findPreviousSnapshotWithGemini(db, excludeTs) {
-  return await db.collection('market_snapshots')
-    .find({ ts: { $lt: excludeTs }, gemini: { $exists: true, $ne: null } })
-    .sort({ ts: -1 })
-    .limit(20)
-    .toArray();
 }

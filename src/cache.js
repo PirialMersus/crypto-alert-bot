@@ -1,6 +1,6 @@
 // src/cache.js
 import { CACHE_TTL, RECENT_SYMBOLS_MAX } from './constants.js';
-import { alertsCollection, lastViewsCollection, usersCollection } from './db.js';
+import { alertsCollection, lastViewsCollection, usersCollection } from './db/db.js';
 
 export const tickersCache = { time: 0, map: new Map() };
 export const pricesCache = new Map();

@@ -3,7 +3,7 @@ import express from 'express';
 import axios from 'axios';
 import { KYIV_TZ } from './constants.js';
 import { fetchQuoteFromAny } from './daily.js';
-import { dailyMotivationCollection } from './db.js';
+import { dailyMotivationCollection } from './db/db.js';
 
 async function loadLlamaCexDataset(slug) {
   const trimmed = String(slug || '').trim().toLowerCase();

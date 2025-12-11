@@ -1,10 +1,11 @@
 // /src/alerts.js
 import { ENTRIES_PER_PAGE, BG_CHECK_INTERVAL, DELETE_LABEL_TARGET_LEN } from './constants.js';
-import { alertsCollection, usersCollection, alertsArchiveCollection } from './db.js';
+import { alertsCollection, usersCollection, alertsArchiveCollection } from './db/db.js';
 import { tickersCache, pricesCache, allAlertsCache, getUserAlertsCached, getAllAlertsCached, getUserLastViews, setUserLastViews, invalidateUserAlertsCache, getUserAlertsOrder } from './cache.js';
 import { getPriceLevel1 } from './prices.js';
 import { fmtNum, formatChangeWithIcons, padLabel } from './utils/utils.js';
 import { resolveUserLang } from './cache.js';
+import signalsEngine from "./signalsEngine.js";
 
 function t(lang, key, ...vars) {
   const isEn = String(lang || '').split('-')[0] === 'en';
@@ -490,5 +491,6 @@ ${t(lang, 'condition_label')}: ${a.condition === '>' ? t(lang, 'condition_above'
     } catch (e) {
       console.error('bg check error', e);
     }
+    await signalsEngine.runOnce(bot);
   }, BG_CHECK_INTERVAL);
 }

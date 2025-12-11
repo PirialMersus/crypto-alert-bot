@@ -17,7 +17,7 @@ import {
 } from "./marketMonitor.js";
 import {bot} from "../bot.js";
 import {setLastHeartbeat} from "../monitor.js";
-import {connectToMongo, countDocumentsWithTimeout, isDbConnected} from "../db.js";
+import {connectToMongo, countDocumentsWithTimeout, isDbConnected} from "../db/db.js";
 import {fetchAndStoreDailyMotivation, processDailyQuoteRetry, sendDailyToUser, watchForNewQuotes} from "../daily.js";
 import {startTickersRefresher} from "../prices.js";
 import {startAlertsChecker} from "../alerts.js";
@@ -188,7 +188,7 @@ export async function buildSettingsInlineForUser(userId, langOverride = null) {
   let sendMotivation = true;
   let sendMarketReport = true;
   try {
-    const {usersCollection} = await import('../db.js');
+    const {usersCollection} = await import('../db/db.js');
     const u = await usersCollection.findOne({userId});
     if (typeof u?.sendMotivation === 'boolean') sendMotivation = u.sendMotivation;
     if (typeof u?.sendMarketReport === 'boolean') sendMarketReport = u.sendMarketReport;
@@ -297,7 +297,7 @@ export function getMainMenuSync(userId, lang = 'ru') {
   const my = isEn ? '📋 My alerts' : '📋 Мои уведомления';
   const shortBtn = isEn ? '📈 Short market report' : '📈 Краткий отчёт';
   const fullBtn = isEn ? '📊 Full report' : '📊 Полный отчёт';
-  const history = isEn ? '📜 Alerts history' : '📜 История алертов';
+  const history = isEn ? '📜 Alerts history' : '📜 История уведомлений';
   const liqBtn = isEn ? '🗺️ Liquidation maps' : '🗺️ Карты ликвидаций';
   const settings = isEn ? '⚙️ Settings' : '⚙️ Настройки';
   const motivate = isEn ? '🌅 Send motivation' : '🌅 Прислать мотивацию';
@@ -429,7 +429,7 @@ export async function startBot() {
 
         try {
           const dateStr = day;
-          const {usersCollection, pendingDailySendsCollection} = await import('../db.js');
+          const {usersCollection, pendingDailySendsCollection} = await import('../db/db.js');
           const already = await pendingDailySendsCollection.find({
             date: dateStr,
             sent: true
