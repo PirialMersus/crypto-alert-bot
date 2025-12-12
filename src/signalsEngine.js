@@ -51,49 +51,49 @@ function shortNum(n) {
 /* ---------------- RUS ---------------- */
 function t_ru(type, sym, data, extra) {
   if (type === 'oiCvd_up_up')
-    return `🚀 ${sym}: OI ${fmtPct(data.oiPct)}, CVD ${fmtMoney(data.cvd)} — агрессивные лонги, шанс роста выше, следи за пробоями (${sym}: $${shortNum(extra.price)})`;
+    return `🚀 ${sym}: OI ${fmtPct(data.oiPct)}, CVD ${fmtMoney(data.cvd)} — агрессивные лонги, шанс роста выше, следи за пробоями (${sym}: <b>$${shortNum(extra.price)}</b>)`;
 
   if (type === 'oiCvd_up_down')
-    return `⚠️ ${sym}: OI ${fmtPct(data.oiPct)}, CVD -${fmtMoney(Math.abs(data.cvd))} — приток шортов, давление вниз, будь внимателен (${sym}: $${shortNum(extra.price)})`;
+    return `⚠️ ${sym}: OI ${fmtPct(data.oiPct)}, CVD -${fmtMoney(Math.abs(data.cvd))} — приток шортов, давление вниз, будь внимателен (${sym}: <b>$${shortNum(extra.price)}</b>)`;
 
   if (type === 'oiCvd_down_down')
-    return `🔻 ${sym}: OI ${fmtPct(data.oiPct)}, CVD ${fmtMoney(data.cvd)} — закрытие лонгов, слабость покупателей, риск снижения (${sym}: $${shortNum(extra.price)})`;
+    return `🔻 ${sym}: OI ${fmtPct(data.oiPct)}, CVD ${fmtMoney(data.cvd)} — закрытие лонгов, слабость покупателей, риск снижения (${sym}: <b>$${shortNum(extra.price)}</b>)`;
 
   if (type === 'oiCvd_down_up')
-    return `🔻 ${sym}: OI ${fmtPct(data.oiPct)}, CVD +${fmtMoney(data.cvd)} — закрытие шортов, продавцы ослабевают (${sym}: $${shortNum(extra.price)})`;
+    return `🔻 ${sym}: OI ${fmtPct(data.oiPct)}, CVD +${fmtMoney(data.cvd)} — закрытие шортов, продавцы ослабевают (${sym}: <b>$${shortNum(extra.price)}</b>)`;
 
   if (type === 'funding_high')
-    return `📉 ${sym}: Funding ${data.funding} — рынок перегрет в лонги, возможна коррекция (${sym}: $${shortNum(extra.price)})`;
+    return `📉 ${sym}: Funding ${data.funding} — рынок перегрет в лонги, возможна коррекция (${sym}: <b>$${shortNum(extra.price)}</b>)`;
 
   if (type === 'funding_low')
-    return `📉 ${sym}: Funding ${data.funding} — рынок перегрет в шорты, возможен отскок (${sym}: $${shortNum(extra.price)})`;
+    return `📉 ${sym}: Funding ${data.funding} — рынок перегрет в шорты, возможен отскок (${sym}: <b>$${shortNum(extra.price)}</b>)`;
 
   if (type === 'netflows_in')
-    return `📊 ${sym}: Приток ${fmtMoney(data.delta)} — давление продаж (${sym}: $${shortNum(extra.price)})`;
+    return `📊 ${sym}: Приток ${fmtMoney(data.delta)} — давление продаж (${sym}: <b>$${shortNum(extra.price)}</b>)`;
 
   if (type === 'netflows_out')
-    return `📊 ${sym}: Отток ${fmtMoney(data.delta)} — возможное накопление (${sym}: $${shortNum(extra.price)})`;
+    return `📊 ${sym}: Отток ${fmtMoney(data.delta)} — возможное накопление (${sym}: <b>$${shortNum(extra.price)}</b>)`;
 
   if (type === 'rsi_low')
-    return `📈 ${sym}: RSI ${data.rsi} — перепроданность (${sym}: RSI ${Math.round(data.rsi)})`;
+    return `📈 ${sym}: RSI ${data.rsi} — перепроданность (${sym}: RSI <b>${Math.round(data.rsi)}</b>)`;
 
   if (type === 'rsi_high')
-    return `📈 ${sym}: RSI ${data.rsi} — перекупленность (${sym}: RSI ${Math.round(data.rsi)})`;
+    return `📈 ${sym}: RSI ${data.rsi} — перекупленность (${sym}: RSI <b>${Math.round(data.rsi)}</b>)`;
 
   if (type === 'price_up')
-    return `💥 ${sym}: Цена выросла на ${fmtPct(data.pct)} (${sym}: $${shortNum(extra.price)})`;
+    return `💥 ${sym}: Цена выросла на ${fmtPct(data.pct)} (${sym}: <b>$${shortNum(extra.price)}</b>)`;
 
   if (type === 'price_down')
-    return `💥 ${sym}: Цена упала на ${fmtPct(data.pct)} (${sym}: $${shortNum(extra.price)})`;
+    return `💥 ${sym}: Цена упала на ${fmtPct(data.pct)} (${sym}: <b>$${shortNum(extra.price)}</b>)`;
 
   if (type === 'vol_up')
-    return `📈 ${sym}: Объём вырос на ${fmtPct(data.volPct)} (${sym} vol)`;
+    return `📈 ${sym}: Объём вырос на ${fmtPct(data.volPct)} (${sym} vol)`; // нет числового значения → не жирню
 
   if (type === 'dom_up')
-    return `📌 BTC доминация выросла на ${fmtPct(data.diff)} (BTC.D: ${data.now.toFixed(2)}%)`;
+    return `📌 BTC доминация выросла на ${fmtPct(data.diff)} (BTC.D: <b>${data.now.toFixed(2)}%</b>)`;
 
   if (type === 'dom_down')
-    return `📌 BTC доминация упала на ${fmtPct(data.diff)} (BTC.D: ${data.now.toFixed(2)}%)`;
+    return `📌 BTC доминация упала на ${fmtPct(data.diff)} (BTC.D: <b>${data.now.toFixed(2)}%</b>)`;
 
   return null;
 }
@@ -101,49 +101,49 @@ function t_ru(type, sym, data, extra) {
 /* ---------------- ENG ---------------- */
 function t_en(type, sym, data, extra) {
   if (type === 'oiCvd_up_up')
-    return `🚀 ${sym}: OI ${fmtPct(data.oiPct)}, CVD ${fmtMoney(data.cvd)} — aggressive longs, breakout risk up (${sym}: $${shortNum(extra.price)})`;
+    return `🚀 ${sym}: OI ${fmtPct(data.oiPct)}, CVD ${fmtMoney(data.cvd)} — aggressive longs, breakout risk up (${sym}: <b>$${shortNum(extra.price)}</b>)`;
 
   if (type === 'oiCvd_up_down')
-    return `⚠️ ${sym}: OI ${fmtPct(data.oiPct)}, CVD -${fmtMoney(Math.abs(data.cvd))} — shorts entering, downside pressure (${sym}: $${shortNum(extra.price)})`;
+    return `⚠️ ${sym}: OI ${fmtPct(data.oiPct)}, CVD -${fmtMoney(Math.abs(data.cvd))} — shorts entering, downside pressure (${sym}: <b>$${shortNum(extra.price)}</b>)`;
 
   if (type === 'oiCvd_down_down')
-    return `🔻 ${sym}: OI ${fmtPct(data.oiPct)}, CVD ${fmtMoney(data.cvd)} — longs closing, buyer weakness (${sym}: $${shortNum(extra.price)})`;
+    return `🔻 ${sym}: OI ${fmtPct(data.oiPct)}, CVD ${fmtMoney(data.cvd)} — longs closing, buyer weakness (${sym}: <b>$${shortNum(extra.price)}</b>)`;
 
   if (type === 'oiCvd_down_up')
-    return `🔻 ${sym}: OI ${fmtPct(data.oiPct)}, CVD +${fmtMoney(data.cvd)} — shorts closing, sellers weakening (${sym}: $${shortNum(extra.price)})`;
+    return `🔻 ${sym}: OI ${fmtPct(data.oiPct)}, CVD +${fmtMoney(data.cvd)} — shorts closing, sellers weakening (${sym}: <b>$${shortNum(extra.price)}</b>)`;
 
   if (type === 'funding_high')
-    return `📉 ${sym}: Funding ${data.funding} — market overheated in longs (${sym}: $${shortNum(extra.price)})`;
+    return `📉 ${sym}: Funding ${data.funding} — market overheated in longs (${sym}: <b>$${shortNum(extra.price)}</b>)`;
 
   if (type === 'funding_low')
-    return `📉 ${sym}: Funding ${data.funding} — market overheated in shorts (${sym}: $${shortNum(extra.price)})`;
+    return `📉 ${sym}: Funding ${data.funding} — market overheated in shorts (${sym}: <b>$${shortNum(extra.price)}</b>)`;
 
   if (type === 'netflows_in')
-    return `📊 ${sym}: Inflow ${fmtMoney(data.delta)} — sell pressure (${sym}: $${shortNum(extra.price)})`;
+    return `📊 ${sym}: Inflow ${fmtMoney(data.delta)} — sell pressure (${sym}: <b>$${shortNum(extra.price)}</b>)`;
 
   if (type === 'netflows_out')
-    return `📊 ${sym}: Outflow ${fmtMoney(data.delta)} — possible accumulation (${sym}: $${shortNum(extra.price)})`;
+    return `📊 ${sym}: Outflow ${fmtMoney(data.delta)} — possible accumulation (${sym}: <b>$${shortNum(extra.price)}</b>)`;
 
   if (type === 'rsi_low')
-    return `📈 ${sym}: RSI ${data.rsi} — oversold (${sym}: RSI ${Math.round(data.rsi)})`;
+    return `📈 ${sym}: RSI ${data.rsi} — oversold (${sym}: RSI <b>${Math.round(data.rsi)}</b>)`;
 
   if (type === 'rsi_high')
-    return `📈 ${sym}: RSI ${data.rsi} — overbought (${sym}: RSI ${Math.round(data.rsi)})`;
+    return `📈 ${sym}: RSI ${data.rsi} — overbought (${sym}: RSI <b>${Math.round(data.rsi)}</b>)`;
 
   if (type === 'price_up')
-    return `💥 ${sym}: Price up ${fmtPct(data.pct)} (${sym}: $${shortNum(extra.price)})`;
+    return `💥 ${sym}: Price up ${fmtPct(data.pct)} (${sym}: <b>$${shortNum(extra.price)}</b>)`;
 
   if (type === 'price_down')
-    return `💥 ${sym}: Price down ${fmtPct(data.pct)} (${sym}: $${shortNum(extra.price)})`;
+    return `💥 ${sym}: Price down ${fmtPct(data.pct)} (${sym}: <b>$${shortNum(extra.price)}</b>)`;
 
   if (type === 'vol_up')
-    return `📈 ${sym}: Volume up ${fmtPct(data.volPct)} (${sym} vol)`;
+    return `📈 ${sym}: Volume up ${fmtPct(data.volPct)} (${sym} vol)`; // нет числа → не жирню
 
   if (type === 'dom_up')
-    return `📌 BTC dominance increased by ${fmtPct(data.diff)} (BTC.D: ${data.now.toFixed(2)}%)`;
+    return `📌 BTC dominance increased by ${fmtPct(data.diff)} (BTC.D: <b>${data.now.toFixed(2)}%</b>)`;
 
   if (type === 'dom_down')
-    return `📌 BTC dominance decreased by ${fmtPct(data.diff)} (BTC.D: ${data.now.toFixed(2)}%)`;
+    return `📌 BTC dominance decreased by ${fmtPct(data.diff)} (BTC.D: <b>${data.now.toFixed(2)}%</b>)`;
 
   return null;
 }
