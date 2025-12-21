@@ -1,4 +1,4 @@
-// src/db.js
+// src/db/db.js
 import { MongoClient, ObjectId as MongoObjectId } from "mongodb";
 import EventEmitter from "events";
 import dotenv from "dotenv";
@@ -28,6 +28,8 @@ export let dailyQuoteRetryCollection = null;
 export let pendingDailySendsCollection = null;
 export let marketSnapshotsCollection = null;
 export let alertStateCollection = null;
+export let surprisesCollection = null;
+export let surpriseLockCollection = null;
 
 async function initCollectionsAndIndexes() {
   const isDev = String(process.env.NODE_ENV || "").toLowerCase() === "development";
@@ -44,6 +46,8 @@ async function initCollectionsAndIndexes() {
   pendingDailySendsCollection = db.collection("pending_daily_sends");
   marketSnapshotsCollection = db.collection("market_snapshots");
   alertStateCollection = db.collection("alert_state");
+  surprisesCollection = db.collection("surprises");
+  surpriseLockCollection = db.collection("surprise_lock");
 
   try {
     await alertsCollection.createIndex({ userId: 1 });
@@ -59,6 +63,8 @@ async function initCollectionsAndIndexes() {
     await dailyQuoteRetryCollection.createIndex({ date: 1 }, { unique: true });
     await pendingDailySendsCollection.createIndex({ userId: 1, date: 1 }, { unique: true });
     await marketSnapshotsCollection.createIndex({ date: 1 }, { unique: true });
+    await surprisesCollection.createIndex({ createdAt: -1 });
+    await surpriseLockCollection.createIndex({ lockedAt: 1 });
   } catch (e) {
     console.error("ensureIndexes error", e?.message || e);
   }

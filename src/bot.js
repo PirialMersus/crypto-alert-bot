@@ -2,26 +2,23 @@
 import {session, Telegraf} from 'telegraf';
 import dotenv from 'dotenv';
 import {ObjectId} from './db/db.js';
-import {getCachedPrice, refreshAllTickers} from './prices.js';
+import {refreshAllTickers} from './prices.js';
 import {buildDeleteInlineForUser, renderAlertsList, renderOldAlertsList} from './alerts.js';
 import {
-  getUserAlertLimit,
   getUserAlertsCached,
   getUserAlertsOrder,
   getUserRecentSymbols,
   invalidateUserAlertsCache,
-  pushRecentSymbol,
   resolveUserLang,
   setUserAlertsOrder
 } from './cache.js';
 import {
-  buildAskSlKeyboard,
   buildCancelButton,
-  buildDirectionKeyboard,
   buildSettingsInlineForUser,
-  editHtmlOrReply, editReportMessageToFull, editReportMessageToShort,
-  extractReportTimeLine,
-  fmtNum,
+  editHtmlOrReply,
+  editReportMessageToFull,
+  editReportMessageToShort,
+  formatSurpriseMessage,
   geminiToHtml,
   getMainMenuSync,
   handleActiveUsers,
@@ -30,16 +27,12 @@ import {
   mdBoldToHtml,
   splitMessage,
   startTyping,
-  stopTyping
 } from './utils/utils.js';
 import {ENTRIES_PER_PAGE, KYIV_TZ} from './constants.js';
 
-import {
-  buildMorningReportHtml,
-  getMarketSnapshot,
-  sendShortReportToUser
-} from './utils/marketMonitor.js';
-import {getLiqMapInfo} from './liqBridgeApi.js';
+import {getMarketSnapshot, sendShortReportToUser} from './utils/marketMonitor.js';
+import {registerTextHandlers} from "./utils/textHandlers.js";
+import {getOrCreateSurprise} from "./surpriseService.js";
 
 dotenv.config();
 
@@ -161,6 +154,49 @@ bot.hears(['⚙️ Настройки', '⚙️ Settings'], async (ctx) => {
   await ctx.reply(text, {reply_markup: inline});
 });
 
+bot.hears(['🔮 Удиви меня', '🔮 Surprise me'], async (ctx) => {
+  const lang = await resolveUserLang(ctx.from.id)
+  const isEn = String(lang).startsWith('en')
+
+  // 1️⃣ сообщение-заглушка
+  const loadingMsg = await ctx.reply(
+    isEn ? '⏳ Generating …' : '⏳ Генерирую …'
+  )
+
+  try {
+    await ctx.telegram.sendChatAction(ctx.chat.id, 'typing')
+  } catch {}
+
+  try {
+    const isDev = process.env.NODE_ENV === 'development'
+    const isAdmin = String(ctx.from.id) === String(process.env.CREATOR_ID)
+
+    const { surprise, remainingMs } = await getOrCreateSurprise({
+      forceFresh: isDev && isAdmin
+    })
+
+    const minutes = Math.max(1, Math.ceil(remainingMs / 60000))
+    const text = formatSurpriseMessage(surprise, lang, minutes)
+
+    await ctx.reply(text, { parse_mode: 'HTML' })
+
+    await ctx.deleteMessage(loadingMsg.message_id).catch(() => {})
+  } catch (e) {
+    console.error('[surprise]', {
+      message: e?.message,
+      stack: e?.stack,
+      response: e?.response?.data,
+      status: e?.response?.status,
+    })
+
+    await ctx.reply(
+      isEn
+        ? '⚠️ Internal error, try again later.'
+        : '⚠️ Внутренняя ошибка, попробуй позже.'
+    )
+  }
+})
+
 bot.hears(['🛠️ Техподдержка/пожелания', 'Пожелания/техподдержка', '🛠️ Support/wishes', 'Wishes/Support'], async (ctx) => {
   const lang = await resolveUserLang(ctx.from.id);
   const msg = String(lang).startsWith('en')
@@ -227,35 +263,6 @@ bot.hears(['🗺️ Карты ликвидаций', '🗺️ Liquidation maps'
   await ctx.reply(msg, {reply_markup: {keyboard: kb, resize_keyboard: true}});
 });
 
-bot.hears(['📜 История уведомлений', '📜 Alerts history'], async (ctx) => {
-  const lang = await resolveUserLang(ctx.from.id);
-  const isEn = String(lang).startsWith('en');
-  try {
-    await ctx.deleteMessage(ctx.message.message_id);
-  } catch {
-  }
-  let rm;
-  try {
-    rm = await ctx.reply('…', {reply_markup: {remove_keyboard: true}});
-  } catch {
-  }
-  if (rm?.message_id) {
-    try {
-      await ctx.deleteMessage(rm.message_id);
-    } catch {
-    }
-  }
-  const header = isEn ? '📜 Alerts history' : '📜 История уведомлений';
-  const inline = {
-    inline_keyboard: [
-      [{text: isEn ? 'Old alerts' : 'Старые алерты', callback_data: 'history_old'}],
-      [{text: isEn ? 'Search old alerts' : 'Поиск старых алертов', callback_data: 'history_search'}],
-      [{text: isEn ? '↩️ Back' : '↩️ Назад', callback_data: 'back_to_main'}],
-    ]
-  };
-  await ctx.reply(header, {reply_markup: inline});
-});
-
 bot.hears(['👥 Количество активных пользователей', '👥 Active users'], async (ctx) => {
   await handleActiveUsers(ctx);
 });
@@ -315,75 +322,85 @@ bot.on('callback_query', async (ctx) => {
     if (!data) return ctx.answerCbQuery();
 
     const lang = await resolveUserLang(ctx.from.id);
+    if (data === 'alerts_history') {
+      const lang2 = await resolveUserLang(ctx.from.id);
+      const isEn = String(lang2).startsWith('en');
+
+      const header = isEn ? '📜 Alerts history' : '📜 История уведомлений';
+      const inline = {
+        inline_keyboard: [
+          [{ text: isEn ? 'Old alerts' : 'Старые алерты', callback_data: 'history_old' }],
+          [{ text: isEn ? 'Search old alerts' : 'Поиск старых алертов', callback_data: 'history_search' }],
+          [{ text: isEn ? '↩️ Back' : '↩️ Назад', callback_data: 'back_to_alerts_root' }]
+        ]
+      };
+
+      try {
+        await ctx.editMessageText(header, { reply_markup: inline });
+      } catch {
+        await ctx.reply(header, { reply_markup: inline });
+      }
+
+      await ctx.answerCbQuery();
+      return;
+    }
     if (data === 'market_ai') {
       const userId = ctx.from.id;
       const lang = await resolveUserLang(userId).catch(() => 'ru');
       const isEn = String(lang).toLowerCase().startsWith('en');
 
-      let typingTimer = null;
+      let stopTypingFn = null;
       try {
-        typingTimer = startTyping(ctx);
+        stopTypingFn = startTyping(ctx);
 
         const snap = await getMarketSnapshot(['BTC', 'ETH', 'PAXG']).catch(() => null);
         if (!snap?.ok) {
-          try {
-            await ctx.answerCbQuery(isEn ? 'Error' : 'Ошибка');
-          } catch {
-          }
+          await ctx.answerCbQuery(isEn ? 'Error' : 'Ошибка');
           return;
         }
 
-        const fullHtml = await buildMorningReportHtml(
-          snap.snapshots,
-          lang,
-          snap.atIsoKyiv || '',
-          snap.fetchedAt ?? null,
-          {
-            btcDominancePct: snap.btcDominancePct,
-            btcDominanceDelta: snap.btcDominanceDelta,
-            spx: snap.spx,
-            totals: snap.totals,
-            fgiNow: snap.fgiNow,
-            fgiDelta: snap.fgiDelta,
-            oiCvdBTC: snap.oiCvdBTC,
-            oiCvdETH: snap.oiCvdETH,
-            leadersTop: snap.leadersTop,
-            cryptoquant: snap.cryptoquant
-          }
-        );
-
         let answer = null;
+        let generatedTimeStr = null;
+
         const aiSrc = snap.gemini || null;
         if (aiSrc && typeof aiSrc === 'object') {
           const key = isEn ? 'en' : 'ru';
           const fallbackKey = isEn ? 'ru' : 'en';
           const entry = aiSrc[key] || aiSrc[fallbackKey] || null;
+
           if (entry && typeof entry.text === 'string' && entry.text.trim()) {
             answer = entry.text.trim();
+
+            if (Number.isFinite(entry.createdAt) && entry.createdAt > 0) {
+              const date = new Date(entry.createdAt);
+              generatedTimeStr = date.toLocaleString(isEn ? 'en-GB' : 'ru-RU', {
+                timeZone: KYIV_TZ,
+                day: '2-digit',
+                month: '2-digit',
+                year: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit'
+              }).replace(',', '');
+            }
           }
         }
 
-        const timeLine2 = extractReportTimeLine(fullHtml);
-
-        if (timeLine2) {
-          const emphasizeTimeLine = (line) => {
-            const ru = line.match(/^(Данные на:\s+)(.+?)(\s+—.*)$/);
-            if (ru) return `${ru[1]}**${ru[2]}**${ru[3]}`;
-
-            const en = line.match(/^(Data as of:\s+)(.+?)(\s+—.*)$/i);
-            if (en) return `${en[1]}**${en[2]}**${en[3]}`;
-
-            return line;
-          };
-
-          const decorated = emphasizeTimeLine(timeLine2);
-
-          const tail = isEn
-            ? `\n\n🧠 AI answer based on the report\n${decorated}`
-            : `\n\n🧠 Ответ ИИ по рынку\n${decorated}`;
-
-          answer += tail;
+        if (!answer) {
+          answer = isEn
+            ? 'AI recommendations are being prepared or temporarily unavailable.'
+            : 'Рекомендации ИИ готовятся или временно недоступны.';
         }
+
+        if (!generatedTimeStr) {
+          const when = formatKyiv(snap.fetchedAt ?? null, snap.atIsoKyiv || '');
+          generatedTimeStr = isEn ? when.en : when.ru;
+        }
+
+        const tail = isEn
+          ? `\n\n🧠 AI market analysis\nGenerated at: **${generatedTimeStr}** (Europe/Kyiv) — AI answer updates every hour`
+          : `\n\n🧠 Ответ ИИ по рынку\nСгенерировано: **${generatedTimeStr}** (Europe/Kyiv) — Анализ ИИ обновляется каждый час`;
+
+        answer += tail;
 
         const chunks = splitMessage(answer, 3500);
         for (let i = 0; i < chunks.length; i++) {
@@ -393,29 +410,16 @@ bot.on('callback_query', async (ctx) => {
           await ctx.reply(html, { ...baseExtra, ...menuExtra });
         }
 
-        try {
-          await ctx.answerCbQuery(isEn ? 'Done.' : 'Готово.');
-        } catch {
-        }
+        await ctx.answerCbQuery(isEn ? 'Done.' : 'Готово.');
       } catch (e) {
-        try {
-          console.error('[market_ai]', e?.stack || e);
-        } catch {
-        }
-        try {
-          await ctx.answerCbQuery(isEn ? 'Error' : 'Ошибка');
-        } catch {
-        }
+        console.error('[market_ai]', e?.stack || e);
+        try { await ctx.answerCbQuery(isEn ? 'Error' : 'Ошибка'); } catch {}
       } finally {
-        if (typingTimer) {
-          try {
-            stopTyping(typingTimer);
-          } catch {
-          }
-        }
+        if (stopTypingFn) stopTypingFn();
       }
       return;
     }
+
     if (data === 'market_short') {
       try {
         await editReportMessageToShort(ctx);
@@ -493,6 +497,27 @@ bot.on('callback_query', async (ctx) => {
         await ctx.answerCbQuery();
       } catch {
       }
+      return;
+    }
+
+    if (data === 'back_to_alerts_root') {
+      const lang2 = await resolveUserLang(ctx.from.id);
+      const { pages } = await renderAlertsList(ctx.from.id, { fast: true, lang: lang2 });
+      const page = pages[0];
+
+      try {
+        await ctx.editMessageText(page.text, {
+          parse_mode: 'Markdown',
+          reply_markup: { inline_keyboard: page.buttons }
+        });
+      } catch {
+        await ctx.reply(page.text, {
+          parse_mode: 'Markdown',
+          reply_markup: { inline_keyboard: page.buttons }
+        });
+      }
+
+      await ctx.answerCbQuery();
       return;
     }
 
@@ -720,16 +745,35 @@ bot.on('callback_query', async (ctx) => {
         return;
       }
 
-      try {
-        await ctx.editMessageReplyMarkup({inline_keyboard: inline2});
-      } catch {
-        try {
-          const originalText = ctx.update.callback_query.message?.text || (String(lang).startsWith('en') ? 'Your alerts' : 'Твои алерты');
-          await ctx.reply(originalText, {reply_markup: {inline_keyboard: inline2}});
-        } catch {
-        }
-      }
+      // try {
+      //   await ctx.editMessageReplyMarkup({inline_keyboard: inline2});
+      // } catch {
+      //   try {
+      //     const originalText = ctx.update.callback_query.message?.text || (String(lang).startsWith('en') ? 'Your alerts' : 'Твои алерты');
+      //     await ctx.reply(originalText, {reply_markup: {inline_keyboard: inline2}});
+      //   } catch {
+      //   }
+      // }
+      const { pages } = await renderAlertsList(ctx.from.id, { fast: true, lang });
+      const page = pages[sourcePage ?? 0] || pages[0];
 
+      try {
+        await ctx.editMessageText(
+          page.text,
+          {
+            parse_mode: 'Markdown',
+            reply_markup: { inline_keyboard: page.buttons }
+          }
+        );
+      } catch {
+        await ctx.reply(
+          page.text,
+          {
+            parse_mode: 'Markdown',
+            reply_markup: { inline_keyboard: page.buttons }
+          }
+        );
+      }
       await ctx.answerCbQuery(String(lang).startsWith('en') ? 'Alert deleted' : 'Алерт удалён');
       return;
     }
@@ -820,388 +864,5 @@ bot.on('callback_query', async (ctx) => {
   }
 });
 
-bot.on('text', async (ctx, next) => {
-  if (!ctx.session?.liqAwait) return next();
+registerTextHandlers(bot);
 
-  const txt = (ctx.message?.text || '').trim();
-  const lang = await resolveUserLang(ctx.from.id);
-  const isEn = String(lang).startsWith('en');
-
-  if (txt === '↩️ Отмена' || txt === '↩️ Cancel') {
-    ctx.session = {};
-    await ctx.reply(isEn ? 'Cancelled ✅' : 'Отмена ✅', getMainMenuSync(ctx.from.id, lang));
-    return;
-  }
-
-  const symbol = txt.toUpperCase();
-
-  try {
-    const loading = await ctx.reply(isEn ? '⏳ Fetching liquidation map…' : '⏳ Получаю карту ликвидаций…');
-    const info = await getLiqMapInfo(symbol);
-    const fileId = info.file_id;
-    const header = isEn ? '🗺️ Liquidation map' : '🗺️ Карта ликвидаций';
-    const pairLabel = (symbol || '').toUpperCase();
-    const explain = isEn
-      ? 'Shows clusters of stop-loss/liquidation areas on futures markets; helps spot squeeze zones and liquidity pools.'
-      : 'Показывает кластеры стопов/ликвидаций на фьючерсных рынках; помогает видеть зоны сквизов и «пулы ликвидности».';
-    let timeLine = '';
-    if (typeof info.snapshot_ts === 'number' && info.snapshot_ts > 0) {
-      const asOf = new Date(info.snapshot_ts).toLocaleString('uk-UA', {
-        timeZone: KYIV_TZ,
-        year: 'numeric', month: '2-digit', day: '2-digit',
-        hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
-      });
-      timeLine = isEn
-        ? `\n\nSnapshot time: <b>${asOf} (Europe/Kyiv)</b>. Updates in 15 minutes`
-        : `\n\nВремя снимка: <b>${asOf} (Europe/Kyiv)</b>. Обновится через 15 минут`;
-    } else {
-      timeLine = isEn
-        ? `\n\nUpdates in 15 minutes`
-        : `\n\nОбновится через 15 минут`;
-    }
-
-    const menu = getMainMenuSync(ctx.from.id, lang);
-    await ctx.replyWithPhoto(fileId, {
-      ...menu,
-      caption: `${header} — ${pairLabel}\n\n${explain}${timeLine}`,
-      parse_mode: 'HTML'
-    });
-
-    try {
-      await ctx.deleteMessage(loading.message_id);
-    } catch {
-    }
-    try {
-      await pushRecentSymbol(ctx.from.id, pairLabel);
-    } catch {
-    }
-
-    try {
-      ctx.session.liqAwait = false;
-    } catch {
-    }
-  } catch (e) {
-    try {
-      ctx.session.liqAwait = true;
-    } catch {
-    }
-    try {
-      ctx.session.step = null;
-    } catch {
-    }
-
-    const lang2 = await resolveUserLang(ctx.from.id);
-    const isEn2 = String(lang2).startsWith('en');
-    const recent = await getUserRecentSymbols(ctx.from.id).catch(() => []);
-    const {POPULAR_COINS} = await import('./constants.js');
-    const suggestRow = [...new Set([...recent, ...POPULAR_COINS])].slice(0, 6).map(s => ({text: s}));
-    const liqReplyMarkup = {
-      reply_markup: {
-        keyboard: (suggestRow.length ? [suggestRow, [buildCancelButton(lang2)]] : [[buildCancelButton(lang2)]]),
-        resize_keyboard: true
-      }
-    };
-
-    await ctx.reply(
-      isEn2
-        ? '❗ Symbol not found or service unavailable. Try: BTC, ETH, ARB.'
-        : '❗ Проверь правильность написания или монета с низкой ликвидностью. Попробуй: BTC, ETH, ARB.',
-      liqReplyMarkup
-    );
-    return;
-  }
-});
-
-bot.on('text', async (ctx) => {
-  if (ctx.session?.liqAwait) return;
-  try {
-    const step = ctx.session.step;
-    const text = (ctx.message.text || '').trim();
-
-    const daysMap = {'7 дней': 7, '30 дней': 30, '90 дней': 90, '7 days': 7, '30 days': 30, '90 days': 90};
-    const numeric = parseInt(text.replace(/\D/g, ''), 10);
-    const isNumericDay = Number.isFinite(numeric) && [7, 30, 90].includes(numeric);
-    const normalized = text.toLowerCase();
-    const isDaysPhrase = daysMap[text] || daysMap[normalized] || isNumericDay || /^\d+\s*дн/i.test(text) || /^\d+\s*day/i.test(text);
-    if ((!step || step === 'old_alerts_select_days') && isDaysPhrase) {
-      const days = daysMap[text] || daysMap[normalized] || (isNumericDay ? numeric : 30);
-      const token = `d${days}_q`;
-      const lang = await resolveUserLang(ctx.from.id);
-      const {pages} = await renderOldAlertsList(ctx.from.id, {days, symbol: null, token, lang});
-      const first = pages[0];
-      ctx.session = {};
-      if (first.buttons && first.buttons.length) {
-        await ctx.reply(mdBoldToHtml(first.text), {parse_mode: 'HTML', reply_markup: {inline_keyboard: first.buttons}});
-      } else {
-        await ctx.reply(mdBoldToHtml(first.text), {parse_mode: 'HTML', ...getMainMenuSync(ctx.from.id, lang)});
-      }
-      return;
-    }
-
-    if (!step && /^[A-Z0-9]{2,10}$/i.test(text)) ctx.session = {step: 'symbol'};
-    if (!ctx.session.step) return;
-
-    if (ctx.session.step === 'symbol') {
-      const base = text.toUpperCase();
-      const symbol = `${base}-USDT`;
-      const price = await getCachedPrice(symbol);
-      if (Number.isFinite(price)) {
-        try {
-          await pushRecentSymbol(ctx.from.id, base);
-        } catch {
-        }
-        ctx.session.symbol = symbol;
-        ctx.session.step = 'alert_condition';
-        const lang = await resolveUserLang(ctx.from.id);
-
-        // ⬇️ многострочное HTML-сообщение с жирным тикером и ценой
-        const isEn = String(lang).startsWith('en');
-        const html = isEn
-          ? `✅ Coin: <b>${symbol}</b>\nCurrent price: <b>${fmtNum(price)}</b>\nChoose direction: 👇`
-          : `✅ Монета: <b>${symbol}</b>\nТекущая цена: <b>${fmtNum(price)}</b>\nВыбери направление: 👇`;
-        await ctx.reply(html, {
-          parse_mode: 'HTML',
-          reply_markup: buildDirectionKeyboard(lang),
-          disable_web_page_preview: true
-        });
-      } else {
-        await ctx.reply('Пара не найдена на KuCoin. Попробуй другой символ.');
-        ctx.session = {};
-      }
-      return;
-    }
-
-    if (ctx.session.step === 'alert_condition') {
-      const lang = await resolveUserLang(ctx.from.id);
-      if (text === '⬆️ Когда выше' || text === '⬆️ When above') ctx.session.alertCondition = '>';
-      else if (text === '⬇️ Когда ниже' || text === '⬇️ When below') ctx.session.alertCondition = '<';
-      else {
-        await ctx.reply(String(lang).startsWith('en') ? 'Choose ⬆️ or ⬇️' : 'Выбери ⬆️ или ⬇️');
-        return;
-      }
-      ctx.session.step = 'alert_price';
-      await ctx.reply(String(lang).startsWith('en') ? 'Enter alert price:' : 'Введи цену уведомления:', {
-        reply_markup: {
-          keyboard: [[buildCancelButton(lang)]],
-          resize_keyboard: true
-        }
-      });
-      return;
-    }
-
-    if (ctx.session.step === 'alert_price') {
-      const v = parseFloat(text);
-      if (!Number.isFinite(v)) {
-        await ctx.reply('Введите корректное число');
-        return;
-      }
-      ctx.session.alertPrice = v;
-      ctx.session.step = 'ask_sl';
-      const lang = await resolveUserLang(ctx.from.id);
-      const hint = ctx.session.alertCondition === '>' ? (String(lang).startsWith('en') ? 'SL will be higher (for short — reverse)' : 'SL будет выше (для шорта — логика обратная)') : (String(lang).startsWith('en') ? 'SL will be lower' : 'SL будет ниже');
-      await ctx.reply((String(lang).startsWith('en') ? 'Add stop-loss?' : 'Добавить стоп-лосс?') + ` ${hint}`, {reply_markup: buildAskSlKeyboard(lang)});
-      return;
-    }
-
-    if (ctx.session.step === 'ask_sl') {
-      const {alertsCollection} = await import('./db/db.js');
-      const limit = await getUserAlertLimit(ctx.from.id).catch(() => 1000000000);
-      let currentCount = 0;
-      try {
-        currentCount = await alertsCollection.countDocuments({userId: ctx.from.id});
-      } catch {
-        const currentAlerts = await getUserAlertsCached(ctx.from.id).catch(() => []);
-        currentCount = (currentAlerts?.length || 0);
-      }
-
-      if (currentCount >= limit) {
-        const lang = await resolveUserLang(ctx.from.id);
-        await ctx.reply(String(lang).startsWith('en') ? `You already have ${currentCount} alerts — limit ${limit}. Contact @pirial_gena to increase.` : `У тебя уже ${currentCount} алертов — достигнут лимит ${limit}. Если нужно увеличить лимит, напиши мне: @pirial_genа`, getMainMenuSync(ctx.from.id, lang));
-        ctx.session = {};
-        return;
-      }
-
-      const lang = await resolveUserLang(ctx.from.id);
-      if (text === (String(lang).startsWith('en') ? '⏭️ Skip SL' : '⏭️ Без SL')) {
-        try {
-          const {alertsCollection: ac} = await import('./db/db.js');
-          const beforeInsertCount = await ac.countDocuments({userId: ctx.from.id}).catch(() => currentCount);
-          if (beforeInsertCount >= limit) {
-            await ctx.reply(String(lang).startsWith('en') ? `You already have ${beforeInsertCount} alerts — limit ${limit}.` : `У тебя уже ${beforeInsertCount} алертов — достигнут лимит ${limit}. Если нужно увеличить лимит, напиши мне: @pirial_gena`, getMainMenuSync(ctx.from.id, lang));
-            ctx.session = {};
-            return;
-          }
-
-          await ac.insertOne({
-            userId: ctx.from.id,
-            symbol: ctx.session.symbol,
-            condition: ctx.session.alertCondition,
-            price: ctx.session.alertPrice,
-            type: 'alert',
-            createdAt: new Date()
-          });
-          invalidateUserAlertsCache(ctx.from.id);
-          const cp = await getCachedPrice(ctx.session.symbol);
-          const isEn = String(lang).startsWith('en');
-          const conditionLine = ctx.session.alertCondition === '>' ? (isEn ? '⬆️ when above' : '⬆️ выше') : (isEn ? '⬇️ when below' : '⬇️ ниже');
-
-          // ⬇️ жирный тикер, жирная целевая, жирная текущая
-          const msg = isEn
-            ? `✅ Alert created:\n🔔 <b>${ctx.session.symbol}</b>\n${conditionLine} <b>${fmtNum(ctx.session.alertPrice)}</b>\nCurrent: <b>${fmtNum(cp) ?? '—'}</b>`
-            : `✅ Алерт создан:\n🔔 <b>${ctx.session.symbol}</b>\n${conditionLine} <b>${fmtNum(ctx.session.alertPrice)}</b>\nТекущая: <b>${fmtNum(cp) ?? '—'}</b>`;
-
-          await ctx.reply(msg, {
-            ...getMainMenuSync(ctx.from.id, lang),
-            parse_mode: 'HTML',
-            disable_web_page_preview: true
-          });
-        } catch {
-          await ctx.reply('Ошибка при создании алерта');
-        }
-        ctx.session = {};
-        return;
-      }
-      if (text === (String(lang).startsWith('en') ? '🛑 Add SL' : '🛑 Добавить SL')) {
-        ctx.session.step = 'sl_price';
-        await ctx.reply(String(lang).startsWith('en') ? 'Enter stop-loss price:' : 'Введи цену стоп-лосса:', {
-          reply_markup: {
-            keyboard: [[buildCancelButton(lang)]],
-            resize_keyboard: true
-          }
-        });
-        return;
-      }
-      await ctx.reply(String(lang).startsWith('en') ? 'Choose: 🛑 Add SL / ⏭️ Skip SL' : 'Выбери опцию: 🛑 Добавить SL / ⏭️ Без SL');
-      return;
-    }
-
-    if (ctx.session.step === 'sl_price') {
-      const sl = parseFloat(text);
-      if (!Number.isFinite(sl)) {
-        await ctx.reply('Введите корректное число SL');
-        return;
-      }
-
-      const {alertsCollection} = await import('./db/db.js');
-      const limit = await getUserAlertLimit(ctx.from.id).catch(() => 1000000000);
-      let currentCount = 0;
-      try {
-        currentCount = await alertsCollection.countDocuments({userId: ctx.from.id});
-      } catch {
-        const currentAlerts = await getUserAlertsCached(ctx.from.id).catch(() => []);
-        currentCount = (currentAlerts?.length || 0);
-      }
-
-      if (currentCount + 2 > limit) {
-        const lang = await resolveUserLang(ctx.from.id);
-        await ctx.reply(String(lang).startsWith('en') ? `Can't create pair (alert + SL). You have ${currentCount} alerts, limit ${limit}.` : `Нельзя создать связку (уведомление + SL). У тебя сейчас ${currentCount} алертов, лимит ${limit}. Чтобы увеличить лимит напиши: @pirial_genа`, getMainMenuSync(ctx.from.id, lang));
-        ctx.session = {};
-        return;
-      }
-
-      try {
-        const groupId = new ObjectId().toString();
-        const beforeInsertCount = await alertsCollection.countDocuments({userId: ctx.from.id}).catch(() => currentCount);
-        if (beforeInsertCount + 2 > limit) {
-          const lang = await resolveUserLang(ctx.from.id);
-          await ctx.reply(String(lang).startsWith('en') ? `Can't create pair (alert + SL). You have ${beforeInsertCount} alerts, limit ${limit}.` : `Нельзя создать связку (уведомление + SL). У тебя сейчас ${beforeInsertCount} алертов, лимит ${limit}. Чтобы увеличить лимит напиши: @pirial_genа`, getMainMenuSync(ctx.from.id, lang));
-          ctx.session = {};
-          return;
-        }
-
-        const slDir = ctx.session.alertCondition === '<' ? (await resolveUserLang(ctx.from.id)) === 'en' ? 'lower' : 'ниже' : (await resolveUserLang(ctx.from.id)) === 'en' ? 'higher' : 'выше';
-        const {alertsCollection: ac} = await import('./db/db.js');
-        await ac.insertMany([
-          {
-            userId: ctx.from.id,
-            symbol: ctx.session.symbol,
-            condition: ctx.session.alertCondition,
-            price: ctx.session.alertPrice,
-            type: 'alert',
-            groupId,
-            createdAt: new Date()
-          },
-          {
-            userId: ctx.from.id,
-            symbol: ctx.session.symbol,
-            condition: ctx.session.alertCondition,
-            price: sl,
-            type: 'sl',
-            slDir,
-            groupId,
-            createdAt: new Date()
-          }
-        ]);
-        invalidateUserAlertsCache(ctx.from.id);
-        const cp = await getCachedPrice(ctx.session.symbol);
-        const lang = await resolveUserLang(ctx.from.id);
-        const isEn = String(lang).startsWith('en');
-
-        // ⬇️ жирные тикер/цены
-        const slLine = isEn ? `🛑 SL (${slDir}) <b>${fmtNum(sl)}</b>` : `🛑 SL (${slDir}) <b>${fmtNum(sl)}</b>`;
-        const msg = isEn
-          ? `✅ Pair created:\n🔔 <b>${ctx.session.symbol}</b>\n${ctx.session.alertCondition === '>' ? '⬆️ when above' : '⬇️ when below'} <b>${fmtNum(ctx.session.alertPrice)}</b>\n${slLine}\nCurrent: <b>${fmtNum(cp) ?? '—'}</b>`
-          : `✅ Создана связка:\n🔔 <b>${ctx.session.symbol}</b>\n${ctx.session.alertCondition === '>' ? '⬆️ выше' : '⬇️ ниже'} <b>${fmtNum(ctx.session.alertPrice)}</b>\n${slLine}\nТекущая: <b>${fmtNum(cp) ?? '—'}</b>`;
-
-        await ctx.reply(msg, {
-          ...getMainMenuSync(ctx.from.id, lang),
-          parse_mode: 'HTML',
-          disable_web_page_preview: true
-        });
-      } catch {
-        await ctx.reply('Ошибка при создании связки');
-      }
-      ctx.session = {};
-      return;
-    }
-
-    if (ctx.session.step === 'old_alerts_select_days') {
-      if (text === '↩️ Отмена' || text === '↩️ Cancel') {
-        ctx.session = {};
-        const lang = await resolveUserLang(ctx.from.id);
-        await ctx.reply('Отмена', getMainMenuSync(ctx.from.id, lang));
-        return;
-      }
-      const daysMapLocal = {'7 дней': 7, '30 дней': 30, '90 дней': 90};
-      const days = daysMapLocal[text] || parseInt(text, 10) || 30;
-      const token = `d${days}_q`;
-      const lang = await resolveUserLang(ctx.from.id);
-      const {pages} = await renderOldAlertsList(ctx.from.id, {days, symbol: null, token, lang});
-      const first = pages[0];
-      ctx.session = {};
-      if (first.buttons && first.buttons.length) {
-        await ctx.reply(mdBoldToHtml(first.text), {parse_mode: 'HTML', reply_markup: {inline_keyboard: first.buttons}});
-      } else {
-        await ctx.reply(mdBoldToHtml(first.text), {parse_mode: 'HTML', ...getMainMenuSync(ctx.from.id, lang)});
-      }
-      return;
-    }
-
-    if (ctx.session.step === 'old_alerts_search') {
-      if (text === '↩️ Отмена' || text === '↩️ Cancel') {
-        ctx.session = {};
-        const lang = await resolveUserLang(ctx.from.id);
-        await ctx.reply('Отмена', getMainMenuSync(ctx.from.id, lang));
-        return;
-      }
-      const parts = text.split(/\s+/).filter(Boolean);
-      const symbol = parts[0] || null;
-      const days = parts[1] ? Math.max(1, parseInt(parts[1], 10)) : 30;
-      const token = `d${days}_q${encodeURIComponent(String(symbol || ''))}`;
-      const lang = await resolveUserLang(ctx.from.id);
-      const {pages} = await renderOldAlertsList(ctx.from.id, {days, symbol, token, lang});
-      const first = pages[0];
-      ctx.session = {};
-      if (first.buttons && first.buttons.length) {
-        await ctx.reply(mdBoldToHtml(first.text), {parse_mode: 'HTML', reply_markup: {inline_keyboard: first.buttons}});
-      } else {
-        await ctx.reply(mdBoldToHtml(first.text), {parse_mode: 'HTML', ...getMainMenuSync(ctx.from.id, lang)});
-      }
-      return;
-    }
-
-  } catch {
-    await ctx.reply('Произошла ошибка, попробуй ещё раз.');
-    ctx.session = {};
-  }
-});

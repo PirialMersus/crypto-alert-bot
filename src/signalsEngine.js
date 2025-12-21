@@ -13,8 +13,8 @@ const RECIPIENTS = [
 const prevState = {};
 
 const THRESH = {
-  OI_PCT: 0.01,
-  CVD_USD: 10000000,
+  OI_PCT: 0.3,
+  CVD_USD: 50000000,
 
   FUNDING_HIGH: 0.02,
   FUNDING_LOW: -0.02,

@@ -19,6 +19,7 @@ function t(lang, key, ...vars) {
       next: 'Next ▶️',
       collapse: '⬆️ Collapse',
       show_all: '📂 Show all alerts',
+      alerts_history: '📜 Alerts history',
       alert_title: (idx, sym, isSL) => `${idx+1}. ${sym}${isSL ? ' — 🛑 SL' : ''}`,
       type_label: 'Type',
       type_sl: '🛑 SL',
@@ -57,6 +58,7 @@ function t(lang, key, ...vars) {
       next: 'Следующая страница ▶️',
       collapse: '⬆️ Свернуть',
       show_all: '📂 Показать все алерты',
+      alerts_history: '📜 История уведомлений',
       alert_title: (idx, sym, isSL) => `${idx+1}. ${sym}${isSL ? ' — 🛑 SL' : ''}`,
       type_label: 'Тип',
       type_sl: '🛑 Стоп-лосс',
@@ -143,7 +145,15 @@ function sortAlertsByOrder(alerts, order) {
 export async function renderAlertsList(userId, options = { fast: false, lang: 'ru' }) {
   const lang = options.lang || 'ru';
   let alerts = await getUserAlertsCached(userId);
-  if (!alerts || !alerts.length) return { pages: [{ text: t(lang, 'no_active_alerts'), buttons: [] }], pageCount: 1 };
+  if (!alerts || !alerts.length) {
+    return {
+      pages: [{
+        text: t(lang, 'no_active_alerts'),
+        buttons: [{ text: t(lang, 'alerts_history'), callback_data: 'alerts_history' }]
+      }],
+      pageCount: 1
+    };
+  }
 
   try {
     const order = await getUserAlertsOrder(userId);
@@ -172,12 +182,11 @@ export async function renderAlertsList(userId, options = { fast: false, lang: 'r
 
   const total = entries.length;
   if (total <= ENTRIES_PER_PAGE) {
-    let text = `${t(lang, 'your_alerts_title')}
-
-`;
+    let text = `${t(lang, 'your_alerts_title')}\n\n`;
     for (const e of entries) text += e.text;
     const buttons = [];
     buttons.push([{ text: t(lang, 'delete_menu'), callback_data: `show_delete_menu_0` }]);
+    buttons.push([{ text: t(lang, 'alerts_history'), callback_data: 'alerts_history' }]);
     const valid = {};
     for (const s of uniqueSymbols) { const v = priceMap.get(s); if (Number.isFinite(v)) valid[s] = v; }
     if (Object.keys(valid).length) try { await setUserLastViews(userId, valid); } catch (e) {}
@@ -186,9 +195,7 @@ export async function renderAlertsList(userId, options = { fast: false, lang: 'r
 
   const pages = [];
   for (let i = 0; i < entries.length; i += ENTRIES_PER_PAGE) {
-    let text = `${t(lang, 'your_alerts_title')}
-
-`;
+    let text = `${t(lang, 'your_alerts_title')}\n\n`;
     const entryIndexes = [];
     for (let j = i; j < Math.min(i + ENTRIES_PER_PAGE, entries.length); j++) {
       text += entries[j].text;
@@ -198,15 +205,14 @@ export async function renderAlertsList(userId, options = { fast: false, lang: 'r
   }
 
   for (let p = 0; p < pages.length; p++) {
-    pages[p].text = pages[p].text + `${t(lang, 'page', p+1, pages.length)}\u2063
-
-`;
+    pages[p].text = pages[p].text + `${t(lang, 'page', p+1, pages.length)}\u2063\n\n`;
     const rows = [];
     const nav = [];
     if (p > 0) nav.push({ text: t(lang, 'prev'), callback_data: `alerts_page_${p-1}_view` });
     if (p < pages.length - 1) nav.push({ text: t(lang, 'next'), callback_data: `alerts_page_${p+1}_view` });
     if (nav.length) rows.push(nav);
     rows.push([{ text: padLabel(t(lang, 'delete_menu'), Math.max(DELETE_LABEL_TARGET_LEN || 30, 28)), callback_data: `show_delete_menu_${p}` }]);
+    rows.push([{ text: t(lang, 'alerts_history'), callback_data: 'alerts_history' }]);
     pages[p].buttons = rows;
   }
 
@@ -346,9 +352,7 @@ ${timeLabel}: ${whenStr}${firedInfo}${reason}
 
     const pages = [];
     for (let i = 0; i < entries.length; i += ENTRIES_PER_PAGE) {
-      let text = `${t(lang, 'old_alerts_title')}
-
-`;
+      let text = `${t(lang, 'old_alerts_title')}\n\n`;
       const entryIndexes = [];
       for (let j = i; j < Math.min(i + ENTRIES_PER_PAGE, entries.length); j++) {
         text += entries[j].text;
@@ -358,9 +362,7 @@ ${timeLabel}: ${whenStr}${firedInfo}${reason}
     }
 
     for (let p = 0; p < pages.length; p++) {
-      pages[p].text = pages[p].text + `${t(lang, 'page', p+1, pages.length)}\u2063
-
-`;
+      pages[p].text = pages[p].text + `${t(lang, 'page', p+1, pages.length)}\u2063\n\n`;
       const rows = [];
       const nav = [];
       const token = opts && opts.token ? opts.token : `d${days}_q${opts && opts.symbol ? encodeURIComponent(String(opts.symbol)) : ''}`;
@@ -437,7 +439,6 @@ export function startAlertsChecker(bot) {
           const header = isSL ? t(lang, 'sl_fired_header') : t(lang, 'alert_fired_header');
           const coinLabel = t(lang, 'coin_label');
           const priceNow = t(lang, 'price_now');
-          const cond = a.condition === '>' ? t(lang, 'condition_above_short') : t(lang, 'condition_below_short');
           const text = `${header}
 ${coinLabel}: *${a.symbol}*
 ${priceNow}: *${fmtNum(cur)}*

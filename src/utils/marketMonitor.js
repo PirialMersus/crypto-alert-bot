@@ -184,7 +184,7 @@ function renderLsBlock(ls, isEn, label){
   return `${esc(lbl)}:\n• ${L} ${B(`${ls.longPct}%`)} | ${S} ${B(`${ls.shortPct}%`)}\n${bar}`;
 }
 
-function formatKyiv(tsEpoch, tsIso) {
+export function formatKyiv(tsEpoch, tsIso) {
   try {
     const d = Number.isFinite(Number(tsEpoch)) && Number(tsEpoch) > 0
       ? new Date(Number(tsEpoch))

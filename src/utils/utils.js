@@ -125,9 +125,9 @@ export async function handleMarketSnapshotRequest(ctx) {
       await ctx.telegram.sendChatAction(ctx.chat.id, 'typing');
     } catch {
     }
-    const typingTimer = startTyping(ctx);
-    const state = reportInFlight.get(ctx.from.id);
-    if (state) state.typingTimer = typingTimer;
+    const stop = startTyping(ctx)
+    const state = reportInFlight.get(ctx.from.id)
+    if (state) state.stopTyping = stop
     let startedMsgId = null;
     try {
       const m = await ctx.reply(isEn ? '⏳ Generating the report…' : '⏳ Формирую отчёт…').catch(() => null);
@@ -245,37 +245,41 @@ const reportInFlight = new Map();
 
 
 export function startTyping(ctx) {
-  try {
-    ctx.telegram.sendChatAction(ctx.chat.id, 'typing').catch(() => {
-    });
-  } catch {
-  }
-  const t = setInterval(() => {
-    try {
-      ctx.telegram.sendChatAction(ctx.chat.id, 'typing').catch(() => {
-      });
-    } catch {
-    }
-  }, 4000);
-  return t;
-}
+  let stopped = false
 
-export function stopTyping(t) {
-  try {
-    if (t) clearInterval(t);
-  } catch {
+  const send = () => {
+    if (stopped) return
+    try {
+      ctx.telegram.sendChatAction(ctx.chat.id, 'typing').catch(() => {})
+    } catch {}
+  }
+
+  send()
+  const timer = setInterval(send, 5100)
+
+  return () => {
+    if (stopped) return
+    stopped = true
+    clearInterval(timer)
   }
 }
 
 function lockReport(userId, ms = 30000) {
-  reportInFlight.set(userId, {until: Date.now() + ms, typingTimer: null, startedMsgId: null});
+  reportInFlight.set(userId, {
+    until: Date.now() + ms,
+    stopTyping: null,
+    startedMsgId: null
+  });
 }
 
 function unlockReport(userId) {
   const s = reportInFlight.get(userId);
-  if (s?.typingTimer) stopTyping(s.typingTimer);
+  if (typeof s?.stopTyping === 'function') {
+    s.stopTyping();
+  }
   reportInFlight.delete(userId);
 }
+
 
 function isLocked(userId) {
   const s = reportInFlight.get(userId);
@@ -297,7 +301,7 @@ export function getMainMenuSync(userId, lang = 'ru') {
   const my = isEn ? '📋 My alerts' : '📋 Мои уведомления';
   const shortBtn = isEn ? '📈 Short market report' : '📈 Краткий отчёт';
   const fullBtn = isEn ? '📊 Full report' : '📊 Полный отчёт';
-  const history = isEn ? '📜 Alerts history' : '📜 История уведомлений';
+  const history = isEn ? '🔮 Surprise me' : '🔮 Удиви меня';
   const liqBtn = isEn ? '🗺️ Liquidation maps' : '🗺️ Карты ликвидаций';
   const settings = isEn ? '⚙️ Settings' : '⚙️ Настройки';
   const motivate = isEn ? '🌅 Send motivation' : '🌅 Прислать мотивацию';
@@ -595,3 +599,17 @@ export async function editReportMessageToShort(ctx){
   }
 }
 
+export function formatSurpriseMessage(surprise, lang, remainingMinutes) {
+  const isEn = String(lang).startsWith('en')
+  const c = isEn ? surprise.content.en : surprise.content.ru
+
+  return [
+    `<b>${c.title}</b>`,
+    '',
+    c.text,
+    '',
+    isEn
+      ? `🕒 Can be updated in <b>${remainingMinutes} minutes</b>`
+      : `🕒 Обновится через <b>${remainingMinutes} минут</b>`
+  ].join('\n')
+}
