@@ -717,65 +717,39 @@ bot.on('callback_query', async (ctx) => {
       invalidateUserAlertsCache(ctx.from.id);
 
       const alertsAfter = await getUserAlertsCached(ctx.from.id);
-      const computedTotalPages = Math.max(1, Math.ceil((alertsAfter?.length || 0) / ENTRIES_PER_PAGE));
+      const totalPages = Math.max(1, Math.ceil((alertsAfter.length || 0) / ENTRIES_PER_PAGE));
+
       if (sourcePage !== null) {
-        sourcePage = Math.max(0, Math.min(sourcePage, computedTotalPages - 1));
+        sourcePage = Math.max(0, Math.min(sourcePage, totalPages - 1));
       }
 
-      const inline2 = await buildDeleteInlineForUser(ctx.from.id, {
-        fast: true,
-        sourcePage,
-        totalPages: (sourcePage === null ? null : computedTotalPages),
-        lang
-      });
-
-      if (!inline2 || inline2.length === 0) {
-        try {
-          await ctx.editMessageText(
-            String(lang).startsWith('en') ? 'You have no active alerts.' : 'У тебя больше нет активных алертов.',
-            {parse_mode: 'HTML', reply_markup: {inline_keyboard: []}}
-          );
-        } catch {
-          try {
-            await ctx.reply(String(lang).startsWith('en') ? 'You have no active alerts.' : 'У тебя больше нет активных алертов.', {parse_mode: 'HTML'});
-          } catch {
-          }
-        }
-        await ctx.answerCbQuery(String(lang).startsWith('en') ? 'Alert deleted' : 'Алерт удалён');
-        return;
-      }
-
-      // try {
-      //   await ctx.editMessageReplyMarkup({inline_keyboard: inline2});
-      // } catch {
-      //   try {
-      //     const originalText = ctx.update.callback_query.message?.text || (String(lang).startsWith('en') ? 'Your alerts' : 'Твои алерты');
-      //     await ctx.reply(originalText, {reply_markup: {inline_keyboard: inline2}});
-      //   } catch {
-      //   }
-      // }
       const { pages } = await renderAlertsList(ctx.from.id, { fast: true, lang });
       const page = pages[sourcePage ?? 0] || pages[0];
 
+      const deleteInline = await buildDeleteInlineForUser(ctx.from.id, {
+        fast: true,
+        sourcePage,
+        totalPages,
+        lang
+      });
+
       try {
-        await ctx.editMessageText(
-          page.text,
-          {
-            parse_mode: 'Markdown',
-            reply_markup: { inline_keyboard: page.buttons }
-          }
-        );
+        await ctx.editMessageText(page.text, {
+          parse_mode: 'Markdown',
+          reply_markup: { inline_keyboard: deleteInline }
+        });
       } catch {
-        await ctx.reply(
-          page.text,
-          {
-            parse_mode: 'Markdown',
-            reply_markup: { inline_keyboard: page.buttons }
-          }
-        );
+        await ctx.reply(page.text, {
+          parse_mode: 'Markdown',
+          reply_markup: { inline_keyboard: deleteInline }
+        });
       }
-      await ctx.answerCbQuery(String(lang).startsWith('en') ? 'Alert deleted' : 'Алерт удалён');
+
+      await ctx.answerCbQuery(
+        String(lang).startsWith('en') ? 'Alert deleted' : 'Алерт удалён'
+      );
       return;
+
     }
 
     const mOldPage = data.match(/^old_alerts_page_(\d+)_view_(d(\d+)_q(.*))$/);
