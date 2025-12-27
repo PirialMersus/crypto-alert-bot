@@ -397,8 +397,8 @@ bot.on('callback_query', async (ctx) => {
         }
 
         const tail = isEn
-          ? `\n\n🧠 AI market analysis\nGenerated at: **${generatedTimeStr}** (Europe/Kyiv) — AI answer updates every hour`
-          : `\n\n🧠 Ответ ИИ по рынку\nСгенерировано: **${generatedTimeStr}** (Europe/Kyiv) — Анализ ИИ обновляется каждый час`;
+          ? `\n\n🧠 AI market analysis\nGenerated at: **${generatedTimeStr}** (Europe/Kyiv)`
+          : `\n\n🧠 Ответ ИИ по рынку\nСгенерировано: **${generatedTimeStr}** (Europe/Kyiv)`;
 
         answer += tail;
 
