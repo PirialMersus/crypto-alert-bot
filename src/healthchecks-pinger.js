@@ -25,6 +25,14 @@ export async function pingHealthchecksOnce() {
       https.get('https://liq-bridge.onrender.com/').on('error', () => {});
     } catch {}
 
+    try {
+      https.get('https://zen-bot-6bud.onrender.com/').on('error', () => {});
+    } catch {}
+
+    try {
+      https.get('https://family-bot-jgo8.onrender.com/').on('error', () => {});
+    } catch {}
+
     return true;
   } catch (e) {
     console.warn('[healthchecks] ping failed', e?.message || e);
