@@ -22,6 +22,10 @@ export async function pingHealthchecksOnce() {
     } catch {}
 
     try {
+      https.get('https://samomotivaciya.onrender.com/health/').on('error', () => {});
+    } catch {}
+
+    try {
       https.get('https://liq-bridge.onrender.com/').on('error', () => {});
     } catch {}
 
