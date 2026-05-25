@@ -32,3 +32,4 @@ export const MARKET_BATCH_PAUSE_MS = 400;   // пауза между батча�
 
 export const CREATOR_ID = process.env.CREATOR_ID ? parseInt(process.env.CREATOR_ID, 10) : null;
 
+export const GEMINI_MOTIVATION_TIMEOUT_MS = 60000;

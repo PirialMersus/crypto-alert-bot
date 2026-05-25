@@ -1,15 +1,12 @@
-// src/daily.js
 import { httpGetWithRetry, httpClient } from './httpClient.js';
 import { dailyCache } from './cache.js';
 import { dailyMotivationCollection, dailyQuoteRetryCollection, pendingDailySendsCollection, client } from './db/db.js';
 import { RETRY_INTERVAL_MS, QUOTE_CAPTION_MAX, MESSAGE_TEXT_MAX, KYIV_TZ } from './constants.js';
 import { translateOrNull } from './translate.js';
+import { generateMotivationForImage, generateMotivationTextOnly } from './geminiMotivation.js';
 
-const QUOTABLE_RANDOM = 'https://api.quotable.io/random';
 const ZEN_QUOTES = 'https://zenquotes.io/api/today';
 const TYPEFIT_ALL = 'https://type.fit/api/quotes';
-const FORISMATIC_RU = 'https://api.forismatic.com/api/1.0/?method=getQuote&format=json&lang=ru';
-const UNSPLASH_RANDOM = 'https://source.unsplash.com/random/1200x800/?nature,landscape,forest,mountains,sea';
 const PICSUM_RANDOM = 'https://picsum.photos/1200/800';
 const PICSUM_SEED = (seed) => `https://picsum.photos/seed/${encodeURIComponent(seed)}/1200/800`;
 const PLACEHOLD = 'https://placehold.co/1200x800.png?text=Motivation';
@@ -57,15 +54,6 @@ function transliterateCyrillicToLatin(s) {
   return s.split('').map(ch => map[ch] !== undefined ? map[ch] : ch).join('');
 }
 
-export async function fetchQuoteQuotable() {
-  try {
-    const res = await httpGetWithRetry(QUOTABLE_RANDOM, 1);
-    const d = res?.data;
-    if (d?.content && !isLikelyHTML(d.content)) return { text: d.content, author: d.author || '', source: 'quotable' };
-  } catch (e) { console.warn('fetchQuoteQuotable failed', e?.message || e); }
-  return null;
-}
-
 export async function fetchQuoteZen() {
   try {
     const res = await httpGetWithRetry(ZEN_QUOTES, 1);
@@ -90,26 +78,10 @@ export async function fetchQuoteTypefit() {
   return null;
 }
 
-export async function fetchQuoteForismatic() {
-  try {
-    const res = await httpGetWithRetry(FORISMATIC_RU, 1, { timeout: 7000 });
-    const d = res?.data;
-    if (!d) return null;
-    const text = d.quoteText || d.quote || '';
-    const author = d.quoteAuthor || d.author || '';
-    if (text && String(text).trim() && !isLikelyHTML(text)) return { text: String(text).trim(), author: String(author || '').trim(), source: 'forismatic' };
-  } catch (e) { console.warn('fetchQuoteForismatic failed', e?.message || e); }
-  return null;
-}
-
 export async function fetchQuoteFromAny(attempts = 2) {
   for (let a = 0; a < attempts; a++) {
     let q = null;
-    q = await fetchQuoteForismatic().catch(()=>null);
-    if (q && q.text) return q;
     q = await fetchQuoteTypefit().catch(()=>null);
-    if (q && q.text) return q;
-    q = await fetchQuoteQuotable().catch(()=>null);
     if (q && q.text) return q;
     q = await fetchQuoteZen().catch(()=>null);
     if (q && q.text) return q;
@@ -122,7 +94,6 @@ export async function fetchRandomImage() {
   const sources = [
     { name: 'picsum-seed', fn: async () => await tryGetArrayBuffer(PICSUM_SEED(String(Date.now()))) },
     { name: 'picsum', fn: async () => await tryGetArrayBuffer(PICSUM_RANDOM) },
-    { name: 'unsplash', fn: async () => await tryGetArrayBuffer(UNSPLASH_RANDOM) },
     { name: 'loremflickr', fn: async () => await tryGetArrayBuffer(LOREMFLICKR) },
     { name: 'placehold', fn: async () => await tryGetArrayBuffer(PLACEHOLD) }
   ];
@@ -141,22 +112,47 @@ export async function fetchRandomImage() {
 
 export async function fetchAndStoreDailyMotivation(dateStr, opts = { force: false }) {
   try {
-    const quoteAttempts = (opts && opts.force) ? 3 : 2;
     const imgAttempts = (opts && opts.force) ? 3 : 1;
-
-    let quote = null;
-    for (let i = 0; i < quoteAttempts && !quote; i++) {
-      quote = await fetchQuoteFromAny(1).catch(()=>null);
-      if (!quote) await new Promise(r => setTimeout(r, 300 * (i+1)));
-    }
-
     let img = null;
     for (let i = 0; i < imgAttempts && !img; i++) {
       img = await fetchRandomImage().catch(()=>null);
       if (!img) await new Promise(r => setTimeout(r, 200 * (i+1)));
     }
 
-    let originalLang = 'en';
+    let quote = null;
+
+    if (img && img.buffer) {
+      const visionResult = await generateMotivationForImage(img.buffer).catch(visionError => {
+        console.warn('[daily] Gemini vision failed', visionError?.message || visionError);
+        return null;
+      });
+      if (visionResult && visionResult.text) {
+        quote = { text: visionResult.text, author: visionResult.author || '', source: visionResult.source };
+        console.log('[daily] Gemini vision generated motivation for image');
+      }
+    }
+
+    if (!quote) {
+      const geminiTextOnlyResult = await generateMotivationTextOnly().catch(geminiTextError => {
+        console.warn('[daily] Gemini text-only also failed', geminiTextError?.message || geminiTextError);
+        return null;
+      });
+      if (geminiTextOnlyResult && geminiTextOnlyResult.text) {
+        quote = { text: geminiTextOnlyResult.text, author: geminiTextOnlyResult.author || '', source: geminiTextOnlyResult.source };
+        console.log('[daily] Gemini generated text-only motivation');
+      }
+    }
+
+    if (!quote) {
+      const quoteAttempts = (opts && opts.force) ? 3 : 2;
+      for (let i = 0; i < quoteAttempts && !quote; i++) {
+        quote = await fetchQuoteFromAny(1).catch(()=>null);
+        if (!quote) await new Promise(r => setTimeout(r, 300 * (i+1)));
+      }
+      if (quote) console.log('[daily] Fallback quote from', quote.source);
+    }
+
+    let originalLang = 'ru';
     if (quote && quote.text) originalLang = detectSimpleLang(quote.text);
 
     let translations = { en: null, ru: null, uk: null };
@@ -178,7 +174,6 @@ export async function fetchAndStoreDailyMotivation(dateStr, opts = { force: fals
       createdAt: new Date()
     };
 
-    // If DB not available, either throw on force or return null gracefully
     if (!dailyMotivationCollection) {
       if (opts && opts.force) {
         throw new Error('fetchAndStoreDailyMotivation: mongo unavailable');
@@ -198,7 +193,7 @@ export async function fetchAndStoreDailyMotivation(dateStr, opts = { force: fals
 
     if (opts && opts.force) {
       if (!doc.quote && !doc.image) {
-        throw new Error('fetchAndStoreDailyMotivation: force requested but unable to fetch quote or image from sources (network or sources failure).');
+        throw new Error('fetchAndStoreDailyMotivation: force requested but unable to fetch quote or image from sources.');
       }
       await dailyMotivationCollection.updateOne({ date: dateStr }, { $set: doc }, { upsert: true });
     } else {
@@ -209,7 +204,7 @@ export async function fetchAndStoreDailyMotivation(dateStr, opts = { force: fals
 
     dailyCache.date = dateStr;
     dailyCache.doc = stored;
-    dailyCache.imageBuffer = null;
+    dailyCache.imageBuffer = img?.buffer || null;
 
     if (!stored?.quote) {
       if (dailyQuoteRetryCollection) {
