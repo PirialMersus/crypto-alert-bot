@@ -14,7 +14,15 @@ const LOREMFLICKR = 'https://loremflickr.com/1200/800/nature,landscape';
 
 async function tryGetArrayBuffer(url, opts = {}) {
   try {
-    const res = await httpClient.get(url, { responseType: 'arraybuffer', maxRedirects: 10, timeout: 8000, ...opts });
+    const res = await httpClient.get(url, {
+      responseType: 'arraybuffer',
+      maxRedirects: 10,
+      timeout: 8000,
+      headers: {
+        'Accept': 'image/*, */*'
+      },
+      ...opts
+    });
     if (res && res.data) {
       const buf = Buffer.from(res.data);
       let finalUrl = null;
@@ -150,6 +158,15 @@ export async function fetchAndStoreDailyMotivation(dateStr, opts = { force: fals
         if (!quote) await new Promise(r => setTimeout(r, 300 * (i+1)));
       }
       if (quote) console.log('[daily] Fallback quote from', quote.source);
+    }
+
+    if (!quote) {
+      quote = {
+        text: 'Хорошего дня! Пусть этот день принесет новые возможности, энергию для великих свершений и отличные результаты.',
+        author: 'Crypto Alert Bot',
+        source: 'local_fallback'
+      };
+      console.log('[daily] FAILED to get online quotes, using local default motivation');
     }
 
     let originalLang = 'ru';
@@ -362,7 +379,14 @@ export async function ensureDailyImageBuffer(dateStr) {
   const doc = dailyCache.doc;
   if (doc?.image?.url) {
     try {
-      const r = await httpClient.get(doc.image.url, { responseType: 'arraybuffer', maxRedirects: 10, timeout: 8000 });
+      const r = await httpClient.get(doc.image.url, {
+        responseType: 'arraybuffer',
+        maxRedirects: 10,
+        timeout: 8000,
+        headers: {
+          'Accept': 'image/*, */*'
+        }
+      });
       if (r && r.data) {
         dailyCache.imageBuffer = Buffer.from(r.data);
         return dailyCache.imageBuffer;
