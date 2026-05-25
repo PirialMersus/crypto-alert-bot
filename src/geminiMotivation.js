@@ -119,7 +119,8 @@ export async function generateMotivationForImage(imageBuffer) {
   } catch (httpError) {
     console.error('[geminiMotivation] HTTP error in vision request', {
       status: httpError.response?.status,
-      message: httpError.message
+      message: httpError.message,
+      data: httpError.response?.data ? JSON.stringify(httpError.response.data) : null
     })
     return null
   }
@@ -161,7 +162,8 @@ export async function generateMotivationTextOnly() {
   } catch (httpError) {
     console.error('[geminiMotivation] HTTP error generating text-only', {
       status: httpError.response?.status,
-      message: httpError.message
+      message: httpError.message,
+      data: httpError.response?.data ? JSON.stringify(httpError.response.data) : null
     })
     return null
   }

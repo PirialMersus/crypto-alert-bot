@@ -230,7 +230,9 @@ export async function sendDailyToUser(bot, userId, dateStr, opts = { disableNoti
     }
 
     let doc = dailyCache.date === dateStr ? dailyCache.doc : (dailyMotivationCollection ? await dailyMotivationCollection.findOne({ date: dateStr }).catch(()=>null) : null);
-    if (!doc) doc = await fetchAndStoreDailyMotivation(dateStr).catch(()=>null);
+    if (!doc || !doc.quote || !doc.quote.original) {
+      doc = await fetchAndStoreDailyMotivation(dateStr, { force: true }).catch(()=>null);
+    }
 
     const buf = await ensureDailyImageBuffer(dateStr).catch(()=>null);
     // resolveUserLang is in cache.js to avoid circular imports here
