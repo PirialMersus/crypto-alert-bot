@@ -98,9 +98,10 @@ export async function fetchQuoteFromAny(attempts = 2) {
   return null;
 }
 
-export async function fetchRandomImage() {
+export async function fetchRandomImage(seedStr = '') {
+  const finalSeed = seedStr || String(Date.now());
   const sources = [
-    { name: 'picsum-seed', fn: async () => await tryGetArrayBuffer(PICSUM_SEED(String(Date.now()))) },
+    { name: 'picsum-seed', fn: async () => await tryGetArrayBuffer(PICSUM_SEED(finalSeed)) },
     { name: 'picsum', fn: async () => await tryGetArrayBuffer(PICSUM_RANDOM) },
     { name: 'loremflickr', fn: async () => await tryGetArrayBuffer(LOREMFLICKR) },
     { name: 'placehold', fn: async () => await tryGetArrayBuffer(PLACEHOLD) }
@@ -123,7 +124,7 @@ export async function fetchAndStoreDailyMotivation(dateStr, opts = { force: fals
     const imgAttempts = (opts && opts.force) ? 3 : 1;
     let img = null;
     for (let i = 0; i < imgAttempts && !img; i++) {
-      img = await fetchRandomImage().catch(()=>null);
+      img = await fetchRandomImage(dateStr).catch(()=>null);
       if (!img) await new Promise(r => setTimeout(r, 200 * (i+1)));
     }
 
@@ -187,7 +188,7 @@ export async function fetchAndStoreDailyMotivation(dateStr, opts = { force: fals
         originalLang,
         translations
       } : null,
-      image: img ? { url: img.url, source: img.source } : null,
+      image: img ? { url: img.url, source: img.source, bufferBase64: img.buffer.toString('base64') } : null,
       createdAt: new Date()
     };
 
@@ -206,6 +207,10 @@ export async function fetchAndStoreDailyMotivation(dateStr, opts = { force: fals
         }
         return doc;
       }
+    }
+
+    if (dailyMotivationCollection) {
+      await dailyMotivationCollection.deleteMany({}).catch(() => {});
     }
 
     if (opts && opts.force) {
@@ -374,9 +379,16 @@ export async function ensureDailyImageBuffer(dateStr) {
     dailyCache.doc = doc;
     dailyCache.imageBuffer = null;
   }
+
   if (dailyCache.imageBuffer) return dailyCache.imageBuffer;
 
   const doc = dailyCache.doc;
+
+  if (doc?.image?.bufferBase64) {
+    dailyCache.imageBuffer = Buffer.from(doc.image.bufferBase64, 'base64');
+    return dailyCache.imageBuffer;
+  }
+
   if (doc?.image?.url) {
     try {
       const r = await httpClient.get(doc.image.url, {
@@ -388,19 +400,21 @@ export async function ensureDailyImageBuffer(dateStr) {
         }
       });
       if (r && r.data) {
-        dailyCache.imageBuffer = Buffer.from(r.data);
-        return dailyCache.imageBuffer;
+        const buffer = Buffer.from(r.data);
+        dailyCache.imageBuffer = buffer;
+        return buffer;
       }
     } catch (e) { console.warn('ensureDailyImageBuffer fetch stored url failed', e?.message || e); }
   }
 
-  const got = await fetchRandomImage().catch(()=>null);
+  const got = await fetchRandomImage(dateStr).catch(()=>null);
   if (got && got.buffer) {
     dailyCache.imageBuffer = got.buffer;
     try {
       if (got.url) {
-        await dailyMotivationCollection.updateOne({ date: dateStr }, { $set: { 'image.url': got.url, 'image.source': got.source } });
-        dailyCache.doc.image = { url: got.url, source: got.source };
+        const bufferBase64 = got.buffer.toString('base64');
+        await dailyMotivationCollection.updateOne({ date: dateStr }, { $set: { 'image.url': got.url, 'image.source': got.source, 'image.bufferBase64': bufferBase64 } });
+        dailyCache.doc.image = { url: got.url, source: got.source, bufferBase64: bufferBase64 };
       }
     } catch (e) { /* ignore */ }
     return dailyCache.imageBuffer;

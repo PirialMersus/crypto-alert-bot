@@ -7,6 +7,19 @@ const TTL_MS = 15 * 60 * 1000
 export async function getOrCreateSurprise({ forceFresh = false } = {}) {
   const now = Date.now()
 
+  if (!surprisesCollection) {
+    for (let databaseCheckAttempts = 0; databaseCheckAttempts < 10; databaseCheckAttempts++) {
+      if (surprisesCollection) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+  }
+
+  if (!surprisesCollection) {
+    throw new Error('Database connection is not established yet');
+  }
+
   if (!forceFresh) {
     const last = await surprisesCollection.findOne(
       {},

@@ -350,22 +350,90 @@ export async function handleMotivationRequest(ctx) {
     const lang = await resolveUserLang(ctx.from?.id, null, ctx.from?.language_code).catch(() => ctx.from?.language_code || 'ru');
     const isEn = String(lang).toLowerCase().startsWith('en');
     try {
-      await ctx.telegram.sendChatAction(ctx.chat.id, 'upload_photo').catch(() => {
-      });
-    } catch {
-    }
+      await ctx.telegram.sendChatAction(ctx.chat.id, 'upload_photo').catch(() => {});
+    } catch {}
+
     const dateStr = new Date().toLocaleDateString('sv-SE', {timeZone: KYIV_TZ});
-    const ok = await sendDailyToUser(bot, ctx.from.id, dateStr, {
-      disableNotification: false,
-      forceRefresh: false
-    }).catch(() => false);
-    if (!ok) await ctx.reply(isEn ? '⚠️ Could not send motivation now.' : '⚠️ Не удалось отправить мотивацию сейчас.');
+    
+    await fetchAndStoreDailyMotivation(dateStr, { force: true }).catch(() => {});
+    
+    const ok = await sendDailyToUser(bot, ctx.chat.id, dateStr, { forceRefresh: false, disableNotification: false }).catch(() => false);
+    
+    if (ok !== false) {
+      await ctx.reply(isEn ? '✅ New motivation generated!' : '✅ Новая мотивация сгенерирована!');
+    } else {
+      await ctx.reply(isEn ? '⚠️ Could not send motivation now.' : '⚠️ Не удалось отправить мотивацию сейчас.');
+    }
   } catch {
     try {
       await ctx.reply('⚠️ Внутренняя ошибка при отправке мотивации.');
-    } catch {
+    } catch {}
+  }
+}
+
+async function broadcastMotivation(dateStr, ignoreHistory = false) {
+  const {usersCollection, pendingDailySendsCollection} = await import('../db/db.js');
+  let sentSet = new Set();
+  
+  if (!ignoreHistory) {
+    const already = await pendingDailySendsCollection.find({
+      date: dateStr,
+      sent: true
+    }, {projection: {userId: 1}}).toArray();
+    sentSet = new Set((already || []).map(r => r.userId));
+  }
+  
+  const cursor = usersCollection.find(
+    {$or: [{botBlocked: {$exists: false}}, {botBlocked: false}], sendMotivation: {$ne: false}},
+    {projection: {userId: 1}}
+  );
+  const BATCH = 20;
+  let batch = [];
+  while (await cursor.hasNext()) {
+    const u = await cursor.next();
+    if (!u || !u.userId) continue;
+    const uid = u.userId;
+    if (sentSet.has(uid)) continue;
+    batch.push(uid);
+    if (batch.length >= BATCH) {
+      await Promise.all(batch.map(async (targetId) => {
+        try {
+          const ok = await sendDailyToUser(bot, targetId, dateStr, {
+            disableNotification: false,
+            forceRefresh: false
+          }).catch(() => false);
+          await pendingDailySendsCollection.updateOne({userId: targetId, date: dateStr}, {
+            $set: {
+              sent: !!ok,
+              sentAt: ok ? new Date() : null,
+              quoteSent: !!ok,
+              permanentFail: !ok
+            }
+          }, {upsert: true});
+        } catch {}
+      }));
+      batch = [];
     }
   }
+  if (batch.length) {
+    await Promise.all(batch.map(async (targetId) => {
+      try {
+        const ok = await sendDailyToUser(bot, targetId, dateStr, {
+          disableNotification: false,
+          forceRefresh: false
+        }).catch(() => false);
+        await pendingDailySendsCollection.updateOne({userId: targetId, date: dateStr}, {
+          $set: {
+            sent: !!ok,
+            sentAt: ok ? new Date() : null,
+            quoteSent: !!ok,
+            permanentFail: !ok
+          }
+        }, {upsert: true});
+      } catch {}
+    }));
+  }
+  return true;
 }
 
 export async function startBot() {
@@ -399,12 +467,7 @@ export async function startBot() {
   setInterval(() => processDailyQuoteRetry(bot), 60000);
   setInterval(() => watchForNewQuotes(bot), 30000);
 
-  const dateStrNow = new Date().toLocaleDateString('sv-SE', {timeZone: KYIV_TZ});
-  try {
-    await fetchAndStoreDailyMotivation(dateStrNow).catch(() => {
-    });
-  } catch {
-  }
+
 
   let lastFetchDay = null;
   let lastPrepareDay = null;
@@ -432,65 +495,7 @@ export async function startBot() {
         lastPrepareDay = day;
 
         try {
-          const dateStr = day;
-          const {usersCollection, pendingDailySendsCollection} = await import('../db/db.js');
-          const already = await pendingDailySendsCollection.find({
-            date: dateStr,
-            sent: true
-          }, {projection: {userId: 1}}).toArray();
-          const sentSet = new Set((already || []).map(r => r.userId));
-          const cursor = usersCollection.find(
-            {$or: [{botBlocked: {$exists: false}}, {botBlocked: false}], sendMotivation: {$ne: false}},
-            {projection: {userId: 1}}
-          );
-          const BATCH = 20;
-          let batch = [];
-          while (await cursor.hasNext()) {
-            const u = await cursor.next();
-            if (!u || !u.userId) continue;
-            const uid = u.userId;
-            if (sentSet.has(uid)) continue;
-            batch.push(uid);
-            if (batch.length >= BATCH) {
-              await Promise.all(batch.map(async (targetId) => {
-                try {
-                  const ok = await sendDailyToUser(bot, targetId, dateStr, {
-                    disableNotification: false,
-                    forceRefresh: false
-                  }).catch(() => false);
-                  await pendingDailySendsCollection.updateOne({userId: targetId, date: dateStr}, {
-                    $set: {
-                      sent: !!ok,
-                      sentAt: ok ? new Date() : null,
-                      quoteSent: !!ok,
-                      permanentFail: !ok
-                    }
-                  }, {upsert: true});
-                } catch {
-                }
-              }));
-              batch = [];
-            }
-          }
-          if (batch.length) {
-            await Promise.all(batch.map(async (targetId) => {
-              try {
-                const ok = await sendDailyToUser(bot, targetId, dateStr, {
-                  disableNotification: false,
-                  forceRefresh: false
-                }).catch(() => false);
-                await pendingDailySendsCollection.updateOne({userId: targetId, date: dateStr}, {
-                  $set: {
-                    sent: !!ok,
-                    sentAt: ok ? new Date() : null,
-                    quoteSent: !!ok,
-                    permanentFail: !ok
-                  }
-                }, {upsert: true});
-              } catch {
-              }
-            }));
-          }
+          await broadcastMotivation(day, false);
         } catch {
         }
       }
